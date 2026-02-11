@@ -1,0 +1,17 @@
+# Build directories
+linux_port/build/
+linux_port/overhead/build/
+linux_port/overhead/build-x86_64/
+linux_port/interface/build/
+linux_port/interface/build-x86_64/
+
+# Compiled binaries and objects
+*.o
+*.d
+*.exe
+*.pyc
+__pycache__/
+
+# Compiled binaries (keep source, not binaries)
+linux_port/interface/interface
+linux_port/overhead/overhead
