@@ -18,6 +18,11 @@
 #define  ON    1
 #define  OFF   0
 
+// Build configuration (defines _PCM3724_SIM_, _HBM_SIM_, etc.)
+// MUST come before platform.h so preprocessor conditionals in
+// platform.h (e.g. routing RtReadPortUchar to sim vs stub) work.
+#include "../common/overheadconst.h"
+
 // Platform compatibility layer (replaces Windows.h + rtapi.h)
 #include "../common/platform.h"
 
@@ -27,9 +32,6 @@
 // Serial port support (Linux version)
 #include "serial.h"
 #include "serialtypes.h"
-
-// Original shared headers
-#include "../common/overheadconst.h"
 #include "overheadmacros.h"
 #include "../common/overheadtypes.h"
 

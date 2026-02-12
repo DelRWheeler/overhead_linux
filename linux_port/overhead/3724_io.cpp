@@ -56,11 +56,14 @@ bool io_3724::initialize()
 void io_3724::readInputs(void)
 {
     UCHAR atemp, btemp;
+    UCHAR raw_a0, raw_b0;
     int i, dest_bit;
 
     // Read the OPTO 22 Input ports for sensor state checking
-    atemp = (unsigned char)(~RtReadPortUchar(PCM_3724_1_PORT_A0));
-    btemp = (unsigned char)(~RtReadPortUchar(PCM_3724_1_PORT_B0));
+    raw_a0 = RtReadPortUchar(PCM_3724_1_PORT_A0);
+    raw_b0 = RtReadPortUchar(PCM_3724_1_PORT_B0);
+    atemp = (unsigned char)(~raw_a0);
+    btemp = (unsigned char)(~raw_b0);
 
     // Separate into sync_in and sync_zero bytes
     // Port A0/B0 use interleaved bits:

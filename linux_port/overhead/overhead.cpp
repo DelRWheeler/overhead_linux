@@ -9890,6 +9890,14 @@ void overhead::ProcessSyncs()
 	}
 	if (NumSyncs > 8) NumSyncs = 8; // hard max: 2 scale + 6 drop
 
+	// If grading is disabled, grade_zeroed must be true so zero processing works.
+	// GradeSyncs() doesn't run when grading is off, so grade_zeroed would never
+	// get set otherwise. Init at line 1706 unconditionally sets it false.
+	if (!pShm->sys_set.Grading) {
+		grade_zeroed[0] = true;
+		grade_zeroed[1] = true;
+	}
+
 	static bool	sync_zero_triggered[MAXSYNCS]; //GLC Added for Carolina turkeys 3/8/05
 
 	// Check for BOAZ mode and set number of syncs accordingly
@@ -9975,6 +9983,7 @@ void overhead::ProcessSyncs()
                     pSyncStat->shackleno                = 1;
                     true_shackle_count[i]				= 1; //GLC added 2/14/05
                     pSyncStat->zeroed                   = true;
+					shm_updates[78-1]                   = true;  // shmID 78 = SyncStatus, notify host of zeroed state
 					pShm->sys_stat.dbg_sync[ZERO_ON][i] = 0;
 					pShm->sys_stat.dbg_sync[SYNC_ON][i]++; //added jc
 
@@ -10065,7 +10074,10 @@ void overhead::ProcessSyncs()
                     pShm->ShackleStatus[pSyncStat->shackleno].last_in_batch[0] = false;
                     //pShm->ShackleStatus[pSyncStat->shackleno].last_in_batch[1] = false;
 
-                    pShm->WeighZero[0]    = true;
+                    if (!pShm->WeighZero[0]) {
+                        pShm->WeighZero[0] = true;
+                        shm_updates[SCLWGHZ-1] = true;  // notify host only on transition
+                    }
                     pShm->WeighShackle[0] = pSyncStat->shackleno;
                     weigh_state[0]        = WeighActive;
 					DebugTrace(_SYNCS_, "SC1-Weighing triggered. Shackle = %d, trolley = %d\n",pSyncStat->shackleno, trolly_counters[i]);
@@ -10079,7 +10091,10 @@ void overhead::ProcessSyncs()
 					pShm->ShackleStatus[pSyncStat->shackleno].batch_number[1]  = 0;
 					pShm->ShackleStatus[pSyncStat->shackleno].last_in_batch[1] = false;
 
-                    pShm->WeighZero[1]    = true;
+                    if (!pShm->WeighZero[1]) {
+                        pShm->WeighZero[1] = true;
+                        shm_updates[SCLWGHZ-1] = true;  // notify host only on transition
+                    }
                     pShm->WeighShackle[1] = pSyncStat->shackleno;
                     weigh_state[1]        = WeighActive;
 					DebugTrace(_SYNCS_, "SC2-Weighing triggered. Shackle = %d, trolley = %d\n",pSyncStat->shackleno, trolly_counters[i]);

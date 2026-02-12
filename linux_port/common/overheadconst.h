@@ -93,8 +93,8 @@
 
 // STEP 8: Build for no interface/debug/simulation mode 
 
-//#define _SIMULATION_MODE_ //GLC  -- enables built-in sync/grade simulator (bypasses I/O)
-//#define _WEIGHT_SIMULATION_MODE_ //GLC  -- enables simulated weights (skips real load cell)
+//#define _SIMULATION_MODE_ //GLC  -- enables built-in sync/grade simulator (bypasses I/O) -- CONFLICTS with _PCM3724_SIM_
+//#define _WEIGHT_SIMULATION_MODE_ //GLC  -- enables simulated weights (skips real load cell) -- CONFLICTS with _HBM_SIM_
 #define _PCM3724_SIM_  // Virtual PCM-3724 I/O board simulator (exercises full I/O path)
 #define _HBM_SIM_      // Virtual HBM FIT7 load cell simulator (exercises full serial path)
 //#define _ZERO_SIM_WEIGHT_
