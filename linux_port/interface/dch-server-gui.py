@@ -172,10 +172,10 @@ def read_settings_file(path):
 
 
 def _wt(raw):
-    """Format a raw weight value: show raw and lbs (raw/10000)."""
+    """Format a raw weight value: show raw and lbs (raw/CNTS where CNTS=116500 for HBM digital load cell)."""
     if raw == 0:
         return "0"
-    return f"{raw} ({raw / 10000.0:.4f} lbs)"
+    return f"{raw} ({raw / 116500.0:.4f} lbs)"
 
 
 def decode_system_settings(data):

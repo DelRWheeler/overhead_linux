@@ -22,6 +22,9 @@
 
 #include "types.h"
 #include "pcm3724_sim.h"
+#ifdef _HBM_SIM_
+#include "hbm_sim.h"
+#endif
 
 #undef  _FILE_
 #define _FILE_  "pcm3724_sim.cpp"
@@ -333,7 +336,7 @@ static bool IsFlagAtSync(int entry_idx)
 //--------------------------------------------------------
 static void RunSimStep(void)
 {
-    // Check for auto-start: wait for config_Ok then 30 second delay
+    // Check for auto-start: wait for config_Ok then 10 second delay
     if (!g_pcmSim.started)
     {
         if (g_pcmSim.waiting_for_config)
@@ -342,12 +345,12 @@ static void RunSimStep(void)
             {
                 g_pcmSim.waiting_for_config = false;
                 g_pcmSim.config_ok_tick = 0;
-                RtPrintf("PCM-3724 Sim: config_Ok detected, waiting 60s to start line\n");
+                RtPrintf("PCM-3724 Sim: config_Ok detected, waiting 10s to start line\n");
 
                 // Now that config is loaded, set up timing and syncs
+                // Always use default SPM - don't read from sys_stat which
+                // is the measured value and may be stale/zero at startup
                 double spm = PCM_SIM_DEFAULT_SPM;
-                if (app->pShm && app->pShm->sys_stat.ShacklesPerMinute > 0)
-                    spm = (double)app->pShm->sys_stat.ShacklesPerMinute;
                 RecalcTiming(spm);
                 ReconfigSyncs();
 
@@ -376,7 +379,7 @@ static void RunSimStep(void)
         g_pcmSim.started = true;
         g_pcmSim.tick = 0;
         g_pcmSim.shackle_count = 0;
-        RtPrintf("PCM-3724 Sim: Line auto-started after 60s delay\n");
+        RtPrintf("PCM-3724 Sim: Line auto-started after 10s delay\n");
     }
 
     // --- Active simulation ---
@@ -438,6 +441,46 @@ static void RunSimStep(void)
         grade_counter_on = true;
     }
 
+#ifdef _HBM_SIM_
+    // --- Bird-present signaling to HBM load cell simulator ---
+    // When counter fires and the controller has zeroed at least one scale,
+    // signal that a bird is on the scale. This makes the HBM sim output
+    // bird-level weights during the weighing window, and near-zero
+    // (empty shackle) the rest of the time.
+    //
+    // Before zeroing: WeighZero is false → bird_present stays false →
+    //   HBM outputs ~0 → tare captures ~0
+    // After zeroing: WeighZero is true → bird_present pulses true →
+    //   HBM outputs bird weight → net = bird - tare(~0) = correct weight
+    if (t == g_pcmSim.counter_start_tick)
+    {
+        // Check if any scale has zeroed (production mode)
+        if (app && app->pShm)
+        {
+            bool any_zeroed = false;
+            for (int s = 0; s < MAXSCALES; s++)
+            {
+                if (app->pShm->WeighZero[s])
+                {
+                    any_zeroed = true;
+                    break;
+                }
+            }
+            if (any_zeroed)
+            {
+                g_hbm_bird_present = true;
+                // Bird-present signaling is working; suppress periodic logging
+            }
+        }
+    }
+    // Clear bird-present at 75% of cycle (bird has left the scale,
+    // well after the weighing window closes)
+    if (t == (g_pcmSim.cycle_ticks * 3 / 4))
+    {
+        g_hbm_bird_present = false;
+    }
+#endif
+
     // --- Grade signals on Port C0 ---
     if (grade_counter_on)
     {
@@ -475,21 +518,13 @@ static void RunSimStep(void)
         if (g_pcmSim.grade_idx >= 5)
             g_pcmSim.grade_idx = 0;
 
-        // Periodically re-read SPM from controller in case it changed
-        if ((g_pcmSim.shackle_count % 100) == 0)
-        {
-            if (app && app->pShm && app->pShm->sys_stat.ShacklesPerMinute > 0)
-            {
-                double new_spm = (double)app->pShm->sys_stat.ShacklesPerMinute;
-                double old_cycle = (double)g_pcmSim.cycle_ticks;
-                RecalcTiming(new_spm);
-                if ((double)g_pcmSim.cycle_ticks != old_cycle)
-                {
-                    RtPrintf("PCM-3724 Sim: SPM changed, cycle=%dms counter_on=%dms\n",
-                        g_pcmSim.cycle_ticks, g_pcmSim.counter_on_ticks);
-                }
-            }
-        }
+        // NOTE: Do NOT read SPM from sys_stat.ShacklesPerMinute here.
+        // That field is the MEASURED value from BpmStats (updated once/min).
+        // Reading it creates a destructive feedback loop: if zeroing takes
+        // most of the first 60s window, BpmStats reports low SPM, sim slows
+        // down, next BpmStats reports even lower, etc.
+        // The real conveyor runs at a fixed speed set by the VFD - it never
+        // adjusts based on the controller's reported SPM.
     }
 }
 
@@ -546,7 +581,7 @@ void PCM3724Sim_Init(void)
     g_pcmSim.started = false;
     g_pcmSim.waiting_for_config = true;
     g_pcmSim.config_ok_tick = 0;
-    g_pcmSim.autostart_delay = 60000;  // 60 seconds in ticks (1ms each)
+    g_pcmSim.autostart_delay = 10000;  // 10 seconds in ticks (1ms each)
 
     RtPrintf("PCM-3724 I/O Simulator initialized\n");
     RtPrintf("  Default SPM  %3d\n", (int)PCM_SIM_DEFAULT_SPM);
@@ -556,7 +591,7 @@ void PCM3724Sim_Init(void)
     RtPrintf("  Counter ON   %3d ms (trolley width, fires at +%dms)\n",
         g_pcmSim.counter_on_ticks, g_pcmSim.counter_start_tick);
     RtPrintf("  Zero flag ON %3d ms (%.1f\" flag length)\n", g_pcmSim.zero_flag_ticks, PCM_SIM_FLAG_LENGTH);
-    RtPrintf("  Waiting for config_Ok then 60s auto-start delay\n");
+    RtPrintf("  Waiting for config_Ok then 10s auto-start delay\n");
 }
 
 //--------------------------------------------------------

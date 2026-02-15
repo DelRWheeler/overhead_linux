@@ -83,6 +83,9 @@ typedef struct
     int             weight_idx;     // index into weight table
     int             port_num;       // COM port number for this instance
 
+    // Bird-present tracking (for sync with PCM3724 sim)
+    bool            prev_bird;      // previous bird-present state (for edge detection)
+
     // Identification
     bool            initialized;
 } HBMSimState;
@@ -114,3 +117,12 @@ int HBMSim_Available(int port_num);
 // Cleanup
 void HBMSim_Cleanup(int port_num);
 void HBMSim_CleanupAll(void);
+
+//--------------------------------------------------------
+// Bird-present signaling (set by PCM3724 sim)
+//
+// When true, the HBM sim outputs bird weights from the table.
+// When false, it outputs ~0 (empty shackle baseline).
+// This is how the sim models birds physically being on the scale.
+//--------------------------------------------------------
+extern volatile bool g_hbm_bird_present;

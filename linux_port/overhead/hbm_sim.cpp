@@ -18,6 +18,7 @@
 
 #include "types.h"
 #include "hbm_sim.h"
+#include <stdlib.h>
 
 #undef  _FILE_
 #define _FILE_  "hbm_sim.cpp"
@@ -25,13 +26,18 @@
 // Global simulator states (one per load cell)
 HBMSimState g_hbmSim[HBM_SIM_MAX_LC];
 
-// Simulated weight table (pounds) - same as Simulator.cpp sim_weight[]
+// Bird-present flag: set by PCM3724 sim when counter pulse fires
+// and the controller has zeroed (WeighZero = true).
+// When false, HBM sim outputs ~0 (empty shackle).
+volatile bool g_hbm_bird_present = false;
+
+// Simulated weight table (pounds) - 2 to 6 lb range for testing schedules/grading
 static const double hbm_sim_weights[HBM_SIM_NUM_WEIGHTS] =
 {
-    2.00, 2.10, 2.20, 2.30, 2.40, 2.50, 2.70, 2.80,
-    3.20, 3.40, 3.30, 3.40, 3.50, 3.60, 3.80, 3.80,
-    2.80, 2.60, 2.70, 2.80, 2.40, 2.30, 2.20, 2.10,
-    3.50, 3.10, 3.80, 3.90, 3.50, 3.40, 3.30, 3.00
+    2.10, 3.40, 4.80, 2.60, 5.20, 3.90, 4.30, 2.30,
+    5.50, 3.10, 4.60, 5.80, 2.80, 4.10, 3.60, 5.40,
+    2.50, 4.90, 3.30, 5.10, 2.90, 4.40, 3.70, 5.70,
+    3.50, 2.40, 5.30, 4.20, 3.80, 5.90, 2.70, 4.50
 };
 
 //--------------------------------------------------------
@@ -515,10 +521,36 @@ static void* HBMSimMeasThread(void* arg)
     {
         if (s->continuous)
         {
-            // Generate weight in ADC counts
-            wt = hbm_sim_weights[s->weight_idx] * CNTS;
-            adc_counts = (int)wt;
-            s->weight_idx = (s->weight_idx + 1) % HBM_SIM_NUM_WEIGHTS;
+            // Check bird-present flag from PCM3724 sim.
+            // When a bird is on the scale (after zeroing), output bird weight.
+            // Otherwise output near-zero (empty shackle baseline).
+            bool bird = g_hbm_bird_present;
+
+            if (bird)
+            {
+                // On rising edge (new bird arrived), advance to next weight
+                if (!s->prev_bird)
+                {
+                    s->weight_idx = (s->weight_idx + 1) % HBM_SIM_NUM_WEIGHTS;
+                    // Bird weight available in hbm_sim_weights[s->weight_idx] if needed for debugging
+                }
+
+                // Output bird weight in ADC counts
+                wt = hbm_sim_weights[s->weight_idx] * CNTS;
+                adc_counts = (int)wt;
+            }
+            else
+            {
+                // Empty shackle - output near-zero baseline
+                // Small positive offset simulates residual hardware offset
+                adc_counts = 500;
+            }
+            s->prev_bird = bird;
+
+            // Add small random noise (±10 ADC counts) to simulate real
+            // load cell behavior. Without noise, the controller's stuck
+            // load cell detector fires (50 consecutive identical readings).
+            adc_counts += (rand() % 21) - 10;
 
             // Push 4-byte packet into FIFO
             pthread_mutex_lock(&s->fifo_mutex);
