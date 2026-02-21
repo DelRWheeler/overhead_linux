@@ -28,6 +28,12 @@ static BOOL   g_tcpConnected[INSTANCES];
 static char   g_tcpHost[INSTANCES][32];
 static USHORT g_tcpPort[INSTANCES];
 
+// Connection state tracking for clean status messages
+static BOOL   g_prevHostConnected = FALSE;
+static int    g_reconnectAttempts[INSTANCES];
+#define RECONNECT_LOG_INTERVAL  30  // Only log reconnect attempts every N tries
+
+
 //--------------------------------------------------------
 // InitTcpClientSockets
 //--------------------------------------------------------
@@ -39,7 +45,9 @@ void InitTcpClientSockets()
         g_tcpConnected[i] = FALSE;
         memset(g_tcpHost[i], 0, sizeof(g_tcpHost[i]));
         g_tcpPort[i] = TCP_CLIENT_BASE_PORT;
+        g_reconnectAttempts[i] = 0;
     }
+    g_prevHostConnected = FALSE;
 }
 
 //--------------------------------------------------------
@@ -89,14 +97,18 @@ int ConnectToTcpHost(int idx)
     strncpy(g_tcpHost[idx], ipAddr, sizeof(g_tcpHost[idx]) - 1);
     g_tcpPort[idx] = port;
 
-    RtPrintf("Connecting to TCP host %s:%d (idx %d)\n", ipAddr, port, idx);
+    // Only log connect attempts on first try or periodically to reduce spam
+    if (g_reconnectAttempts[idx] == 0 || g_reconnectAttempts[idx] % RECONNECT_LOG_INTERVAL == 0)
+        RtPrintf("Connecting to TCP host %s:%d (idx %d, attempt %d)\n",
+                 ipAddr, port, idx, g_reconnectAttempts[idx] + 1);
 
     sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
     if (sock == INVALID_SOCKET)
     {
-        RtPrintf("Error: socket failed %d, file %s, line %d\n",
-                 errno, _FILE_, __LINE__);
+        if (g_reconnectAttempts[idx] == 0)
+            RtPrintf("Error: socket failed %d, file %s, line %d\n",
+                     errno, _FILE_, __LINE__);
         return ERROR_OCCURED;
     }
 
@@ -119,8 +131,9 @@ int ConnectToTcpHost(int idx)
 
     if (serverAddr.sin_addr.s_addr == INADDR_NONE)
     {
-        RtPrintf("Error: Invalid IP address %s, file %s, line %d\n",
-                 ipAddr, _FILE_, __LINE__);
+        if (g_reconnectAttempts[idx] == 0)
+            RtPrintf("Error: Invalid IP address %s, file %s, line %d\n",
+                     ipAddr, _FILE_, __LINE__);
         close(sock);
         return ERROR_OCCURED;
     }
@@ -132,8 +145,9 @@ int ConnectToTcpHost(int idx)
     {
         if (errno != EINPROGRESS)
         {
-            RtPrintf("Error: connect failed %d, file %s, line %d\n",
-                     errno, _FILE_, __LINE__);
+            if (g_reconnectAttempts[idx] == 0)
+                RtPrintf("Error: connect failed %d, file %s, line %d\n",
+                         errno, _FILE_, __LINE__);
             close(sock);
             return ERROR_OCCURED;
         }
@@ -148,8 +162,8 @@ int ConnectToTcpHost(int idx)
 
         if (result <= 0)
         {
-            RtPrintf("Error: connect timeout to %s:%d, file %s, line %d\n",
-                     ipAddr, port, _FILE_, __LINE__);
+            if (g_reconnectAttempts[idx] == 0)
+                RtPrintf("Error: connect timeout to %s:%d\n", ipAddr, port);
             close(sock);
             return ERROR_OCCURED;
         }
@@ -160,7 +174,8 @@ int ConnectToTcpHost(int idx)
 
         if (optVal != 0)
         {
-            RtPrintf("Error: connect error %d to %s:%d\n", optVal, ipAddr, port);
+            if (g_reconnectAttempts[idx] == 0)
+                RtPrintf("Error: connect error %d to %s:%d\n", optVal, ipAddr, port);
             close(sock);
             return ERROR_OCCURED;
         }
@@ -181,6 +196,7 @@ int ConnectToTcpHost(int idx)
     // Store socket
     g_tcpSock[idx] = sock;
     g_tcpConnected[idx] = TRUE;
+    g_reconnectAttempts[idx] = 0;
 
     RtPrintf("Connected to %s:%d\n", ipAddr, port);
 
@@ -406,6 +422,16 @@ int RTFCNDCL TcpConnectionManager()
 
                 if (pShm->IsysLineStatus.connected[i] == FALSE)
                 {
+                    // Detect HOST connection lost (was connected, now disconnected)
+                    if (i == TCP_HOST_INDEX && g_prevHostConnected)
+                    {
+                        g_prevHostConnected = FALSE;
+                        RtPrintf("\n");
+                        RtPrintf("*** Host Comms Lost ***\n");
+                        RtPrintf("    Check switch and ethernet connections.\n");
+                        RtPrintf("\n");
+                    }
+
                     valid_char = 0;
                     for (int j = 0; current_host[j] != 0 && j < 16; j++)
                     {
@@ -415,14 +441,26 @@ int RTFCNDCL TcpConnectionManager()
 
                     if (valid_char >= 7)
                     {
-                        if (ConnectToTcpHost(i) == NO_ERRORS)
+                        int connectResult = ConnectToTcpHost(i);
+
+                        if (connectResult == NO_ERRORS)
                         {
                             pShm->IsysLineStatus.connected[i] = TRUE;
+
+                            // Detect HOST connection established
+                            if (i == TCP_HOST_INDEX)
+                            {
+                                g_prevHostConnected = TRUE;
+                                RtPrintf("\n");
+                                RtPrintf("*** Host Comms Normal ***\n");
+                                RtPrintf("\n");
+                            }
                         }
                         else
                         {
                             pShm->IsysLineStatus.connected[i] = FALSE;
                             DisconnectTcpHost(i);
+                            g_reconnectAttempts[i]++;
                         }
                     }
                 }

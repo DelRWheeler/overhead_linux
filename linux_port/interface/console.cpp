@@ -117,11 +117,12 @@ void ConsoleInit(void)
         fflush(stdout);
 
         // Open log file
-        #ifdef DCHSERVICES_BASE
-        log_file = fopen(DCHSERVICES_BASE "/logs/dchserver.log", "a");
-#else
-        log_file = fopen("/opt/dchservices/logs/dchserver.log", "a");
-#endif
+        // Try home-based paths first, then fallback
+        log_file = fopen("/home/del/dchservices/logs/dchserver.log", "a");
+        if (!log_file)
+            log_file = fopen("/home/dchservice/dchservices/logs/dchserver.log", "a");
+        if (!log_file)
+            log_file = fopen("/opt/dchservices/logs/dchserver.log", "a");
         if (log_file) {
             fprintf(log_file, "\n=== DCH Server started %04d-%02d-%02d %02d:%02d:%02d ===\n",
                     t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,

@@ -3390,7 +3390,7 @@ void __stdcall overhead::GpSendThread(PVOID unused)
                      (app->susp_drop_rec_send == 0) &&
                      (app->drp_rec_count <= DROPRECHISP) )
                     app->SendDropRecords();
-                else
+                else if (app->drp_rec_count > 0)
                 {
                     RtPrintf("SaveDrpRecs: HOST_OK=%d susp=%d cnt=%d hisp=%d\n",
                              HOST_OK ? 1 : 0, app->susp_drop_rec_send & 1,
