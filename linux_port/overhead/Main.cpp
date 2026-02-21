@@ -6,6 +6,7 @@
 //////////////////////////////////////////////////////////////////////
 
 #include "types.h"
+#include <sys/syscall.h>
 
 #undef  _FILE_
 #define _FILE_          "Main.cpp"
@@ -20,11 +21,46 @@ static void ShutdownHandler(PVOID unused, LONG reason);
 //       main():
 //--------------------------------------------------------
 
-// Debug: track why process exits
+// Debug: track why process exits and crashes
 #include <execinfo.h>
+#include <ucontext.h>
+
+static void overhead_crash_handler(int sig, siginfo_t *info, void *ctx)
+{
+    // Write to BOTH stdout and stderr and a file - ensure something gets captured
+    const char marker[] = "\n!!! OVERHEAD CRASH HANDLER ENTERED !!!\n";
+    write(STDOUT_FILENO, marker, sizeof(marker) - 1);
+    write(STDERR_FILENO, marker, sizeof(marker) - 1);
+
+    ucontext_t *uc = (ucontext_t *)ctx;
+    int efd = open("/tmp/overhead_crash.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    char buf[512];
+    int len = snprintf(buf, sizeof(buf),
+        "\n*** OVERHEAD CRASHED (signal %d, pid=%d, tid=%d) ***\n"
+        "Fault address: %p\n"
+        "RIP: 0x%llx\n"
+        "RSP: 0x%llx\n\nBacktrace:\n",
+        sig, getpid(), (int)syscall(SYS_gettid), info->si_addr,
+        (unsigned long long)uc->uc_mcontext.gregs[REG_RIP],
+        (unsigned long long)uc->uc_mcontext.gregs[REG_RSP]);
+    write(STDOUT_FILENO, buf, len);
+    write(STDERR_FILENO, buf, len);
+    if (efd >= 0) write(efd, buf, len);
+
+    void* bt[32];
+    int bt_size = backtrace(bt, 32);
+    backtrace_symbols_fd(bt, bt_size, STDOUT_FILENO);
+    backtrace_symbols_fd(bt, bt_size, STDERR_FILENO);
+    if (efd >= 0) backtrace_symbols_fd(bt, bt_size, efd);
+
+    fsync(STDOUT_FILENO);
+    fsync(STDERR_FILENO);
+    if (efd >= 0) { fsync(efd); close(efd); }
+    _exit(128 + sig);
+}
+
 static void overhead_atexit_handler()
 {
-    // Write to a KNOWN file to ensure we see this even if stderr is lost
     int efd = open("/tmp/overhead_exit.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
     char buf[256];
     int len = snprintf(buf, sizeof(buf),
@@ -32,7 +68,6 @@ static void overhead_atexit_handler()
     write(STDERR_FILENO, buf, len);
     if (efd >= 0) write(efd, buf, len);
 
-    // Print backtrace
     void* bt[32];
     int bt_size = backtrace(bt, 32);
     backtrace_symbols_fd(bt, bt_size, STDERR_FILENO);
@@ -48,6 +83,35 @@ int main(int argc, char* argv[])
     struct tm   *ptime;
 
     atexit(overhead_atexit_handler);
+
+    // Install alternate signal stack so crash handler works even on stack overflow
+    {
+        static char altstack_buf[32768]; // SIGSTKSZ + extra for backtrace
+        stack_t ss;
+        ss.ss_sp = altstack_buf;
+        ss.ss_size = sizeof(altstack_buf);
+        ss.ss_flags = 0;
+        sigaltstack(&ss, NULL);
+    }
+
+    // Install crash signal handler for debugging
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = overhead_crash_handler;
+        sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK;
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS, &sa, NULL);
+        sigaction(SIGFPE, &sa, NULL);
+    }
+
+    // Enable direct port I/O access (requires root, must be done before any I/O)
+#ifndef _PCM3724_SIM_
+    if (iopl(3) != 0) {
+        fprintf(stderr, "FATAL: iopl(3) failed: %s (need root?)\n", strerror(errno));
+        return 1;
+    }
+#endif
 
     // Initialize console output (shared with Interface via console.h)
     ConsoleInit();

@@ -588,23 +588,30 @@ void overhead::CheckIfEPM19() {
 void overhead::initialize()
 {
 
+	RtPrintf("=== initialize() START ===\n");
+
 	//	Determine which board the system is running on
+	RtPrintf("  Checking board type...\n");
 	BoardIsEPM15 = ((unsigned char)(RtReadPortUchar((PUCHAR)0x1d1)) != 0xff);
-	 
+
 	// TG - If Board is not EPM15, then check for EPM19
 	if (!BoardIsEPM15) {
 		CheckIfEPM19();
 	}
+	RtPrintf("  Board: EPM15=%d EPM19=%d\n", BoardIsEPM15, BoardIsEPM19);
 
 	//------------- Initialize Memory
 
     // Open shared memory
+    RtPrintf("  Calling InitMem()...\n");
     if ((hShmem = InitMem()) == NULL)
     {
         RtPrintf("Error InitMem file %s, line %d \n",_FILE_, __LINE__);
         Sleep (1000);
         RtExitProcess(1);
     }
+
+    RtPrintf("  InitMem OK, pShm=%p\n", pShm);
 
     // If shared memory was just created (no Interface running), set RUN_APP
     if (!(pShm->AppFlags & RUN_APP))
@@ -628,37 +635,46 @@ void overhead::initialize()
 
     // for sending messages to host
 
-   InitTrace();
-    RtPrintf("InitTrace complete, calling InitLocals...\n");
+    RtPrintf("  Calling InitTrace()...\n");
+    InitTrace();
+    RtPrintf("  InitTrace complete, calling InitLocals...\n");
 
 //------------- Initialize data
 
     // This needs to be before IO card
     // init because it sets outputs to 0
     InitLocals();
-    RtPrintf("InitLocals complete, calling SetDefaults...\n");
+    RtPrintf("  InitLocals complete, calling SetDefaults...\n");
 
 //----- Load hard coded defaults
 
     SetDefaults();
-    RtPrintf("SetDefaults complete\n");
+    RtPrintf("  SetDefaults complete\n");
 
 //----- This table is a master lookup table for info on shared memory.
 //      It is used for the debug task and for the interface
 
+    RtPrintf("  Calling InitShmTbl()...\n");
     InitShmTbl();
+    RtPrintf("  InitShmTbl complete\n");
 
 //----- Read config files
 
+    RtPrintf("  Calling ReadConfiguration()...\n");
     ReadConfiguration();
+    RtPrintf("  ReadConfiguration complete\n");
 
 //----- Set initial InterSystem fastest indices for each drop
 
+    RtPrintf("  Calling SetIsysFastestIndices()...\n");
 	SetIsysFastestIndices(-1, true);
+    RtPrintf("  SetIsysFastestIndices complete\n");
 
 //----- Setup 2nd 3724 card requirements from Configuration
 
+    RtPrintf("  Calling AnalyzeConfig()...\n");
 	AnalyzeConfig(true);
+    RtPrintf("  AnalyzeConfig complete\n");
 
 //----- Any overrides for debug here
 
@@ -682,11 +698,15 @@ void overhead::initialize()
 
 //------------- Initialize the IO cards
 
+    RtPrintf("  Calling InitIO()...\n");
     InitIO();
+    RtPrintf("  InitIO complete\n");
 
 //------------- Create events/threads to handle communications
 
+    RtPrintf("  Calling InitCommunications()...\n");
     InitCommunications();
+    RtPrintf("  InitCommunications complete\n");
 
 	//	Check to see what board we are running on
 	if (BoardIsEPM15)
@@ -739,9 +759,13 @@ void overhead::initialize()
 			ucbList[1].irq = 11;	//	COM4
 		#endif
 	}
+    RtPrintf("  Board type selection complete\n");
+
 #ifndef _WEIGHT_SIMULATION_MODE_ //GLC added 1/24/05
 
 //------------- Set up load cell
+
+    RtPrintf("  Setting up load cell events...\n");
 
     // Create load cell initialized event GLC
 
@@ -758,7 +782,9 @@ void overhead::initialize()
     }
 
 #ifndef _WEIGHT_SIMULATION_MODE_       //GLC
+    RtPrintf("  Calling InitLoadCell()...\n");
 		InitLoadCell();
+    RtPrintf("  InitLoadCell complete\n");
 #endif
 	//Sleep(5000);
 
@@ -766,8 +792,12 @@ void overhead::initialize()
 
     //------------- Other threads and timers
 
-    InitMiscThreads();
+    RtPrintf("  Calling InitMiscThreads()...\n");
 
+    InitMiscThreads();
+    RtPrintf("  InitMiscThreads complete\n");
+
+    RtPrintf("=== initialize() COMPLETE ===\n");
 }
 
 //--------------------------------------------------------
@@ -3127,10 +3157,16 @@ void __stdcall overhead::Gp_Timer_Main(PVOID addr)
 
 //----- Save any settings/status which changed
 
-    if ( sec1_OK && (app->pShm->OpMode == ModeRun) )
+    if ( sec1_OK )
     {
+        // Always send sys_stat so the API can detect 32/64-bit architecture.
+        // On 64-bit Linux, struct sizes differ from 32-bit XP, and the API
+        // auto-detects from the shmID=88 data size. Without this, the API
+        // defaults to 32-bit sizes and the controller rejects settings writes.
         app->shm_updates[STATID-1] = true;
-        app->saveTotals       = true;
+
+        if (app->pShm->OpMode == ModeRun)
+            app->saveTotals = true;
     }
 
 
@@ -4257,7 +4293,7 @@ void overhead::ProcessMbxMsg()
                     }
                     else
                     {
-                        RtPrintf("Bad length id %d file %s, line %d \n", id+1, _FILE_, __LINE__);
+                        RtPrintf("Bad length id %d: got %d expected %d file %s, line %d \n", id+1, len, shm_tbl[id].struct_len, _FILE_, __LINE__);
 
                         // Request Mutex for send
                         if(RtWaitForSingleObject(trc[EVTBUFID].mutex, WAIT50MS) != WAIT_OBJECT_0)
@@ -11084,20 +11120,15 @@ fsave_grp grp_tbl[MAX_GROUPS] = {
 
 //----- Some miscellaneous prints to see sizes for debug, should normally be commented out.
 
-    /*
-    for ( int i = 0; i < MAXIDS; i++ )
-        RtPrintf("id %d size %u\n", shm_tbl[i].id, shm_tbl[i].struct_len);
-
-    for ( i = 1; i < MAX_GROUPS; i++ )
-        RtPrintf("%s size %u\n", fsave_grp_tbl[i].fname, fsave_grp_tbl[i].struct_size);
-
-        RtPrintf("mhdr size %u\n", sizeof(mhdr));
-        RtPrintf("stat size %u\n", sizeof(pShm->sys_stat));
-
-     RtPrintf(" THostDropRec size %u\n",sizeof(THostDropRec));
-     RtPrintf("fdrec_info %u\n", sizeof(fdrec_info));
-     RtPrintf("ftot_info %u\n",  sizeof(ftot_info));
-    */
+    // Print key struct sizes for 32/64-bit architecture debugging
+    RtPrintf("--- SHM struct sizes (64-bit architecture check) ---\n");
+    RtPrintf("  sizeof(TScheduleSettings) = %u (32-bit: 100, 64-bit: 104)\n", (unsigned)sizeof(TScheduleSettings));
+    RtPrintf("  sizeof(sys_stat)          = %u (32-bit: 8312, 64-bit: 8576)\n", (unsigned)sizeof(pShm->sys_stat));
+    RtPrintf("  sizeof(sys_in/sys_set)    = %u (32-bit: 2416, 64-bit: 2424)\n", (unsigned)sizeof(pShm->sys_set));
+    RtPrintf("  sizeof(struct tm)         = %u (32-bit: 36, 64-bit: 56)\n", (unsigned)sizeof(struct tm));
+    RtPrintf("  sizeof(THostDropRec)      = %u (32-bit: 88, 64-bit: 112)\n", (unsigned)sizeof(THostDropRec));
+    RtPrintf("  Schedule total (id 67)    = %u bytes\n", (unsigned)sizeof(pShm->Schedule));
+    RtPrintf("---------------------------------------------------\n");
 
     shm_valid = true;
 

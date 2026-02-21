@@ -54,9 +54,12 @@ target_link_libraries(overhead
 # -fpermissive: Original MSVC code uses implicit int return types extensively
 # -g: Debug symbols for stack traces
 # -rdynamic: Export symbols for backtrace_symbols
+target_link_options(overhead PRIVATE -no-pie -rdynamic)
 target_compile_options(overhead PRIVATE
     -fpermissive
     -g
+    -O0
+    -fno-pie
     -rdynamic
     -fno-omit-frame-pointer
     -Wall

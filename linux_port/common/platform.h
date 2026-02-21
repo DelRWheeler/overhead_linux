@@ -34,6 +34,7 @@
 #include <syslog.h>
 #include <ctype.h>
 #include <execinfo.h>
+#include <sys/io.h>     // ioperm(), inb(), outb() for direct port I/O on x86
 
 // Forward declaration of console output function
 extern int RtPrintf(const char* fmt, ...);
@@ -405,6 +406,10 @@ static inline BOOL RtReleaseSemaphore(HANDLE handle, LONG count, LPLONG prev)
 
 static inline HANDLE RtCreateMutex(void* attr, BOOL initialOwner, const char* name)
 {
+    if (!name) {
+        RtPrintf("ERROR: RtCreateMutex called with NULL name!\n");
+        return NULL;
+    }
     char sem_name[256];
     snprintf(sem_name, sizeof(sem_name), "/mtx_%s", name);
 
@@ -425,6 +430,10 @@ static inline HANDLE RtCreateMutex(void* attr, BOOL initialOwner, const char* na
 
 static inline HANDLE RtOpenMutex(DWORD access, BOOL inherit, const char* name)
 {
+    if (!name) {
+        RtPrintf("ERROR: RtOpenMutex called with NULL name!\n");
+        return NULL;
+    }
     char sem_name[256];
     snprintf(sem_name, sizeof(sem_name), "/mtx_%s", name);
 
@@ -654,8 +663,14 @@ static inline HANDLE CreateThread(void* attr, DWORD stackSize,
 
     pthread_attr_t pattr;
     pthread_attr_init(&pattr);
-    if (stackSize > 0) {
-        pthread_attr_setstacksize(&pattr, stackSize);
+    // Original RTX code used 16KB stacks, but Linux pthreads need more:
+    // - RtPrintf uses 2KB stack per call (char msg[2048])
+    // - Signal handlers need stack space for ucontext_t (~800 bytes)
+    // - Minimum 256KB to be safe for nested function calls
+    {
+        size_t minStack = 256 * 1024; // 256KB minimum
+        size_t useStack = (stackSize > minStack) ? stackSize : minStack;
+        pthread_attr_setstacksize(&pattr, useStack);
     }
 
     if (pthread_create(&ti->thread, &pattr, _thread_wrapper, ti) != 0) {
@@ -1182,12 +1197,28 @@ static inline HANDLE RtAttachShutdownHandler(void* security, DWORD stackSize,
 
 static inline BOOL RtEnablePortIo(PUCHAR addr, ULONG bytes)
 {
-    // On x86 Linux: ioperm()/iopl()
-    // On ARM/VM: not applicable - stub always succeeds
-    // With PCM-3724 sim: not applicable - virtual ports don't need enabling
+#ifdef _PCM3724_SIM_
+    // Virtual ports don't need enabling
     (void)addr;
     (void)bytes;
     return TRUE;
+#else
+    // Real hardware: use iopl(3) for full port access.
+    // ioperm() doesn't survive execvp(), but iopl() does.
+    // Only need to call once - subsequent calls are harmless.
+    (void)addr;
+    (void)bytes;
+    static int iopl_done = 0;
+    if (!iopl_done) {
+        if (iopl(3) != 0) {
+            RtPrintf("ERROR: iopl(3) failed: %s (need root?)\n", strerror(errno));
+            return FALSE;
+        }
+        iopl_done = 1;
+        RtPrintf("Port I/O access enabled (iopl)\n");
+    }
+    return TRUE;
+#endif
 }
 
 #ifdef _PCM3724_SIM_
@@ -1212,24 +1243,12 @@ static inline UCHAR RtReadPortUchar(PUCHAR addr)
 
 static inline void RtWritePortUchar(PUCHAR addr, UCHAR value)
 {
-    // Stub - no direct port I/O
-    // On x86 Linux with ioperm: outb(value, (unsigned short)(uintptr_t)addr)
-    // REVERT to actual outb() when building for real hardware.
-    (void)addr;
-    (void)value;
+    outb(value, (unsigned short)(uintptr_t)addr);
 }
 
 static inline UCHAR RtReadPortUchar(PUCHAR addr)
 {
-    // Stub - no direct port I/O
-    // On x86 Linux with ioperm: inb((unsigned short)(uintptr_t)addr)
-    // IMPORTANT: Return 0xFF (all bits high) because the real PCM-3724 uses
-    // active-low logic. The controller inverts reads with ~, so 0xFF -> 0x00
-    // (nothing active). Returning 0x00 would mean ~0x00 = 0xFF = everything
-    // active, causing phantom syncs, pushbuttons, and missed bird triggers.
-    // REVERT to actual inb() when building for real hardware (SandCat board).
-    (void)addr;
-    return 0xFF;
+    return inb((unsigned short)(uintptr_t)addr);
 }
 
 #endif // _PCM3724_SIM_
@@ -1404,6 +1423,10 @@ static LPTOP_LEVEL_EXCEPTION_FILTER g_exceptionFilter = NULL;
 
 static void _segfault_handler(int sig, siginfo_t* info, void* context)
 {
+    const char marker[] = "\n!!! SEGFAULT HANDLER ENTERED !!!\n";
+    write(STDOUT_FILENO, marker, sizeof(marker) - 1);
+    write(STDERR_FILENO, marker, sizeof(marker) - 1);
+
     // Use write() which is async-signal-safe to ensure crash is visible
     const char* sig_name = "UNKNOWN";
     switch(sig) {
@@ -1417,17 +1440,21 @@ static void _segfault_handler(int sig, siginfo_t* info, void* context)
     int len = snprintf(buf, sizeof(buf),
         "\n*** CRASH: Signal %s (%d) at address %p ***\n",
         sig_name, sig, info ? info->si_addr : NULL);
+    write(STDOUT_FILENO, buf, len);
     write(STDERR_FILENO, buf, len);
 
     // Also write crash info + backtrace to a dedicated crash file
     int crashfd = open("/tmp/overhead_crash.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (crashfd >= 0) {
         write(crashfd, buf, len);
-        // Write backtrace (not strictly async-signal-safe but usually works)
-        void* bt[32];
-        int bt_size = backtrace(bt, 32);
+    }
+    // Write backtrace to all outputs
+    void* bt[32];
+    int bt_size = backtrace(bt, 32);
+    backtrace_symbols_fd(bt, bt_size, STDOUT_FILENO);
+    backtrace_symbols_fd(bt, bt_size, STDERR_FILENO);
+    if (crashfd >= 0) {
         backtrace_symbols_fd(bt, bt_size, crashfd);
-        backtrace_symbols_fd(bt, bt_size, STDERR_FILENO);
         close(crashfd);
     }
 

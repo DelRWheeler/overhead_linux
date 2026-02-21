@@ -73,6 +73,10 @@ void GetDateStr(char* str)
 
 bool FileExists(const char* fname)
 {
+    if (!fname) {
+        RtPrintf("ERROR: FileExists called with NULL filename!\n");
+        return false;
+    }
     struct stat st;
     return (stat(fname, &st) == 0);
 }
