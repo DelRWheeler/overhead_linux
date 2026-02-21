@@ -484,13 +484,26 @@ class SettingsViewerWindow(Gtk.Window):
 
     def __init__(self, title, content, parent=None):
         super().__init__(title=title)
-        self.set_default_size(700, 500)
         if parent:
             self.set_transient_for(parent)
 
+        # Size to fit the screen (leave room for title bar)
+        screen = Gdk.Screen.get_default()
+        scr_w = screen.get_width()
+        scr_h = screen.get_height()
+        win_w = min(700, scr_w - 20)
+        win_h = min(500, scr_h - 40)
+        self.set_default_size(win_w, win_h)
+
+        # Position at top-left so title bar is always reachable
+        self.move(10, 10)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(vbox)
+
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        self.add(scrolled)
+        vbox.pack_start(scrolled, True, True, 0)
 
         textview = Gtk.TextView()
         textview.set_editable(False)
@@ -500,6 +513,11 @@ class SettingsViewerWindow(Gtk.Window):
         textview.set_top_margin(8)
         textview.get_buffer().set_text(content)
         scrolled.add(textview)
+
+        # Close button at bottom so it's always accessible
+        close_btn = Gtk.Button(label="Close")
+        close_btn.connect("clicked", lambda _: self.destroy())
+        vbox.pack_start(close_btn, False, False, 4)
 
         self.show_all()
 

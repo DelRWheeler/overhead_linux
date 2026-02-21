@@ -414,7 +414,7 @@ int RTFCNDCL UdpTraceThread(PVOID unused)
                              (SOCKADDR*)&saUdpServ,
                              sizeof(SOCKADDR_IN));
 
-                if (err < 0)
+                if (err < 0 && errno != ENETUNREACH)
                 {
                     RtPrintf("DoUdpClient:sendto error %d\n", errno);
                 }
