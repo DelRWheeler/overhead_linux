@@ -30,6 +30,11 @@ volatile void* g_sentinel_app   = NULL;  // set once after new overhead
 volatile int   g_sentinel_magic = 0;     // set to 0xDEADBEEF after init
 volatile int   g_shm_fd         = -1;    // fd for SharedMemory (for proc/maps check)
 
+// GP_TIMER checkpoint tracking — updated at each stage of Gp_Timer_Main
+// 0 = not started, 1-N = checkpoint number in sequence
+volatile int g_gptimer_checkpoint = 0;
+volatile int g_gptimer_last_tick  = 0;
+
 //--------------------------------------------------------
 //       main():
 //--------------------------------------------------------
@@ -252,6 +257,8 @@ int main(int argc, char* argv[])
         sigaction(SIGSEGV, &sa, NULL);
         sigaction(SIGBUS, &sa, NULL);
         sigaction(SIGFPE, &sa, NULL);
+        sigaction(SIGABRT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
     }
 
     // Enable direct port I/O access (requires root, must be done before any I/O)
@@ -346,6 +353,29 @@ int main(int argc, char* argv[])
         Sleep (1000);
     }
 
+    // Main loop exited — AppFlags is 0. Log this BEFORE _exit kills everything.
+    {
+        char exit_buf[512];
+        struct timespec exit_ts;
+        clock_gettime(CLOCK_REALTIME, &exit_ts);
+        struct tm exit_tm;
+        localtime_r(&exit_ts.tv_sec, &exit_tm);
+        int exit_fd = open("/tmp/overhead_appflags.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (exit_fd >= 0) {
+            int elen = snprintf(exit_buf, sizeof(exit_buf),
+                "[%02d:%02d:%02d.%03ld] PID=%d MAIN LOOP EXITED: AppFlags=%d\n"
+                "  GP_TIMER last checkpoint=%d last_tick=%d AppHeartbeat=%d\n---\n",
+                exit_tm.tm_hour, exit_tm.tm_min, exit_tm.tm_sec,
+                exit_ts.tv_nsec / 1000000, getpid(),
+                app->pShm ? app->pShm->AppFlags : -1,
+                (int)g_gptimer_checkpoint, (int)g_gptimer_last_tick,
+                app->pShm ? app->pShm->AppHeartbeat : -1);
+            write(exit_fd, exit_buf, elen);
+            fsync(exit_fd);
+            close(exit_fd);
+        }
+    }
+
     // don't lose any records
     app->SaveDropRecords(true);
 
@@ -397,6 +427,7 @@ void CheckHeartbeats()
             RtPrintf("\n****************************************************\n");
             RtPrintf("*  Overhead not responding, overhead shutdown       *\n");
             RtPrintf("****************************************************\n");
+            logAppFlagsChange("CheckHeartbeats: GP_TIMER not responding");
             app->pShm->AppFlags = 0;
         }
 
@@ -429,6 +460,7 @@ void CheckHeartbeats()
             RtPrintf("\n****************************************************\n");
             RtPrintf("* Interface not responding, overhead shutdown       *\n");
             RtPrintf("****************************************************\n");
+            logAppFlagsChange("CheckHeartbeats: Interface not responding");
             app->pShm->AppFlags = 0;
         }
 
@@ -470,6 +502,11 @@ void ShutdownHandler(PVOID unused, LONG reason)
     }
 
     RtPrintf("SHUTDOWN HANDLER: Received \"%s\" notification.\n", s);
+    {
+        char shutdown_reason[128];
+        snprintf(shutdown_reason, sizeof(shutdown_reason), "ShutdownHandler: %s", s);
+        logAppFlagsChange(shutdown_reason);
+    }
     // don't lose any records
     app->saveDrpRecs = true;
     Sleep(500);

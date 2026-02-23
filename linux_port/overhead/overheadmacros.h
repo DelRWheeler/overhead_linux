@@ -5,7 +5,7 @@
 app->saveDrpRecs = true; \
 Sleep(500); \
 app->ClearOutputs(); \
-if (isPShmValid()) app->pShm->AppFlags = 0;
+if (isPShmValid()) { logAppFlagsChange("EXCEPTION_SHUTDOWN macro"); app->pShm->AppFlags = 0; }
 
 #define SYNC_OK     (pSyncStat->zeroed) && (trolly_counters[i] == syncOffset) //jdc
 

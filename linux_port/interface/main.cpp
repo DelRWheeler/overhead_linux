@@ -19,9 +19,30 @@
 #include "types.h"
 #include "tcpconfig.h"
 #include "console.h"
+#include <time.h>
+#include <sys/syscall.h>
 
 #undef  _FILE_
 #define _FILE_      "main.cpp"
+
+// Write diagnostic to /tmp/overhead_appflags.log when Interface touches AppFlags
+static void logInterfaceAppFlags(const char* reason)
+{
+    int fd = open("/tmp/overhead_appflags.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    char buf[256];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    int len = snprintf(buf, sizeof(buf),
+        "[%02d:%02d:%02d.%03ld] PID=%d INTERFACE: %s\n---\n",
+        tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000,
+        getpid(), reason);
+    write(fd, buf, len);
+    fsync(fd);
+    close(fd);
+}
 
 // External declarations
 extern void TelnetMain();
@@ -225,8 +246,10 @@ int main(int argc, char* argv[])
                          pShm->IsysLineStatus.app_threads, ALL_SYSTEMS_READY,
                          thread_errors, FATAL_ERR_CNT);
 
-            if (++thread_errors > FATAL_ERR_CNT)
+            if (++thread_errors > FATAL_ERR_CNT) {
+                logInterfaceAppFlags("Main loop: thread_errors > FATAL_ERR_CNT, calling Shutdown");
                 Shutdown(PIPE_ERR_RESTART_NT);
+            }
         }
 
         // Check for hung mailboxes
@@ -267,6 +290,16 @@ int main(int argc, char* argv[])
         Sleep(950);
 
     } while (pShm && (pShm->AppFlags & 1));
+
+    // Log WHY the main loop exited
+    {
+        char exit_reason[256];
+        snprintf(exit_reason, sizeof(exit_reason),
+            "Main loop exited: pShm=%p AppFlags=%d err_routine_close=%d overhead_pid=%d",
+            (void*)pShm, pShm ? pShm->AppFlags : -1,
+            (int)err_routine_close, (int)g_overhead_pid);
+        logInterfaceAppFlags(exit_reason);
+    }
 
     if (!err_routine_close)
         ErrorRoutine((BYTE*)"Error: Overhead shutdown");
@@ -433,8 +466,10 @@ void Heartbeats()
         RtPrintf("Heartbeat check: AppHB=%d prev=%d fail=%d pShm=%p\n",
                  pShm->AppHeartbeat, prev_app_heartbeat, app_fail_count, (void*)pShm);
 
-        if (app_fail_count > 5)
+        if (app_fail_count > 5) {
+            logInterfaceAppFlags("Heartbeats: app_fail_count > 5, calling ErrorRoutine");
             ErrorRoutine((BYTE*)"Error: app_fail_count > 5");
+        }
     }
     else
     {
@@ -476,6 +511,14 @@ BOOL ConsoleHandler(DWORD CEvent)
 void ErrorRoutine(BYTE *sbuf)
 {
     RtPrintf("%s err\n", sbuf);
+
+    // Log to file BEFORE setting AppFlags — this tells us if Interface cleared it
+    {
+        char reason[256];
+        snprintf(reason, sizeof(reason), "ErrorRoutine: %s (AppFlags was %d)",
+                 (const char*)sbuf, pShm ? pShm->AppFlags : -1);
+        logInterfaceAppFlags(reason);
+    }
 
     pEvtStr = (char*)sbuf;
 
@@ -562,6 +605,7 @@ void Shutdown(int action)
                     (LPCTSTR*)&pEvtStr, NULL);
 
         RtPrintf("%s\n", evt_str);
+        logInterfaceAppFlags("Shutdown(RESTART_APP): Host initiated App restart");
 
         if (pShm)
             pShm->AppFlags = 0;
@@ -580,6 +624,7 @@ void Shutdown(int action)
                     (LPCTSTR*)&pEvtStr, NULL);
 
         RtPrintf("%s\n", evt_str);
+        logInterfaceAppFlags("Shutdown(PIPE_ERR_RESTART_NT): thread status bad");
 
         if (pShm)
             pShm->AppFlags = 0;
@@ -600,6 +645,7 @@ void Shutdown(int action)
                     (LPCTSTR*)&pEvtStr, NULL);
 
         RtPrintf("%s\n", evt_str);
+        logInterfaceAppFlags("Shutdown(RESTART_NT): Host initiated system restart");
 
         if (pShm)
             pShm->AppFlags = 0;
@@ -620,6 +666,7 @@ void Shutdown(int action)
                     (LPCTSTR*)&pEvtStr, NULL);
 
         RtPrintf("%s\n", evt_str);
+        logInterfaceAppFlags("Shutdown(SHUTDOWN_NT): Host initiated system shutdown");
 
         if (pShm)
             pShm->AppFlags = 0;

@@ -5,6 +5,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <time.h>
+#include <execinfo.h>
+#include <sys/syscall.h>
 
 //--------------------------------------------------------
 //  External Variables
@@ -54,6 +56,11 @@ extern trace_ctrl       trc           [MAXTRCBUFFERS];
 //--------------------------------------------------------
 extern volatile void* g_sentinel_pShm;
 extern volatile int   g_sentinel_magic;
+
+// GP_TIMER checkpoint tracking for hang diagnostics
+// Updated at each stage of Gp_Timer_Main, read at process exit
+extern volatile int g_gptimer_checkpoint;
+extern volatile int g_gptimer_last_tick;
 
 // Write comprehensive diagnostics when pShm invalidation is detected.
 // Called once, writes to /tmp/overhead_pshm_diag.log
@@ -139,6 +146,56 @@ static inline void dumpPShmDiagnostics(const char* reason)
     len = snprintf(buf, sizeof(buf), "=== END DIAGNOSTICS ===\n\n");
     write(fd, buf, len);
 
+    fsync(fd);
+    close(fd);
+}
+
+// Log AppFlags change to file. Called at EVERY place that sets AppFlags = 0.
+// Uses write() (unbuffered) and O_APPEND so data survives _exit() and
+// multiple process instances.
+static inline void logAppFlagsChange(const char* reason)
+{
+    int fd = open("/tmp/overhead_appflags.log",
+                  O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+
+    char buf[512];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+
+    int len = snprintf(buf, sizeof(buf),
+        "[%02d:%02d:%02d.%03ld] PID=%d TID=%ld AppFlags→0: %s\n",
+        tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000,
+        getpid(), (long)syscall(SYS_gettid), reason);
+    write(fd, buf, len);
+
+    // Also log current AppHeartbeat if accessible
+    if (app && app->pShm) {
+        void* page = (void*)((uintptr_t)app->pShm & ~(uintptr_t)0xFFF);
+        if (msync(page, 4096, MS_ASYNC) == 0) {
+            len = snprintf(buf, sizeof(buf),
+                "  AppHeartbeat=%d IfServerHeartbeat=%d OpMode=%d\n",
+                app->pShm->AppHeartbeat,
+                app->pShm->IfServerHeartbeat,
+                app->pShm->OpMode);
+            write(fd, buf, len);
+        }
+    }
+
+    // Simple backtrace
+    void* bt[16];
+    int nframes = backtrace(bt, 16);
+    if (nframes > 0) {
+        len = snprintf(buf, sizeof(buf), "  backtrace (%d frames):\n", nframes);
+        write(fd, buf, len);
+        // backtrace_symbols_fd writes directly to fd
+        backtrace_symbols_fd(bt, nframes, fd);
+    }
+
+    len = snprintf(buf, sizeof(buf), "---\n");
+    write(fd, buf, len);
     fsync(fd);
     close(fd);
 }

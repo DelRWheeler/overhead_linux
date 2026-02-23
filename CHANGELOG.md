@@ -37,6 +37,86 @@ If you forget this and deploy the `0xFF` stub to real hardware, the `inb()` read
 
 Applies to both VM and real hardware. The capability is stored on the file and gets wiped by every rebuild/copy.
 
+## Feb 23, 2026 - CPU Starvation Crash Fix & Diagnostics
+
+### Critical Bug: Controller crashed every 3-6 minutes
+
+**Symptom:** `CheckHeartbeats: GP_TIMER not responding` — GP_TIMER thread starved on Intel Atom E3825 (2 cores, 1.33GHz). Load average: 17.05, overhead CPU: 75.4%.
+
+**Root causes identified and fixed:**
+
+#### 1. WaitForMultipleObjects: busy-polling replaced with eventfd + poll() (CRITICAL)
+
+The Linux port's `WaitForMultipleObjects()` was a `while(1)` loop with `usleep(10000)` — 10ms polling that never returned `WAIT_TIMEOUT`. On XP/RTX this was a proper kernel wait (zero CPU).
+
+**Fix:** Added `notify_fd` (eventfd) to event struct. `RtSetEvent()` writes to eventfd, `WaitForMultipleObjects()` uses `poll()` on eventfds with proper timeout. Zero CPU when idle.
+
+#### 2. Auto-reset events not consumed by WaitForMultipleObjects (CRITICAL)
+
+The `process_event[]` events (EVT_SHM_READ, etc.) are auto-reset (`manualReset=false`). On Windows, `WaitForMultipleObjects` automatically clears auto-reset events when consumed. The initial poll()-based fix didn't do this — events stayed signaled forever, causing `MbxEventHandler` to spin at ~3500 iterations/sec.
+
+**Fix:** `WaitForMultipleObjects` now clears `signaled=0` and drains eventfd for auto-reset events in both fast-path and poll-path. Also fixed `RtWaitForSingleObject` and `RtResetEvent` to drain eventfd.
+
+#### 3. GpSendThread: 5ms polling loop
+
+`GpSendThread` had `Sleep(5)` — 200 wakeups/sec polling flags set every 500ms.
+
+**Fix:** Changed to `Sleep(50)` — still catches flags within 50ms.
+
+#### 4. Timer threads: no real-time priority
+
+GP_TIMER ran at normal priority, easily starved by other threads.
+
+**Fix:** `_timer_thread_func()` sets `SCHED_RR` priority. Requires `CAP_SYS_NICE` (granted via systemd `AmbientCapabilities`).
+
+#### 5. ExitWindowsEx: called `system("sudo reboot")`
+
+On XP this rebooted the PC. On Linux, rebooting the whole system is wrong — just restart the service.
+
+**Fix:** Changed to `_exit(1)` and let systemd `Restart=on-failure` handle restart.
+
+### Results
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Load average | 17.05 | 0.62 |
+| Overhead CPU | 75.4% | 7.6% |
+| MbxEventHandler | Busy-spin (3500/sec) | 50ms poll blocking (20/sec) |
+| All thread states | R (running) | S (sleeping) |
+| Crash frequency | Every 3-6 min | None |
+
+### Diagnostic infrastructure added
+
+- `logAppFlagsChange()` — logs every `AppFlags=0` with timestamp, PID, TID, backtrace
+- `logInterfaceAppFlags()` — logs Interface shutdown decisions
+- GP_TIMER checkpoint tracking (`g_gptimer_checkpoint` 1-99) for hang diagnosis
+- Heartbeat health log (`/tmp/overhead_heartbeat.log`) every ~5 seconds
+- Timer thread exit logging
+
+### PCM-3724 Simulator removed
+
+Deleted `pcm3724_sim.cpp` and `pcm3724_sim.h`. The signal generator on SandCat A provides real PCM-3724 digital I/O signals — the built-in simulator is not needed and must stay disabled.
+
+### Systemd service (`dch-controller.service`)
+
+- Added `Nice=-5` and `AmbientCapabilities=CAP_SYS_NICE` for RT scheduling
+- `ExecStopPost` kills both `overhead` and `interface` (was only killing overhead)
+- `ExecStartPre` cleans orphan overhead processes
+- Disabled conflicting `dch-server-gui.service` (was grabbing port 5000)
+
+### Modified files
+
+- `linux_port/common/platform.h` — eventfd + poll() WaitForMultipleObjects with auto-reset, SCHED_RR timer threads, eventfd drain in RtResetEvent/RtWaitForSingleObject, ExitWindowsEx fix
+- `linux_port/overhead/overhead.cpp` — GP_TIMER checkpoints, heartbeat log, GpSendThread Sleep(50), GenError logging
+- `linux_port/overhead/Main.cpp` — GP_TIMER checkpoint globals, exit logging, SIGABRT/SIGTERM handlers
+- `linux_port/overhead/overheadext.h` — logAppFlagsChange() with backtrace, checkpoint externs
+- `linux_port/overhead/overheadmacros.h` — logAppFlagsChange in EXCEPTION_SHUTDOWN macro
+- `linux_port/interface/main.cpp` — logInterfaceAppFlags() diagnostic logging
+- `linux_port/overhead/pcm3724_sim.cpp` — DELETED
+- `linux_port/overhead/pcm3724_sim.h` — DELETED
+
+---
+
 ## Feb 11, 2026 - Session 3: HBM Load Cell Simulator & EPIPE Fix
 
 ### HBM FIT7 Digital Load Cell Simulator (NEW)

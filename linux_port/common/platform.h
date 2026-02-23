@@ -28,6 +28,7 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/eventfd.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -228,6 +229,7 @@ typedef struct {
             pthread_cond_t  cond;
             int             signaled;
             int             manual_reset;
+            int             notify_fd;  // eventfd for poll()-based WaitForMultipleObjects
         } event;
         pthread_t   thread;
     };
@@ -481,6 +483,9 @@ static inline HANDLE RtCreateEvent(void* attr, BOOL manualReset,
     h->event.signaled = initialState ? 1 : 0;
     h->event.manual_reset = manualReset ? 1 : 0;
 
+    // Create eventfd for poll()-based WaitForMultipleObjects (zero CPU when idle)
+    h->event.notify_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+
     return (HANDLE)h;
 }
 
@@ -497,6 +502,13 @@ static inline BOOL RtSetEvent(HANDLE handle)
     h->event.signaled = 1;
     pthread_cond_broadcast(&h->event.cond);
     pthread_mutex_unlock(&h->event.mutex);
+
+    // Wake up any poll()-based waiters (WaitForMultipleObjects)
+    if (h->event.notify_fd >= 0) {
+        uint64_t val = 1;
+        write(h->event.notify_fd, &val, sizeof(val));
+    }
+
     return TRUE;
 }
 
@@ -510,6 +522,11 @@ static inline BOOL RtResetEvent(HANDLE handle)
 
     pthread_mutex_lock(&h->event.mutex);
     h->event.signaled = 0;
+    // Drain eventfd so poll() won't see stale data
+    if (h->event.notify_fd >= 0) {
+        uint64_t val;
+        read(h->event.notify_fd, &val, sizeof(val));
+    }
     pthread_mutex_unlock(&h->event.mutex);
     return TRUE;
 }
@@ -565,8 +582,14 @@ static inline DWORD RtWaitForSingleObject(HANDLE handle, DWORD milliseconds)
                 }
             }
         }
-        if (!h->event.manual_reset)
+        if (!h->event.manual_reset) {
             h->event.signaled = 0;
+            // Drain eventfd so poll() won't see stale data
+            if (h->event.notify_fd >= 0) {
+                uint64_t val;
+                read(h->event.notify_fd, &val, sizeof(val));
+            }
+        }
         pthread_mutex_unlock(&h->event.mutex);
         return WAIT_OBJECT_0;
     }
@@ -595,6 +618,7 @@ static inline BOOL RtCloseHandle(HANDLE handle)
             close(h->shm.fd);
         break;
     case HANDLE_EVENT:
+        if (h->event.notify_fd >= 0) close(h->event.notify_fd);
         pthread_mutex_destroy(&h->event.mutex);
         pthread_cond_destroy(&h->event.cond);
         break;
@@ -962,12 +986,12 @@ static inline BOOL SetLocalTime(SYSTEMTIME* st)
 static inline BOOL ExitWindowsEx(UINT flags, DWORD reason)
 {
     if (flags == EWX_REBOOT) {
-        RtPrintf("System reboot requested\n");
-        system("sudo reboot");
+        RtPrintf("Service restart requested (was system reboot on XP)\n");
     } else {
-        RtPrintf("System shutdown requested\n");
-        system("sudo shutdown -h now");
+        RtPrintf("Service shutdown requested (was system shutdown on XP)\n");
     }
+    // On XP this rebooted the PC; on Linux we just exit and let systemd restart us.
+    _exit(1);
     return TRUE;
 }
 
@@ -1007,19 +1031,67 @@ typedef ConsoleHandlerFunc PHANDLER_ROUTINE;
 static inline DWORD WaitForMultipleObjects(DWORD count, HANDLE* handles,
                                             BOOL waitAll, DWORD ms)
 {
-    // Simple polling implementation for events
-    while (1) {
-        for (DWORD i = 0; i < count; i++) {
-            PlatformHandle* h = (PlatformHandle*)handles[i];
-            if (h && h->type == HANDLE_EVENT) {
-                pthread_mutex_lock(&h->event.mutex);
-                int sig = h->event.signaled;
-                pthread_mutex_unlock(&h->event.mutex);
-                if (sig) return WAIT_OBJECT_0 + i;
+    // First check if any event is already signaled (fast path)
+    for (DWORD i = 0; i < count; i++) {
+        PlatformHandle* h = (PlatformHandle*)handles[i];
+        if (h && h->type == HANDLE_EVENT) {
+            pthread_mutex_lock(&h->event.mutex);
+            int sig = h->event.signaled;
+            if (sig && !h->event.manual_reset) {
+                // Auto-reset: clear signaled state on consume (matches Windows behavior)
+                h->event.signaled = 0;
+                // Drain the eventfd so poll() won't see stale data
+                if (h->event.notify_fd >= 0) {
+                    uint64_t val;
+                    read(h->event.notify_fd, &val, sizeof(val));
+                }
             }
+            pthread_mutex_unlock(&h->event.mutex);
+            if (sig) return WAIT_OBJECT_0 + i;
         }
-        usleep(10000); // 10ms poll interval
     }
+
+    // Build pollfd array from event notify_fds
+    struct pollfd fds[count];
+    for (DWORD i = 0; i < count; i++) {
+        PlatformHandle* h = (PlatformHandle*)handles[i];
+        if (h && h->type == HANDLE_EVENT && h->event.notify_fd >= 0) {
+            fds[i].fd = h->event.notify_fd;
+            fds[i].events = POLLIN;
+        } else {
+            fds[i].fd = -1;  // poll() ignores negative fds
+            fds[i].events = 0;
+        }
+        fds[i].revents = 0;
+    }
+
+    // Block in poll() — zero CPU while waiting, proper timeout
+    int timeout_ms = (ms == INFINITE) ? -1 : (int)ms;
+    int ret = poll(fds, count, timeout_ms);
+
+    if (ret == 0) return WAIT_TIMEOUT;
+    if (ret < 0) return (errno == EINTR) ? WAIT_TIMEOUT : WAIT_FAILED;
+
+    // Check which event was signaled
+    for (DWORD i = 0; i < count; i++) {
+        if (fds[i].revents & POLLIN) {
+            // Drain the eventfd
+            uint64_t val;
+            read(fds[i].fd, &val, sizeof(val));
+
+            PlatformHandle* h = (PlatformHandle*)handles[i];
+            pthread_mutex_lock(&h->event.mutex);
+            int sig = h->event.signaled;
+            if (sig && !h->event.manual_reset) {
+                // Auto-reset: clear signaled state on consume
+                h->event.signaled = 0;
+            }
+            pthread_mutex_unlock(&h->event.mutex);
+            if (sig) return WAIT_OBJECT_0 + i;
+        }
+    }
+
+    return WAIT_TIMEOUT;
 }
 
 //------------------------------------------------------------------------
@@ -1052,6 +1124,17 @@ static void* _timer_thread_func(void* arg)
 {
     TimerHandle* th = (TimerHandle*)arg;
 
+    // Set real-time scheduling to prevent CPU starvation from other threads.
+    // GP_TIMER heartbeat must never be starved or CheckHeartbeats kills the process.
+    {
+        struct sched_param sp;
+        sp.sched_priority = (th->priority > 0) ? th->priority : 10;
+        if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) != 0) {
+            // Fallback: at least try to raise niceness
+            // (requires CAP_SYS_NICE or AmbientCapabilities in systemd service)
+        }
+    }
+
     // Wait for initial expiration
     struct timespec delay;
     delay.tv_sec = th->interval.it_value.tv_sec;
@@ -1073,6 +1156,26 @@ static void* _timer_thread_func(void* arg)
         if (!th->active) break;
         nanosleep(&period, NULL);
     }
+
+    // Timer thread exiting — log this (should never happen during normal operation)
+    {
+        int tfd = open("/tmp/overhead_appflags.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (tfd >= 0) {
+            char tbuf[256];
+            struct timespec tts;
+            clock_gettime(CLOCK_REALTIME, &tts);
+            struct tm ttm;
+            localtime_r(&tts.tv_sec, &ttm);
+            int tlen = snprintf(tbuf, sizeof(tbuf),
+                "[%02d:%02d:%02d.%03ld] PID=%d TIMER THREAD EXITING: active=%d callback=%p\n---\n",
+                ttm.tm_hour, ttm.tm_min, ttm.tm_sec, tts.tv_nsec / 1000000,
+                getpid(), th->active, (void*)th->callback);
+            write(tfd, tbuf, tlen);
+            fsync(tfd);
+            close(tfd);
+        }
+    }
+
     return NULL;
 }
 

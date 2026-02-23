@@ -3026,7 +3026,39 @@ void __stdcall overhead::Gp_Timer_Main(PVOID addr)
     }
 
     // Guard: skip if pShm is invalid (prevents SIGSEGV in timer callback)
-    if (!isPShmValid()) return;
+    if (!isPShmValid()) {
+        static int gp_skip_count = 0;
+        if (gp_skip_count++ % 10 == 0) {
+            RtPrintf("GP_TIMER: pShm invalid, skip #%d\n", gp_skip_count);
+        }
+        return;
+    }
+
+    g_gptimer_checkpoint = 1;  // CP1: passed isPShmValid
+
+    // Heartbeat health log: write PID + timestamp every 10 ticks (~5 sec)
+    // Uses O_APPEND so data survives across process restarts
+    {
+        static int hb_tick = 0;
+        if (hb_tick++ % 10 == 0) {
+            static int hb_fd = -1;
+            if (hb_fd < 0) hb_fd = open("/tmp/overhead_heartbeat.log",
+                                         O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (hb_fd >= 0) {
+                char hb_buf[128];
+                struct timespec hb_ts;
+                clock_gettime(CLOCK_REALTIME, &hb_ts);
+                struct tm hb_tm;
+                localtime_r(&hb_ts.tv_sec, &hb_tm);
+                int hb_len = snprintf(hb_buf, sizeof(hb_buf),
+                    "HB pid=%d tick=%d hb=%d %02d:%02d:%02d.%03ld\n",
+                    getpid(), hb_tick, app->pShm->AppHeartbeat,
+                    hb_tm.tm_hour, hb_tm.tm_min, hb_tm.tm_sec,
+                    hb_ts.tv_nsec / 1000000);
+                write(hb_fd, hb_buf, hb_len);
+            }
+        }
+    }
 
 //----- Every hour, print the time for a time reference in the rtx log
 
@@ -3094,6 +3126,8 @@ void __stdcall overhead::Gp_Timer_Main(PVOID addr)
         }
     }
 
+    g_gptimer_checkpoint = 2;  // CP2: after heartbeat log, before tick toggle
+
     tick = ~tick;
 
 //----- If debugging, uncomment the desired trace
@@ -3127,6 +3161,8 @@ void __stdcall overhead::Gp_Timer_Main(PVOID addr)
 
     if (app->pShm->AppHeartbeat++ >= 32000)
         app->pShm->AppHeartbeat = 0;
+    g_gptimer_last_tick = app->pShm->AppHeartbeat;
+    g_gptimer_checkpoint = 3;  // CP3: heartbeat incremented
 
 //----- Set/Clear ipc thread event if a problem occurs.
 
@@ -3173,6 +3209,8 @@ void __stdcall overhead::Gp_Timer_Main(PVOID addr)
         //          app->pShm->IsysLineStatus.pps_sent,
         //          app->pShm->IsysLineStatus.pps_recvd);
     }
+
+    g_gptimer_checkpoint = 4;  // CP4: after thread check + comm stats
 
 //----- Save any totals which changed
 
@@ -3222,9 +3260,12 @@ void __stdcall overhead::Gp_Timer_Main(PVOID addr)
     // or to set something if there is a change, as in the load cell
     // settings.
 
+    g_gptimer_checkpoint = 5;  // CP5: before Validate
+
     if (sec2_OK)
     {
         app->Validate();
+        g_gptimer_checkpoint = 6;  // CP6: after Validate
 
 #ifndef _WEIGHT_SIMULATION_MODE_ //GLC added 1/24/05
         // These should change only in raw mode, but it will
@@ -3232,6 +3273,7 @@ void __stdcall overhead::Gp_Timer_Main(PVOID addr)
         app->Check_Adc_Settings(0);
         if (app->dual_scale) app->Check_Adc_Settings(1);
 #endif //GLC added 1/24/05
+        g_gptimer_checkpoint = 7;  // CP7: after Check_Adc_Settings
     }
 
 	if (sec5_OK)
@@ -3285,6 +3327,8 @@ void __stdcall overhead::Gp_Timer_Main(PVOID addr)
 	{
 		app->BatchResetStation();
 	}
+
+    g_gptimer_checkpoint = 99;  // CP99: function complete
 
 }
 
@@ -3473,7 +3517,7 @@ void __stdcall overhead::GpSendThread(PVOID unused)
             app->sendGpDebug = false;
         }
 
-        Sleep(5);
+        Sleep(50);  // Was 5ms on XP/RTX. 50ms is sufficient since flags are set every 500ms by Gp_Timer_Main.
     }
 }
 //--------------------------------------------------------
@@ -9728,8 +9772,10 @@ void overhead::GenError(int sev, char* txt)
         RtPrintf("\n***********************************************\n");
         RtPrintf("*   Critical error overhead.rtss shutdown     *\n");
         RtPrintf("***********************************************\n");
-        if (isPShmValid())
+        if (isPShmValid()) {
+            logAppFlagsChange("GenError: critical severity shutdown");
             pShm->AppFlags = 0;
+        }
     }
 }
 
