@@ -516,6 +516,13 @@ int RTFCNDCL DropManager::Mbx_Server(PVOID unused)
 
     for (;;)
     {
+       // Guard: skip pShm access if invalid (prevents SIGSEGV)
+       if (!isPShmValid())
+       {
+           Sleep(100);
+           continue;
+       }
+
        // check for everything ok
        if(RtWaitForSingleObject(hInterfaceThreadsOk,INFINITE)==WAIT_FAILED)
            RtPrintf("Error file %s, line %d \n",_FILE_, __LINE__);

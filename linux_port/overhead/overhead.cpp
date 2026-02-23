@@ -4,8 +4,8 @@
 
 #include "types.h"
 #include "telnetsrv.h"
-#ifdef _PCM3724_SIM_
-#include "pcm3724_sim.h"
+#ifdef _HBM_SIM_
+#include "hbm_sim.h"
 #endif
 
 #undef  _FILE_
@@ -782,6 +782,8 @@ void overhead::initialize()
     }
 
 #ifndef _WEIGHT_SIMULATION_MODE_       //GLC
+    // Set LoadCellType BEFORE InitLoadCell so the HBM path initializes
+    pShm->scl_set.LoadCellType = LOADCELL_TYPE_HBM;
     RtPrintf("  Calling InitLoadCell()...\n");
 		InitLoadCell();
     RtPrintf("  InitLoadCell complete\n");
@@ -1036,15 +1038,6 @@ void overhead::InitIO()
 
 #endif
 */
-//------------- Initialize the PCM-3724 I/O simulator (if enabled)
-//              Must be initialized BEFORE the I/O boards so virtual
-//              registers are ready for initialize() write operations.
-
-#ifdef _PCM3724_SIM_
-    PCM3724Sim_Init();
-    PCM3724Sim_Start();
-#endif
-
 //------------- Initialize the digital card(s)
 
 #ifdef _3724_IO_
@@ -1285,7 +1278,16 @@ void overhead::ReadConfiguration()
             memcpy(&pShm->sys_stat.TotalWeight,     &totals_info.TWt,      sizeof(totals_info.TWt));
             memcpy(&pShm->sys_stat.MissedDropInfo,  &totals_info.MdrpInfo, sizeof(totals_info.MdrpInfo));
             memcpy(&pShm->sys_stat.DropInfo,        &totals_info.DrpInfo,  sizeof(totals_info.DrpInfo));
-            RtPrintf("Totals restored from file.\n");
+
+            // Recompute GradeCount from restored DropInfo (GradeCount is not in totals.dat)
+            memset(&pShm->sys_stat.GradeCount, 0, sizeof(pShm->sys_stat.GradeCount));
+            for (int d = 0; d < MAXDROPS; d++)
+            {
+                for (int g = 0; g < MAXGRADES; g++)
+                    pShm->sys_stat.GradeCount[g] += pShm->sys_stat.DropInfo[d].GrdCount[g];
+            }
+
+            RtPrintf("Totals restored from file (TotalCount=%lld).\n", pShm->sys_stat.TotalCount);
         }
         else
             RtPrintf("Error reading totals file - starting with zero totals.\n");
@@ -1875,7 +1877,7 @@ void overhead::SetDefaults()
 
 //----- Weight stuff
 
-    //pShm->scl_set.LoadCellType              = LOADCELL_TYPE_HBM;
+    pShm->scl_set.LoadCellType              = LOADCELL_TYPE_HBM;
     pShm->scl_set.NumScales                 = 1;
     pShm->scl_set.AdcMode[0]                = 1;
     pShm->scl_set.AdcMode[1]                = 1;
@@ -2583,10 +2585,25 @@ void overhead::SendLabelInfo()
 
 void overhead::UpdateHost()
 {
+    // Guard: skip entirely if pShm is invalid (prevents SIGSEGV on HOST_OK)
+    if (!isPShmValid()) return;
+
     for (int i = 0; i < ALL_SHM_IDS; i++)
     {
         if ( (shm_updates[i]) && (i != DISP_DATA-1) ) //display data done in fast update
         {
+            // Safety check: prevent buffer overflow in SendHostMsg.
+            // MAX_APP_MSG_SIZE is 50000 bytes.  Some shm_tbl entries
+            // (e.g. ShackleStatus at ~112KB) exceed this.  Skip them
+            // to avoid writing past the IPC shared memory buffer.
+            if (shm_tbl[i].struct_len > (MAX_APP_MSG_SIZE - sizeof(mhdr) - 8))
+            {
+                RtPrintf("WARNING: shm_tbl[%d] struct_len %d exceeds IPC buffer, skipping\n",
+                         i, shm_tbl[i].struct_len);
+                shm_updates[i] = false;
+                continue;
+            }
+
             if HOST_OK
             {
                 // Request Mutex for send
@@ -2614,6 +2631,9 @@ void overhead::UpdateHost()
 
 void overhead::UpdateCapture(int buf)
 {
+    // Guard: skip if pShm is invalid
+    if (!isPShmValid()) return;
+
     // Request Mutex for send
     if(RtWaitForSingleObject(trc[GPBUFID].mutex, WAIT100MS) != WAIT_OBJECT_0)
         RtPrintf("Wait failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
@@ -3005,6 +3025,9 @@ void __stdcall overhead::Gp_Timer_Main(PVOID addr)
         gp_init = true;
     }
 
+    // Guard: skip if pShm is invalid (prevents SIGSEGV in timer callback)
+    if (!isPShmValid()) return;
+
 //----- Every hour, print the time for a time reference in the rtx log
 
     time( &long_time );
@@ -3283,6 +3306,12 @@ void __stdcall overhead::GpSendThread(PVOID unused)
 
     for (;;)
     {
+        // Guard: if pShm is invalid, sleep and retry (don't crash on HOST_OK)
+        if (!isPShmValid())
+        {
+            Sleep(100);
+            continue;
+        }
 
 //----- Check/Send updates to host for all shared memory ids.
         app->UpdateHost();
@@ -3494,6 +3523,9 @@ void __stdcall overhead::Fast_Update (PVOID addr)
 	addr;	//	RED - To eliminate unreferenced formal parameter warning
 	TDisplayShackle* pDisplayData;
 
+    // Guard: skip if pShm is invalid (HOST_OK dereferences pShm)
+    if (!isPShmValid()) return;
+
     // display data
     if (app->shm_updates[DISP_DATA-1])
     {
@@ -3587,6 +3619,9 @@ void __stdcall overhead::App_Timer_Main(PVOID addr)
         app_init = true;
     }
 
+    // Guard: skip if pShm is invalid (prevents SIGSEGV in timer callback)
+    if (!isPShmValid()) return;
+
     // Figure out how many ticks between shackles 1 & 2. It is used
     // to stop the weigh average routine in time to calculate average
     // weight before the next shackle.
@@ -3597,6 +3632,115 @@ void __stdcall overhead::App_Timer_Main(PVOID addr)
     if (!app->simulation_mode)
     {
         iop->readInputs();  // three primary input ports
+
+        // TEMP DEBUG: Track OR'd I/O bits over each 5-second window
+        {
+            static int dbg_io_count = 0;
+            static unsigned char or_sync_in[4] = {0,0,0,0};
+            static unsigned char or_sync_zero[4] = {0,0,0,0};
+            static unsigned char or_switch_in[4] = {0,0,0,0};
+            // Count rising edges per sync during window
+            static unsigned char prev_sync_in[4] = {0,0,0,0};
+            static int rising_edge_count[8] = {0,0,0,0,0,0,0,0};
+            static int zero_rising_count[8] = {0,0,0,0,0,0,0,0};
+            static unsigned char prev_sync_zero[4] = {0,0,0,0};
+            // Measure actual timer rate
+            static struct timespec dbg_last_time = {0,0};
+            static int dbg_tick_total = 0;
+            dbg_tick_total++;
+
+            // Accumulate OR of all I/O reads during this window
+            for (int bi = 0; bi < 4; bi++) {
+                or_sync_in[bi]   |= (unsigned char)app->sync_in[bi];
+                or_sync_zero[bi] |= (unsigned char)app->sync_zero[bi];
+                or_switch_in[bi] |= (unsigned char)app->switch_in[bi];
+            }
+            // Count rising edges (LOW→HIGH transitions)
+            for (int si = 0; si < 8; si++) {
+                int bi = si / 8;
+                int bit = si % 8;
+                unsigned char cur_s = (unsigned char)app->sync_in[bi];
+                unsigned char prv_s = prev_sync_in[bi];
+                if ((cur_s & (1<<bit)) && !(prv_s & (1<<bit)))
+                    rising_edge_count[si]++;
+                unsigned char cur_z = (unsigned char)app->sync_zero[bi];
+                unsigned char prv_z = prev_sync_zero[bi];
+                if ((cur_z & (1<<bit)) && !(prv_z & (1<<bit)))
+                    zero_rising_count[si]++;
+            }
+            for (int bi = 0; bi < 4; bi++) {
+                prev_sync_in[bi] = (unsigned char)app->sync_in[bi];
+                prev_sync_zero[bi] = (unsigned char)app->sync_zero[bi];
+            }
+
+            if (++dbg_io_count >= 1000) {  // every 5 seconds
+                dbg_io_count = 0;
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                double elapsed_ms = 0;
+                if (dbg_last_time.tv_sec != 0) {
+                    elapsed_ms = (now.tv_sec - dbg_last_time.tv_sec) * 1000.0 +
+                                 (now.tv_nsec - dbg_last_time.tv_nsec) / 1e6;
+                }
+                dbg_last_time = now;
+
+                FILE* df = fopen("/tmp/io_debug.txt", "w");
+                if (df) {
+                    fprintf(df, "=== Timer: %d ticks in %.0fms (%.2f ms/tick) ===\n",
+                            dbg_tick_total, elapsed_ms,
+                            dbg_tick_total > 0 && elapsed_ms > 0 ? elapsed_ms / dbg_tick_total : 0);
+                    fprintf(df, "=== OR'd over 5s window (bits ever active) ===\n");
+                    fprintf(df, "sync_in[0]=0x%02X sync_in[1]=0x%02X\n",
+                            or_sync_in[0], or_sync_in[1]);
+                    fprintf(df, "sync_zero[0]=0x%02X sync_zero[1]=0x%02X\n",
+                            or_sync_zero[0], or_sync_zero[1]);
+                    fprintf(df, "switch_in[0]=0x%02X switch_in[1]=0x%02X\n",
+                            or_switch_in[0], or_switch_in[1]);
+                    fprintf(df, "=== Rising edges in window ===\n");
+                    for (int si = 0; si < 8; si++) {
+                        if (rising_edge_count[si] > 0 || zero_rising_count[si] > 0)
+                            fprintf(df, "Sync[%d] counter_edges=%d zero_edges=%d\n",
+                                    si, rising_edge_count[si], zero_rising_count[si]);
+                    }
+                    fprintf(df, "=== Instant snapshot ===\n");
+                    fprintf(df, "sync_in_now[0]=0x%02X sync_zero_now[0]=0x%02X switch_now[0]=0x%02X\n",
+                            (unsigned char)app->sync_in[0], (unsigned char)app->sync_zero[0],
+                            (unsigned char)app->switch_in[0]);
+                    fprintf(df, "sync_armed: ");
+                    for (int si = 0; si < 8; si++) fprintf(df, "%d ", app->sync_armed[si]);
+                    fprintf(df, "\nsync_zero_triggered: ");
+                    for (int si = 0; si < 8; si++) fprintf(df, "%d ", app->dbg_sync_zero_triggered[si]);
+                    fprintf(df, "\n");
+                    fprintf(df, "grade_zeroed[0]=%d grade_zeroed[1]=%d\n",
+                            app->grade_zeroed[0], app->grade_zeroed[1]);
+                    fprintf(df, "WeighZero[0]=%d WeighZero[1]=%d\n",
+                            app->pShm->WeighZero[0], app->pShm->WeighZero[1]);
+                    fprintf(df, "OpMode=%d config_Ok=%d Grading=%d\n",
+                            app->pShm->OpMode, app->config_Ok, app->pShm->sys_set.Grading);
+                    fprintf(df, "ReqZeroBeforeSync=%d NumSyncs_cfg=%d SyncOn=%d\n",
+                            app->pShm->sys_set.MiscFeatures.RequireZeroBeforeSync,
+                            app->pShm->scl_set.NumScales,
+                            app->pShm->sys_set.SyncOn);
+                    for (int si = 0; si < 8; si++) {
+                        fprintf(df, "Sync[%d] zeroed=%d shackleno=%d\n",
+                                si, app->pShm->SyncStatus[si].zeroed,
+                                app->pShm->SyncStatus[si].shackleno);
+                    }
+                    fclose(df);
+                }
+                // Reset accumulators
+                dbg_tick_total = 0;
+                for (int bi = 0; bi < 4; bi++) {
+                    or_sync_in[bi] = 0;
+                    or_sync_zero[bi] = 0;
+                    or_switch_in[bi] = 0;
+                }
+                for (int si = 0; si < 8; si++) {
+                    rising_edge_count[si] = 0;
+                    zero_rising_count[si] = 0;
+                }
+            }
+        }
 
         #ifdef _VSBC6_IO_
            #ifdef VSBC6_LOWIN_HIOUT
@@ -3794,6 +3938,16 @@ void __stdcall overhead::App_Timer_Main(PVOID addr)
 	if (!app->weight_simulation_mode)
 		app->CaptureLcData();
 
+	// TEMP DEBUG: check why AverageWeight isn't being called
+	{
+		static int _dbg_trig_cnt = 0;
+		if ((_dbg_trig_cnt++ % 1000) == 0) {
+			RtPrintf("TRIG sc0=%d sc1=%d shk2shk=%d OpMode=%d WeighZero=%d weigh_state=%d\n",
+				app->w_avg[0].avg_trigger_cntr, app->w_avg[1].avg_trigger_cntr,
+				app->shk2shk_ticks, app->pShm->OpMode, app->pShm->WeighZero[0], app->weigh_state[0]);
+		}
+	}
+
 	for (i = 0; i < MAXSCALES; i++)
     {
         // If decrement wt avg trigger counters
@@ -3853,6 +4007,18 @@ void overhead::AverageWeight(int scale)
 //----- The object of all this is to mark the highest points at leading and falling
 //      edges of product. These marks are used to calculate an average weight.
 
+    // TEMP DEBUG: trace AverageWeight entry
+    {
+        static int _dbg_aw_cnt = 0;
+        if ((_dbg_aw_cnt++ % 500) == 0) {
+            int ss = (shk2shk_ticks - (int)((shk2shk_ticks * app->pShm->scl_set.LC_Sample_Adj[scale].start) / 100));
+            int se = (ss - (int)((ss * app->pShm->scl_set.LC_Sample_Adj[scale].end) / 100));
+            RtPrintf("AW[%d] step=%d trig=%d ss=%d se=%d idx=%d LCType=%d\n",
+                scale, w_avg[scale].step, w_avg[scale].avg_trigger_cntr, ss, se, w_avg[scale].curr_index,
+                app->pShm->scl_set.LoadCellType);
+        }
+    }
+
     switch(w_avg[scale].step)
     {
 
@@ -3884,6 +4050,16 @@ void overhead::AverageWeight(int scale)
 						{
 
 							wt = app->ld_cel[scale]->read_load_cell(0);
+
+							// TEMP DEBUG: log HBM read_load_cell value
+							{
+								static int _dbg_avg_cnt = 0;
+								if ((_dbg_avg_cnt++ % 10) == 0) {
+									RtPrintf("AvgWt[%d] wt=%lld bird=%d shk2shk=%d step=%d trig=%d\n",
+										scale, (long long)wt, (int)g_hbm_bird_present,
+										app->shk2shk_ticks, w_avg[scale].step, w_avg[scale].avg_trigger_cntr);
+								}
+							}
 
 							// GLC 12/13/2004
 							// Check to see if digital load cell readings have stalled
@@ -5453,6 +5629,22 @@ void overhead::GradeSyncs()
 			gradesync_zero_triggered[GradeSyncIndex] = false; //GLC added 3/9/05
 			//RtPrintf("Grade sync\n");
 
+			// TEMP DEBUG: Log grade sync fires (always log if zero active, first 20 + every 200th otherwise)
+			{
+				static int grade_fire_count = 0;
+				grade_fire_count++;
+				int zero_now = BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]) ? 1 : 0;
+				if (zero_now || grade_fire_count <= 20 || grade_fire_count % 200 == 0) {
+					FILE* gf = fopen("/tmp/grade_debug.txt", "a");
+					if (gf) {
+						fprintf(gf, "#%d sw=0x%02X zero=%d shk=%d\n",
+							grade_fire_count, (unsigned char)switch_in[0],
+							zero_now, pShm->grade_shackle[GradeSyncIndex]);
+						fclose(gf);
+					}
+				}
+			}
+
 			if ( BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]) )
 			{
 
@@ -5840,6 +6032,19 @@ void overhead::ProcessWeight()
             pShm->sys_stat.DispShackle.shackle[i] = pShm->WeighShackle[i];
             pShm->sys_stat.DispShackle.weight [i] = WEIGH_SHACKLE(i, pShm).weight[i];
             pShm->sys_stat.DispShackle.drop   [i] = WEIGH_SHACKLE(i, pShm).drop[i];
+
+            // TEMP DEBUG: log what goes into DispShackle
+            {
+                static int _dbg_disp_cnt = 0;
+                if ((_dbg_disp_cnt++ % 20) == 0) {
+                    RtPrintf("DISP[%d] shk=%d wt=%lld drop=%d tare=%lld abias=%lld\n",
+                        i, pShm->WeighShackle[i],
+                        (long long)WEIGH_SHACKLE(i, pShm).weight[i],
+                        WEIGH_SHACKLE(i, pShm).drop[i],
+                        (long long)TARE_SHACKLE(i, pShm),
+                        (long long)pShm->AutoBias[i]);
+                }
+            }
 
 //----- Update host. If one scale send, if two scales send after 2nd pass
 
@@ -9523,7 +9728,8 @@ void overhead::GenError(int sev, char* txt)
         RtPrintf("\n***********************************************\n");
         RtPrintf("*   Critical error overhead.rtss shutdown     *\n");
         RtPrintf("***********************************************\n");
-        pShm->AppFlags = 0;
+        if (isPShmValid())
+            pShm->AppFlags = 0;
     }
 }
 
@@ -9533,6 +9739,9 @@ void overhead::GenError(int sev, char* txt)
 
 void overhead::SendError()
 {
+    // Guard: skip if pShm is invalid (HOST_OK dereferences pShm)
+    if (!isPShmValid()) return;
+
     int len = strlen(send_error.err_addr);
 
     if (len >= MAXERRMBUFSIZE)
@@ -10115,6 +10324,17 @@ void overhead::ProcessSyncs()
                         pShm->WeighZero[0] = true;
                         shm_updates[SCLWGHZ-1] = true;  // notify host only on transition
                     }
+#ifdef _HBM_SIM_
+                    // Shackle 1 = empty (auto-zero). All others get bird weight.
+                    // Increment sequence counter so the 600Hz measurement thread
+                    // knows a new shackle arrived and advances the weight table.
+                    if (pShm->WeighZero[0] && pSyncStat->shackleno > 1) {
+                        g_hbm_bird_present = true;
+                        g_hbm_shackle_seq++;
+                    } else {
+                        g_hbm_bird_present = false;
+                    }
+#endif
                     pShm->WeighShackle[0] = pSyncStat->shackleno;
                     weigh_state[0]        = WeighActive;
 					DebugTrace(_SYNCS_, "SC1-Weighing triggered. Shackle = %d, trolley = %d\n",pSyncStat->shackleno, trolly_counters[i]);
@@ -10405,6 +10625,10 @@ void overhead::ProcessSyncs()
 			}
 		 }
     } // for i  = 0 to MAXSYNCS
+
+    // Copy to class member for debug output
+    for (int di = 0; di < MAXSYNCS; di++)
+        dbg_sync_zero_triggered[di] = sync_zero_triggered[di];
 }
 
 //--------------------------------------------------------
@@ -10443,6 +10667,12 @@ void __stdcall overhead::DebugThread(PVOID unused)
 
     for (;;)
     {
+        // Guard: skip pShm access if invalid (prevents SIGSEGV)
+        if (!isPShmValid())
+        {
+            Sleep(100);
+            continue;
+        }
 
         // Update the debug inputs. The syncs were turned into counters
         for (i = 0; i < MAXINPUTBYTS; i++)

@@ -266,7 +266,7 @@ int main(int argc, char* argv[])
 
         Sleep(950);
 
-    } while (pShm->AppFlags & 1);
+    } while (pShm && (pShm->AppFlags & 1));
 
     if (!err_routine_close)
         ErrorRoutine((BYTE*)"Error: Overhead shutdown");
@@ -417,6 +417,8 @@ void Heartbeats()
     static int prev_app_heartbeat = 0;
     static int app_fail_count = 0;
 
+    if (!pShm) return;
+
     if (prev_app_heartbeat == 0)
         prev_app_heartbeat = pShm->AppHeartbeat;
 
@@ -483,7 +485,8 @@ void ErrorRoutine(BYTE *sbuf)
 
     err_routine_close = true;
 
-    pShm->AppFlags = 0;
+    if (pShm)
+        pShm->AppFlags = 0;
     Sleep(5000);
 
     // Cancel threads
@@ -560,7 +563,8 @@ void Shutdown(int action)
 
         RtPrintf("%s\n", evt_str);
 
-        pShm->AppFlags = 0;
+        if (pShm)
+            pShm->AppFlags = 0;
         return;
     }
 
@@ -568,7 +572,7 @@ void Shutdown(int action)
     {
     case PIPE_ERR_RESTART_NT:
         sprintf(evt_str, "Interface flags = %d system restart",
-                pShm->IsysLineStatus.app_threads);
+                pShm ? pShm->IsysLineStatus.app_threads : -1);
         pEvtStr = (char*)&evt_str;
 
         ReportEvent(hLog, EVENTLOG_ERROR_TYPE,
@@ -577,7 +581,8 @@ void Shutdown(int action)
 
         RtPrintf("%s\n", evt_str);
 
-        pShm->AppFlags = 0;
+        if (pShm)
+            pShm->AppFlags = 0;
         Sleep(500);
 
         CleanupTcpServer();
@@ -596,7 +601,8 @@ void Shutdown(int action)
 
         RtPrintf("%s\n", evt_str);
 
-        pShm->AppFlags = 0;
+        if (pShm)
+            pShm->AppFlags = 0;
         Sleep(500);
 
         CleanupTcpServer();
@@ -615,7 +621,8 @@ void Shutdown(int action)
 
         RtPrintf("%s\n", evt_str);
 
-        pShm->AppFlags = 0;
+        if (pShm)
+            pShm->AppFlags = 0;
         Sleep(500);
 
         CleanupTcpServer();

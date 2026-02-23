@@ -1253,11 +1253,11 @@ __int64 HBMLoadCell::read_load_cell(int channel)
     {
         this->MeasureQ(app->individual_wts, this->num_adc_reads[channel]); //GLC TEMP REMOVE
 
-        for(k = 0; k <this->num_adc_reads[channel]; k++) 
+        for(k = 0; k <this->num_adc_reads[channel]; k++)
         {
 
             rdg = app->individual_wts[k];
-            //RtPrintf("Reading %d = %d\n", k, app->individual_wts[k]); //GLC 
+            //RtPrintf("Reading %d = %d\n", k, app->individual_wts[k]); //GLC
             switch(this->adc_mode[channel])
             {
                 case AVG:

@@ -28,7 +28,6 @@ set(OVERHEAD_SOURCES
     InterSystems.cpp
     DropManager.cpp
     Simulator.cpp
-    pcm3724_sim.cpp
     hbm_sim.cpp
     backendshell.cpp
     ../interface/console.cpp

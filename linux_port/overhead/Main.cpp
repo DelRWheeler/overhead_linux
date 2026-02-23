@@ -18,6 +18,19 @@ void CheckHeartbeats();
 static void ShutdownHandler(PVOID unused, LONG reason);
 
 //--------------------------------------------------------
+// Diagnostic sentinels for crash analysis
+//
+// These globals are OUTSIDE the overhead class so a class
+// member overflow cannot corrupt them. They let the crash
+// handler determine whether app->pShm was overwritten vs
+// the mmap region being invalidated.
+//--------------------------------------------------------
+volatile void* g_sentinel_pShm  = NULL;  // set once after InitMem
+volatile void* g_sentinel_app   = NULL;  // set once after new overhead
+volatile int   g_sentinel_magic = 0;     // set to 0xDEADBEEF after init
+volatile int   g_shm_fd         = -1;    // fd for SharedMemory (for proc/maps check)
+
+//--------------------------------------------------------
 //       main():
 //--------------------------------------------------------
 
@@ -34,15 +47,133 @@ static void overhead_crash_handler(int sig, siginfo_t *info, void *ctx)
 
     ucontext_t *uc = (ucontext_t *)ctx;
     int efd = open("/tmp/overhead_crash.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    char buf[512];
-    int len = snprintf(buf, sizeof(buf),
+    char buf[1024];
+    int len;
+
+    // === Basic crash info ===
+    len = snprintf(buf, sizeof(buf),
         "\n*** OVERHEAD CRASHED (signal %d, pid=%d, tid=%d) ***\n"
         "Fault address: %p\n"
         "RIP: 0x%llx\n"
-        "RSP: 0x%llx\n\nBacktrace:\n",
+        "RSP: 0x%llx\n",
         sig, getpid(), (int)syscall(SYS_gettid), info->si_addr,
         (unsigned long long)uc->uc_mcontext.gregs[REG_RIP],
         (unsigned long long)uc->uc_mcontext.gregs[REG_RSP]);
+    write(STDOUT_FILENO, buf, len);
+    write(STDERR_FILENO, buf, len);
+    if (efd >= 0) write(efd, buf, len);
+
+    // === Sentinel diagnostics ===
+    len = snprintf(buf, sizeof(buf),
+        "\n--- SENTINEL DIAGNOSTICS ---\n"
+        "g_sentinel_magic: 0x%X (expect 0xDEADBEEF)\n"
+        "g_sentinel_app:   %p\n"
+        "g_sentinel_pShm:  %p\n"
+        "g_shm_fd:         %d\n",
+        g_sentinel_magic,
+        g_sentinel_app,
+        g_sentinel_pShm,
+        g_shm_fd);
+    write(STDOUT_FILENO, buf, len);
+    write(STDERR_FILENO, buf, len);
+    if (efd >= 0) write(efd, buf, len);
+
+    // === Try to read current app and app->pShm ===
+    // Use volatile reads to prevent optimization
+    volatile overhead* cur_app = app;
+    len = snprintf(buf, sizeof(buf),
+        "app (current):    %p (sentinel match: %s)\n",
+        (void*)cur_app,
+        (cur_app == (overhead*)g_sentinel_app) ? "YES" : "NO");
+    write(STDOUT_FILENO, buf, len);
+    write(STDERR_FILENO, buf, len);
+    if (efd >= 0) write(efd, buf, len);
+
+    if (cur_app != NULL) {
+        // Try to read pShm from app — this might fault if app is corrupted
+        // but since we're already in a crash handler with SA_RESETHAND,
+        // a double fault would just kill us with default handler (acceptable)
+        volatile void* cur_pShm = cur_app->pShm;
+        len = snprintf(buf, sizeof(buf),
+            "app->pShm:        %p (sentinel match: %s)\n",
+            (void*)cur_pShm,
+            (cur_pShm == g_sentinel_pShm) ? "YES" : "NO");
+        write(STDOUT_FILENO, buf, len);
+        write(STDERR_FILENO, buf, len);
+        if (efd >= 0) write(efd, buf, len);
+
+        // Try to read AppFlags from pShm to test if mapping is valid
+        if (cur_pShm != NULL) {
+            // Attempt to read the first int (AppFlags) from the mapping
+            volatile int flags = ((volatile app_type::SHARE_MEMORY*)cur_pShm)->AppFlags;
+            len = snprintf(buf, sizeof(buf),
+                "pShm->AppFlags:   %d (mapping VALID)\n", flags);
+            write(STDOUT_FILENO, buf, len);
+            write(STDERR_FILENO, buf, len);
+            if (efd >= 0) write(efd, buf, len);
+        }
+    }
+
+    // === Check /proc/self/maps for SharedMemory mapping ===
+    len = snprintf(buf, sizeof(buf), "\n--- /proc/self/maps (SharedMemory) ---\n");
+    write(STDOUT_FILENO, buf, len);
+    write(STDERR_FILENO, buf, len);
+    if (efd >= 0) write(efd, buf, len);
+
+    int mfd = open("/proc/self/maps", O_RDONLY);
+    if (mfd >= 0) {
+        char mapbuf[8192];
+        int nr;
+        while ((nr = read(mfd, mapbuf, sizeof(mapbuf) - 1)) > 0) {
+            mapbuf[nr] = '\0';
+            // Search for lines containing "SharedMemory" or the fault address range
+            char* line = mapbuf;
+            while (line && *line) {
+                char* nl = strchr(line, '\n');
+                if (nl) *nl = '\0';
+                // Print lines with SharedMemory or any shm mapping
+                if (strstr(line, "SharedMemory") || strstr(line, "/dev/shm/")) {
+                    int ll = strlen(line);
+                    line[ll] = '\n';
+                    write(STDOUT_FILENO, line, ll + 1);
+                    write(STDERR_FILENO, line, ll + 1);
+                    if (efd >= 0) write(efd, line, ll + 1);
+                    line[ll] = '\0';  // restore for next iteration
+                }
+                if (nl) { *nl = '\n'; line = nl + 1; }
+                else break;
+            }
+        }
+        close(mfd);
+    }
+
+    // === Check if Interface parent process is still alive ===
+    pid_t ppid = getppid();
+    len = snprintf(buf, sizeof(buf),
+        "\n--- PARENT PROCESS ---\n"
+        "Parent PID: %d (1 = reparented to init = parent died)\n",
+        (int)ppid);
+    write(STDOUT_FILENO, buf, len);
+    write(STDERR_FILENO, buf, len);
+    if (efd >= 0) write(efd, buf, len);
+
+    // === Check SharedMemory file ===
+    struct stat shm_stat;
+    if (stat("/dev/shm/SharedMemory", &shm_stat) == 0) {
+        len = snprintf(buf, sizeof(buf),
+            "/dev/shm/SharedMemory: size=%ld, inode=%ld\n",
+            (long)shm_stat.st_size, (long)shm_stat.st_ino);
+    } else {
+        len = snprintf(buf, sizeof(buf),
+            "/dev/shm/SharedMemory: NOT FOUND (errno=%d: %s)\n",
+            errno, strerror(errno));
+    }
+    write(STDOUT_FILENO, buf, len);
+    write(STDERR_FILENO, buf, len);
+    if (efd >= 0) write(efd, buf, len);
+
+    // === Backtrace ===
+    len = snprintf(buf, sizeof(buf), "\nBacktrace:\n");
     write(STDOUT_FILENO, buf, len);
     write(STDERR_FILENO, buf, len);
     if (efd >= 0) write(efd, buf, len);
@@ -106,12 +237,10 @@ int main(int argc, char* argv[])
     }
 
     // Enable direct port I/O access (requires root, must be done before any I/O)
-#ifndef _PCM3724_SIM_
     if (iopl(3) != 0) {
         fprintf(stderr, "FATAL: iopl(3) failed: %s (need root?)\n", strerror(errno));
         return 1;
     }
-#endif
 
     // Initialize console output (shared with Interface via console.h)
     ConsoleInit();
@@ -139,8 +268,31 @@ int main(int argc, char* argv[])
         RtExitProcess(1);
     }
 
+    // Store sentinel BEFORE any threads start
+    g_sentinel_app = (void*)app;
+
     Sleep (1000);
     app->initialize();
+
+    // Store pShm sentinel AFTER initialize (which calls InitMem)
+    g_sentinel_pShm = (void*)app->pShm;
+    g_sentinel_magic = 0xDEADBEEF;
+
+    // Save the SharedMemory fd for diagnostics
+    if (hShmem) {
+        PlatformHandle* ph = (PlatformHandle*)hShmem;
+        if (ph->type == HANDLE_SHM)
+            g_shm_fd = ph->shm.fd;
+    }
+
+    RtPrintf("=== SENTINEL VALUES ===\n");
+    RtPrintf("  app            = %p\n", (void*)app);
+    RtPrintf("  app->pShm      = %p\n", (void*)app->pShm);
+    RtPrintf("  g_sentinel_app = %p\n", g_sentinel_app);
+    RtPrintf("  g_sentinel_pShm= %p\n", g_sentinel_pShm);
+    RtPrintf("  g_shm_fd       = %d\n", g_shm_fd);
+    RtPrintf("  sizeof(SHARE_MEMORY) = %lu\n", (unsigned long)sizeof(app_type::SHARE_MEMORY));
+    RtPrintf("=======================\n");
 
 //------------- Show running
 
@@ -184,17 +336,20 @@ int main(int argc, char* argv[])
     GetDateStr(date_dt_str);
     RtPrintf("Overhead RTOS Shutdown %s\n\n", date_dt_str );
 
-    RtCancelTimer(hAppTimer, NULL);
-    RtCancelTimer(hGpTimer, NULL);
-    RtCloseHandle(hDrpMgr);
-    RtCloseHandle(hDebug);
-    // Don't leave any outputs on
+    // Clear outputs before exiting
     app->ClearOutputs();
-    RtCloseHandle(hShmem);
-    // hShutdown is a static marker, don't close it
 
+    // CRITICAL FIX: On Linux, RtCloseHandle(hShmem) calls munmap() which
+    // invalidates pShm.  But GpSendThread, DropManager, DebugThread, and
+    // timer threads are still running and accessing pShm.  This caused
+    // SIGSEGV crashes (all threads fault on the unmapped shared memory).
+    //
+    // On Windows RTX, RtExitProcess() kills all threads atomically.
+    // On Linux, we must use _exit() which terminates all threads and
+    // releases all resources (mmap, fds, etc.) in one atomic step.
+    // Do NOT call RtCloseHandle(hShmem) here — let _exit() clean up.
     ConsoleShutdown();
-    return 0;
+    _exit(0);
 }
 
 //--------------------------------------------------------
@@ -207,6 +362,9 @@ void CheckHeartbeats()
     static int fail_count       = 0;
     static int IfDeadCount      = 0;
     static int IfLastCount      = 0;
+
+    // Guard: skip heartbeat check if pShm is invalid
+    if (!isPShmValid()) return;
 
 //----- Watch GpTimer heartbeat. If it isn't working, communications is
 //      probably hung. The problem should not happen except maybe at

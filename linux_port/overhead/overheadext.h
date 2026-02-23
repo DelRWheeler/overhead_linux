@@ -44,3 +44,38 @@ extern UINT             TraceMask;
 extern trcbuf           trc_buf       [MAXTRCBUFFERS];     // each thread must have a trace buffer
 extern tmptrcbuf        tmp_trc_buf   [MAXTRCBUFFERS];     // for parts to be catinated
 extern trace_ctrl       trc           [MAXTRCBUFFERS];
+
+//--------------------------------------------------------
+// pShm sentinel diagnostics (set in Main.cpp after init)
+//--------------------------------------------------------
+extern volatile void* g_sentinel_pShm;
+extern volatile int   g_sentinel_magic;
+
+// Returns true if app->pShm appears safe to dereference.
+// Checks sentinel value saved after InitMem() to detect
+// class member overflow corrupting the pShm pointer.
+static inline bool isPShmValid()
+{
+    if (app == NULL) return false;
+    if (app->pShm == NULL) return false;
+
+    // If sentinels haven't been set yet (early init), allow access
+    if (g_sentinel_magic != (int)0xDEADBEEF) return true;
+
+    // Check if pShm still matches what we stored after InitMem
+    if ((void*)app->pShm != (void*)g_sentinel_pShm)
+    {
+        static bool logged = false;
+        if (!logged) {
+            RtPrintf("\n!!! CRITICAL: app->pShm CORRUPTED !!!\n"
+                     "  app->pShm      = %p\n"
+                     "  g_sentinel_pShm= %p\n"
+                     "  Skipping pShm access to prevent SIGSEGV\n\n",
+                     (void*)app->pShm, (void*)g_sentinel_pShm);
+            logged = true;
+        }
+        return false;
+    }
+
+    return true;
+}

@@ -28,8 +28,15 @@ HBMSimState g_hbmSim[HBM_SIM_MAX_LC];
 
 // Bird-present flag: set by PCM3724 sim when counter pulse fires
 // and the controller has zeroed (WeighZero = true).
-// When false, HBM sim outputs ~0 (empty shackle).
+// When PCM3724 sim is not running (disabled), the HBM sim checks
+// WeighZero directly and always outputs bird weights after zeroing.
 volatile bool g_hbm_bird_present = false;
+
+// Sequence counter incremented by overhead.cpp on each new shackle trigger.
+// The measurement thread compares its local copy to detect new shackles
+// and advance the weight index (rising-edge detection on the bool flag
+// is too fast for the 600 Hz thread to catch).
+volatile int g_hbm_shackle_seq = 0;
 
 // Simulated weight table (pounds) - 2 to 6 lb range for testing schedules/grading
 static const double hbm_sim_weights[HBM_SIM_NUM_WEIGHTS] =
@@ -521,31 +528,26 @@ static void* HBMSimMeasThread(void* arg)
     {
         if (s->continuous)
         {
-            // Check bird-present flag from PCM3724 sim.
-            // When a bird is on the scale (after zeroing), output bird weight.
-            // Otherwise output near-zero (empty shackle baseline).
             bool bird = g_hbm_bird_present;
 
             if (bird)
             {
-                // On rising edge (new bird arrived), advance to next weight
-                if (!s->prev_bird)
+                // Advance weight on each new shackle using sequence counter
+                // (rising-edge on bool was too fast for 600Hz thread to catch)
+                int seq = g_hbm_shackle_seq;
+                if (seq != s->prev_seq)
                 {
                     s->weight_idx = (s->weight_idx + 1) % HBM_SIM_NUM_WEIGHTS;
-                    // Bird weight available in hbm_sim_weights[s->weight_idx] if needed for debugging
+                    s->prev_seq = seq;
                 }
 
-                // Output bird weight in ADC counts
                 wt = hbm_sim_weights[s->weight_idx] * CNTS;
                 adc_counts = (int)wt;
             }
             else
             {
-                // Empty shackle - output near-zero baseline
-                // Small positive offset simulates residual hardware offset
                 adc_counts = 500;
             }
-            s->prev_bird = bird;
 
             // Add small random noise (±10 ADC counts) to simulate real
             // load cell behavior. Without noise, the controller's stuck

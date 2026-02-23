@@ -1197,12 +1197,6 @@ static inline HANDLE RtAttachShutdownHandler(void* security, DWORD stackSize,
 
 static inline BOOL RtEnablePortIo(PUCHAR addr, ULONG bytes)
 {
-#ifdef _PCM3724_SIM_
-    // Virtual ports don't need enabling
-    (void)addr;
-    (void)bytes;
-    return TRUE;
-#else
     // Real hardware: use iopl(3) for full port access.
     // ioperm() doesn't survive execvp(), but iopl() does.
     // Only need to call once - subsequent calls are harmless.
@@ -1218,28 +1212,7 @@ static inline BOOL RtEnablePortIo(PUCHAR addr, ULONG bytes)
         RtPrintf("Port I/O access enabled (iopl)\n");
     }
     return TRUE;
-#endif
 }
-
-#ifdef _PCM3724_SIM_
-
-// PCM-3724 I/O board simulator - routes port reads/writes to virtual registers
-// that are driven by a simulation thread generating sensor patterns.
-// Declared in pcm3724_sim.h, implemented in pcm3724_sim.cpp
-extern unsigned char PCM3724Sim_Read(uintptr_t addr);
-extern void PCM3724Sim_Write(uintptr_t addr, unsigned char value);
-
-static inline void RtWritePortUchar(PUCHAR addr, UCHAR value)
-{
-    PCM3724Sim_Write((uintptr_t)addr, value);
-}
-
-static inline UCHAR RtReadPortUchar(PUCHAR addr)
-{
-    return PCM3724Sim_Read((uintptr_t)addr);
-}
-
-#else // !_PCM3724_SIM_
 
 static inline void RtWritePortUchar(PUCHAR addr, UCHAR value)
 {
@@ -1250,8 +1223,6 @@ static inline UCHAR RtReadPortUchar(PUCHAR addr)
 {
     return inb((unsigned short)(uintptr_t)addr);
 }
-
-#endif // _PCM3724_SIM_
 
 //------------------------------------------------------------------------
 // Memory Allocation Functions

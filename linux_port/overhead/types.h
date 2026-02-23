@@ -18,9 +18,8 @@
 #define  ON    1
 #define  OFF   0
 
-// Build configuration (defines _PCM3724_SIM_, _HBM_SIM_, etc.)
-// MUST come before platform.h so preprocessor conditionals in
-// platform.h (e.g. routing RtReadPortUchar to sim vs stub) work.
+// Build configuration (defines _HBM_SIM_, etc.)
+// MUST come before platform.h so preprocessor conditionals work.
 #include "../common/overheadconst.h"
 
 // Platform compatibility layer (replaces Windows.h + rtapi.h)

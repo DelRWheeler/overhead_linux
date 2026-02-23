@@ -61,6 +61,7 @@ public:
     bool                grade_zeroed[MAXGRADESYNCS];
     bool                grade_armed[MAXGRADESYNCS]; // FLAG TO PREVENT GRADING TWICE
     bool                sync_armed[MAXSYNCS];
+    bool                dbg_sync_zero_triggered[MAXSYNCS]; // mirror of static local in ProcessSyncs for debug
     bool                dual_scale;
     char                sync_in     [MAXINPUTBYTS];
     char                sync_zero   [MAXINPUTBYTS];
