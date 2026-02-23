@@ -46,22 +46,43 @@ static void overhead_crash_handler(int sig, siginfo_t *info, void *ctx)
     write(STDERR_FILENO, marker, sizeof(marker) - 1);
 
     ucontext_t *uc = (ucontext_t *)ctx;
-    int efd = open("/tmp/overhead_crash.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int efd = open("/tmp/overhead_crash.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    int dfd = open("/tmp/overhead_pshm_diag.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
     char buf[1024];
     int len;
 
     // === Basic crash info ===
+    const char* sig_name = (sig == SIGSEGV) ? "SIGSEGV" :
+                           (sig == SIGBUS)  ? "SIGBUS" :
+                           (sig == SIGFPE)  ? "SIGFPE" : "UNKNOWN";
+    const char* code_name = "?";
+    if (sig == SIGSEGV) {
+        code_name = (info->si_code == SEGV_MAPERR) ? "SEGV_MAPERR (no mapping)" :
+                    (info->si_code == SEGV_ACCERR) ? "SEGV_ACCERR (bad permissions)" : "?";
+    } else if (sig == SIGBUS) {
+        code_name = (info->si_code == BUS_ADRALN) ? "BUS_ADRALN (alignment)" :
+                    (info->si_code == BUS_ADRERR) ? "BUS_ADRERR (no physical addr)" :
+                    (info->si_code == BUS_OBJERR) ? "BUS_OBJERR (object error)" : "?";
+    }
+    // Helper macro to write to all output destinations
+    #define WRITE_ALL(b, l) do { \
+        write(STDOUT_FILENO, b, l); \
+        write(STDERR_FILENO, b, l); \
+        if (efd >= 0) write(efd, b, l); \
+        if (dfd >= 0) write(dfd, b, l); \
+    } while(0)
+
     len = snprintf(buf, sizeof(buf),
-        "\n*** OVERHEAD CRASHED (signal %d, pid=%d, tid=%d) ***\n"
+        "\n*** OVERHEAD CRASHED: %s (signal %d, code=%d %s) ***\n"
+        "PID=%d, TID=%d\n"
         "Fault address: %p\n"
         "RIP: 0x%llx\n"
         "RSP: 0x%llx\n",
-        sig, getpid(), (int)syscall(SYS_gettid), info->si_addr,
+        sig_name, sig, info->si_code, code_name,
+        getpid(), (int)syscall(SYS_gettid), info->si_addr,
         (unsigned long long)uc->uc_mcontext.gregs[REG_RIP],
         (unsigned long long)uc->uc_mcontext.gregs[REG_RSP]);
-    write(STDOUT_FILENO, buf, len);
-    write(STDERR_FILENO, buf, len);
-    if (efd >= 0) write(efd, buf, len);
+    WRITE_ALL(buf, len);
 
     // === Sentinel diagnostics ===
     len = snprintf(buf, sizeof(buf),
@@ -74,77 +95,76 @@ static void overhead_crash_handler(int sig, siginfo_t *info, void *ctx)
         g_sentinel_app,
         g_sentinel_pShm,
         g_shm_fd);
-    write(STDOUT_FILENO, buf, len);
-    write(STDERR_FILENO, buf, len);
-    if (efd >= 0) write(efd, buf, len);
+    WRITE_ALL(buf, len);
 
     // === Try to read current app and app->pShm ===
-    // Use volatile reads to prevent optimization
     volatile overhead* cur_app = app;
     len = snprintf(buf, sizeof(buf),
         "app (current):    %p (sentinel match: %s)\n",
         (void*)cur_app,
         (cur_app == (overhead*)g_sentinel_app) ? "YES" : "NO");
-    write(STDOUT_FILENO, buf, len);
-    write(STDERR_FILENO, buf, len);
-    if (efd >= 0) write(efd, buf, len);
+    WRITE_ALL(buf, len);
 
     if (cur_app != NULL) {
-        // Try to read pShm from app — this might fault if app is corrupted
-        // but since we're already in a crash handler with SA_RESETHAND,
-        // a double fault would just kill us with default handler (acceptable)
         volatile void* cur_pShm = cur_app->pShm;
         len = snprintf(buf, sizeof(buf),
             "app->pShm:        %p (sentinel match: %s)\n",
             (void*)cur_pShm,
             (cur_pShm == g_sentinel_pShm) ? "YES" : "NO");
-        write(STDOUT_FILENO, buf, len);
-        write(STDERR_FILENO, buf, len);
-        if (efd >= 0) write(efd, buf, len);
+        WRITE_ALL(buf, len);
 
-        // Try to read AppFlags from pShm to test if mapping is valid
+        // msync check: is the mapping still valid?
         if (cur_pShm != NULL) {
-            // Attempt to read the first int (AppFlags) from the mapping
-            volatile int flags = ((volatile app_type::SHARE_MEMORY*)cur_pShm)->AppFlags;
+            void* page = (void*)((uintptr_t)cur_pShm & ~(uintptr_t)0xFFF);
+            int msync_ret = msync(page, 4096, MS_ASYNC);
+            int msync_err = errno;
             len = snprintf(buf, sizeof(buf),
-                "pShm->AppFlags:   %d (mapping VALID)\n", flags);
-            write(STDOUT_FILENO, buf, len);
-            write(STDERR_FILENO, buf, len);
-            if (efd >= 0) write(efd, buf, len);
+                "msync(pShm page): %s (ret=%d, errno=%d)\n",
+                (msync_ret == 0) ? "VALID" : "INVALID/UNMAPPED",
+                msync_ret, msync_err);
+            WRITE_ALL(buf, len);
+
+            if (msync_ret == 0) {
+                // Mapping valid, try to read AppFlags
+                volatile int flags = ((volatile app_type::SHARE_MEMORY*)cur_pShm)->AppFlags;
+                len = snprintf(buf, sizeof(buf),
+                    "pShm->AppFlags:   %d (mapping VALID, readable)\n", flags);
+                WRITE_ALL(buf, len);
+            }
         }
     }
 
     // === Check /proc/self/maps for SharedMemory mapping ===
     len = snprintf(buf, sizeof(buf), "\n--- /proc/self/maps (SharedMemory) ---\n");
-    write(STDOUT_FILENO, buf, len);
-    write(STDERR_FILENO, buf, len);
-    if (efd >= 0) write(efd, buf, len);
+    WRITE_ALL(buf, len);
 
     int mfd = open("/proc/self/maps", O_RDONLY);
     if (mfd >= 0) {
         char mapbuf[8192];
         int nr;
+        bool found = false;
         while ((nr = read(mfd, mapbuf, sizeof(mapbuf) - 1)) > 0) {
             mapbuf[nr] = '\0';
-            // Search for lines containing "SharedMemory" or the fault address range
             char* line = mapbuf;
             while (line && *line) {
                 char* nl = strchr(line, '\n');
                 if (nl) *nl = '\0';
-                // Print lines with SharedMemory or any shm mapping
                 if (strstr(line, "SharedMemory") || strstr(line, "/dev/shm/")) {
                     int ll = strlen(line);
                     line[ll] = '\n';
-                    write(STDOUT_FILENO, line, ll + 1);
-                    write(STDERR_FILENO, line, ll + 1);
-                    if (efd >= 0) write(efd, line, ll + 1);
-                    line[ll] = '\0';  // restore for next iteration
+                    WRITE_ALL(line, ll + 1);
+                    line[ll] = '\0';
+                    found = true;
                 }
                 if (nl) { *nl = '\n'; line = nl + 1; }
                 else break;
             }
         }
         close(mfd);
+        if (!found) {
+            len = snprintf(buf, sizeof(buf), "(NO /dev/shm entries in maps!)\n");
+            WRITE_ALL(buf, len);
+        }
     }
 
     // === Check if Interface parent process is still alive ===
@@ -153,9 +173,7 @@ static void overhead_crash_handler(int sig, siginfo_t *info, void *ctx)
         "\n--- PARENT PROCESS ---\n"
         "Parent PID: %d (1 = reparented to init = parent died)\n",
         (int)ppid);
-    write(STDOUT_FILENO, buf, len);
-    write(STDERR_FILENO, buf, len);
-    if (efd >= 0) write(efd, buf, len);
+    WRITE_ALL(buf, len);
 
     // === Check SharedMemory file ===
     struct stat shm_stat;
@@ -168,25 +186,25 @@ static void overhead_crash_handler(int sig, siginfo_t *info, void *ctx)
             "/dev/shm/SharedMemory: NOT FOUND (errno=%d: %s)\n",
             errno, strerror(errno));
     }
-    write(STDOUT_FILENO, buf, len);
-    write(STDERR_FILENO, buf, len);
-    if (efd >= 0) write(efd, buf, len);
+    WRITE_ALL(buf, len);
 
     // === Backtrace ===
     len = snprintf(buf, sizeof(buf), "\nBacktrace:\n");
-    write(STDOUT_FILENO, buf, len);
-    write(STDERR_FILENO, buf, len);
-    if (efd >= 0) write(efd, buf, len);
+    WRITE_ALL(buf, len);
 
     void* bt[32];
     int bt_size = backtrace(bt, 32);
     backtrace_symbols_fd(bt, bt_size, STDOUT_FILENO);
     backtrace_symbols_fd(bt, bt_size, STDERR_FILENO);
     if (efd >= 0) backtrace_symbols_fd(bt, bt_size, efd);
+    if (dfd >= 0) backtrace_symbols_fd(bt, bt_size, dfd);
 
     fsync(STDOUT_FILENO);
     fsync(STDERR_FILENO);
     if (efd >= 0) { fsync(efd); close(efd); }
+    if (dfd >= 0) { fsync(dfd); close(dfd); }
+
+    #undef WRITE_ALL
     _exit(128 + sig);
 }
 
