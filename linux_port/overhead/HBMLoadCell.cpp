@@ -1824,16 +1824,19 @@ int HBMLoadCell::HBMCheckSettings()
         // Read load cell linearization coefficients
         if (this->SendCommand("LIC?;", 3000) == NO_ERRORS) // Response: 0000000, 1000000, 0000000, 0000000
         {
-	        pSegment = strtok((char*)&this->rxmsg[0],",");  
+	        pSegment = strtok((char*)&this->rxmsg[0],",");
 	        if (pSegment != NULL)
 	        {
                 app->LastDigLCSet[this->LoadCellNum].LIC0 = atoi(pSegment);
             	pSegment = strtok(NULL,",");
-                app->LastDigLCSet[this->LoadCellNum].LIC1 = atoi(pSegment);
+                if (pSegment != NULL)
+                    app->LastDigLCSet[this->LoadCellNum].LIC1 = atoi(pSegment);
             	pSegment = strtok(NULL,",");
-                app->LastDigLCSet[this->LoadCellNum].LIC2 = atoi(pSegment);
+                if (pSegment != NULL)
+                    app->LastDigLCSet[this->LoadCellNum].LIC2 = atoi(pSegment);
             	pSegment = strtok(NULL,",");
-                app->LastDigLCSet[this->LoadCellNum].LIC3 = atoi(pSegment);
+                if (pSegment != NULL)
+                    app->LastDigLCSet[this->LoadCellNum].LIC3 = atoi(pSegment);
 	        }
             RtPrintf("LIC %d, %d, %d, %d\n", 
                 app->LastDigLCSet[this->LoadCellNum].LIC0,
@@ -1868,13 +1871,17 @@ int HBMLoadCell::HBMCheckSettings()
 	        {
                 app->LastDigLCSet[this->LoadCellNum].TRC1 = atoi(pSegment);
             	pSegment = strtok(NULL,",");
-                app->LastDigLCSet[this->LoadCellNum].TRC2 = atoi(pSegment);
+                if (pSegment != NULL)
+                    app->LastDigLCSet[this->LoadCellNum].TRC2 = atoi(pSegment);
             	pSegment = strtok(NULL,",");
-                app->LastDigLCSet[this->LoadCellNum].TRC3 = atoi(pSegment);
+                if (pSegment != NULL)
+                    app->LastDigLCSet[this->LoadCellNum].TRC3 = atoi(pSegment);
             	pSegment = strtok(NULL,",");
-                app->LastDigLCSet[this->LoadCellNum].TRC4 = atoi(pSegment);
+                if (pSegment != NULL)
+                    app->LastDigLCSet[this->LoadCellNum].TRC4 = atoi(pSegment);
             	pSegment = strtok(NULL,",");
-                app->LastDigLCSet[this->LoadCellNum].TRC5 = atoi(pSegment);
+                if (pSegment != NULL)
+                    app->LastDigLCSet[this->LoadCellNum].TRC5 = atoi(pSegment);
 	        }
             RtPrintf("TRC %d, %d, %d, %d, %d\n", 
                 app->LastDigLCSet[this->LoadCellNum].TRC1,
@@ -2357,13 +2364,17 @@ int HBMLoadCell::HBMSetTrigger()
 	        {
                 app->LastDigLCSet[this->LoadCellNum].TRC1 = atoi(pSegment);
             	pSegment = strtok(NULL,",");
-                app->LastDigLCSet[this->LoadCellNum].TRC2 = atoi(pSegment);
+                if (pSegment != NULL)
+                    app->LastDigLCSet[this->LoadCellNum].TRC2 = atoi(pSegment);
             	pSegment = strtok(NULL,",");
-                app->LastDigLCSet[this->LoadCellNum].TRC3 = atoi(pSegment);
+                if (pSegment != NULL)
+                    app->LastDigLCSet[this->LoadCellNum].TRC3 = atoi(pSegment);
             	pSegment = strtok(NULL,",");
-                app->LastDigLCSet[this->LoadCellNum].TRC4 = atoi(pSegment);
+                if (pSegment != NULL)
+                    app->LastDigLCSet[this->LoadCellNum].TRC4 = atoi(pSegment);
             	pSegment = strtok(NULL,",");
-                app->LastDigLCSet[this->LoadCellNum].TRC5 = atoi(pSegment);
+                if (pSegment != NULL)
+                    app->LastDigLCSet[this->LoadCellNum].TRC5 = atoi(pSegment);
 
                 // Reassign the old value to the shm variable
                 //app->pShm->scl_set.DigLCSet[this->LoadCellNum].TRC1 = app->LastDigLCSet[this->LoadCellNum].TRC1;

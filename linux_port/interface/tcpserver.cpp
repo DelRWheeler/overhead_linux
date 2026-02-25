@@ -309,9 +309,10 @@ int RTFCNDCL TcpServer(PVOID unused)
         return ERROR_OCCURED;
     }
 
-    // Set socket options
+    // Set socket options - REUSEADDR + REUSEPORT to handle orphaned sockets after crash
     optVal = 1;
     setsockopt(g_listenSock, SOL_SOCKET, SO_REUSEADDR, (char*)&optVal, sizeof(optVal));
+    setsockopt(g_listenSock, SOL_SOCKET, SO_REUSEPORT, (char*)&optVal, sizeof(optVal));
 
     // Set non-blocking
     int flags = fcntl(g_listenSock, F_GETFL, 0);
@@ -323,12 +324,20 @@ int RTFCNDCL TcpServer(PVOID unused)
     serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
     serverAddr.sin_port = htons(TCP_SERVER_PORT);
 
-    if (bind(g_listenSock, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) < 0)
+    // Retry bind in case port is still held from a previous SIGKILL'd process
+    int bind_retries = 0;
+    while (bind(g_listenSock, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) < 0)
     {
-        RtPrintf("Error: bind failed %d, file %s, line %d\n",
-                 errno, _FILE_, __LINE__);
-        close(g_listenSock);
-        return ERROR_OCCURED;
+        bind_retries++;
+        if (bind_retries > 30)  // Give up after ~30 seconds
+        {
+            RtPrintf("Error: bind failed after %d retries, errno=%d, file %s, line %d\n",
+                     bind_retries, errno, _FILE_, __LINE__);
+            close(g_listenSock);
+            return ERROR_OCCURED;
+        }
+        RtPrintf("Warning: bind failed (errno=%d), retry %d/30...\n", errno, bind_retries);
+        Sleep(1000);
     }
 
     // Listen

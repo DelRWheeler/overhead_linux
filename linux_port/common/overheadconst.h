@@ -169,7 +169,7 @@
 #define ISYS_MSGTMO        300
 #define ISYS_BAD           0
 #define ISYS_GOOD          1
-#define FATAL_ERR_CNT       10
+#define FATAL_ERR_CNT       60
 
 #define W32_TX_SVR_RDY        0x00000001
 #define W32_HST_TX_SVR_RDY    0x00000002
