@@ -161,12 +161,12 @@ ser_typ::UCB   ucbList[COM_MAX_PORTS] = {
 	1						   //RS422
 	}
 #else
-	{                          //COM3 UCB RS485
-	COM3,                      //COM port
-	(PUCHAR)COM3_BADDR,		   //base address
-	Serial::COM3Isr,           // isr handle
+	{                          //COM1 UCB RS485 (SandCat: HBM load cell on COM1/ttyS0)
+	COM1,                      //COM port (was COM3 on RTX, COM1 on SandCat)
+	(PUCHAR)COM1_BADDR,		   //base address
+	Serial::COM1Isr,           // isr handle
 	0,						   //interrupt vector address
-	COM3_IRQ,                  //IRQ level
+	COM1_IRQ,                  //IRQ level
 	NULL,                      //pointer to input ring buff
 	NULL,                      //pointer to output ring buff
 	DEFAULT_FIFO_MASK,         //default FIFO mask
