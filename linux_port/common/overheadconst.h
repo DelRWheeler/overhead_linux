@@ -95,7 +95,8 @@
 
 //#define _SIMULATION_MODE_ //GLC  -- enables built-in sync/grade simulator (bypasses I/O)
 //#define _WEIGHT_SIMULATION_MODE_ //GLC  -- enables simulated weights (skips real load cell) -- CONFLICTS with _HBM_SIM_
-#define _HBM_SIM_      // Virtual HBM FIT7 load cell simulator (exercises full serial path)
+//#define _HBM_SIM_      // Virtual HBM FIT7 load cell simulator (exercises full serial path)
+                         // Disabled: now using real RS-485 serial to signal generator's HBM responder
 //#define _ZERO_SIM_WEIGHT_
 //#define _NO_INTERFACE_
 //#define _SIM_LAPTOP_	// Simulation build for laptop

@@ -2,9 +2,14 @@
 //
 // Serial.cpp: Linux implementation of the Serial class.
 //
-// When _HBM_SIM_ is defined, the serial read/write/count functions
-// route through the HBM FIT7 load cell simulator instead of being
-// no-ops. This exercises the full HBM serial code path.
+// Three modes (compile-time selection via overheadconst.h):
+//
+// 1. _HBM_SIM_ defined: routes serial I/O through the in-process
+//    HBM FIT7 load cell simulator (FIFO-based, no real serial port).
+//
+// 2. _HBM_SIM_ NOT defined: uses real Linux serial ports via termios.
+//    COM1 = /dev/ttyS0, COM2 = /dev/ttyS1.
+//    Sets SandCat FPGA registers for RS-485 transceiver mode.
 //
 //////////////////////////////////////////////////////////////////////
 
@@ -12,6 +17,11 @@
 
 #ifdef _HBM_SIM_
 #include "hbm_sim.h"
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#include <termios.h>
+#include <sys/ioctl.h>
 #endif
 
 #undef  _FILE_
@@ -52,6 +62,119 @@ ser_typ::FIFO  fifoTbl[5] =
    {8,FCR_TRIGGER_8},
    {14,FCR_TRIGGER_14}
 };
+
+#ifndef _HBM_SIM_
+//--------------------------------------------------------
+// Real serial I/O support (Linux termios)
+//--------------------------------------------------------
+
+// File descriptors for each COM port (-1 = not open)
+static int g_comFd[4] = { -1, -1, -1, -1 };
+
+// COM port to Linux device path mapping
+static const char* g_comDevPath[4] = {
+    "/dev/ttyS0",   // COM1
+    "/dev/ttyS1",   // COM2
+    "/dev/ttyS2",   // COM3
+    "/dev/ttyS3"    // COM4
+};
+
+// SandCat VersaLogic FPGA register addresses for RS-485 mode
+#define FPGA_XCVRMODE   0xCA9   // Transceiver mode
+#define FPGA_UARTMODE1  0xCB6   // UART mode 1
+
+//--------------------------------------------------------
+// Set SandCat FPGA registers for RS-485 transceiver mode
+// via /dev/port direct I/O access.
+//--------------------------------------------------------
+static void SetFPGA_RS485(void)
+{
+    int fd = open("/dev/port", O_RDWR | O_SYNC);
+    if (fd < 0)
+    {
+        RtPrintf("Serial: Warning: could not open /dev/port for FPGA setup (%d)\n", errno);
+        RtPrintf("Serial: Continuing anyway (may already be set, or not running on SandCat)\n");
+        return;
+    }
+
+    unsigned char val;
+
+    // XCVRMODE: 0x03 = both COM1+COM2 in RS-485 mode
+    lseek(fd, FPGA_XCVRMODE, SEEK_SET);
+    val = 0x03;
+    write(fd, &val, 1);
+
+    // UARTMODE1: 0x33 = auto TX direction + UART enable for both
+    lseek(fd, FPGA_UARTMODE1, SEEK_SET);
+    val = 0x33;
+    write(fd, &val, 1);
+
+    close(fd);
+    RtPrintf("Serial: FPGA RS-485 registers set (XCVRMODE=0x03, UARTMODE1=0x33)\n");
+}
+
+//--------------------------------------------------------
+// Open and configure a Linux serial port with termios
+// Returns file descriptor or -1 on error.
+//--------------------------------------------------------
+static int OpenLinuxSerial(int port_num)
+{
+    if (port_num < 0 || port_num > 3)
+        return -1;
+
+    const char* path = g_comDevPath[port_num];
+
+    int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0)
+    {
+        RtPrintf("Serial: Failed to open %s: errno=%d\n", path, errno);
+        return -1;
+    }
+
+    // Clear O_NONBLOCK so reads can be used with VTIME/VMIN
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0)
+        fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+
+    // Configure termios: 38400 baud, 8N1, raw mode
+    struct termios tty;
+    memset(&tty, 0, sizeof(tty));
+
+    // Input: no break, no CR->NL, no parity check, no strip, no flow ctrl
+    tty.c_iflag = 0;
+
+    // Output: raw
+    tty.c_oflag = 0;
+
+    // Control: 8-bit, enable receiver, local mode (no modem signals)
+    tty.c_cflag = CS8 | CREAD | CLOCAL;
+
+    // Local: completely raw
+    tty.c_lflag = 0;
+
+    // VMIN=1: block until at least 1 byte available
+    // VTIME=1: 100ms inter-character timeout
+    tty.c_cc[VMIN]  = 1;
+    tty.c_cc[VTIME] = 1;
+
+    // Baud rate
+    cfsetispeed(&tty, B38400);
+    cfsetospeed(&tty, B38400);
+
+    if (tcsetattr(fd, TCSANOW, &tty) != 0)
+    {
+        RtPrintf("Serial: tcsetattr failed for %s: errno=%d\n", path, errno);
+        close(fd);
+        return -1;
+    }
+
+    // Flush any stale data
+    tcflush(fd, TCIOFLUSH);
+
+    RtPrintf("Serial: Opened %s (38400 8N1 RS-485) fd=%d\n", path, fd);
+    return fd;
+}
+#endif // !_HBM_SIM_
 
 //////////////////////////////////////////////////////////////////////
 // Construction/Destruction
@@ -107,6 +230,20 @@ WORD Serial::RtOpenComPort(WORD baudRate, BYTE wordSize, BYTE stopBits, BYTE par
 #ifdef _HBM_SIM_
     // Initialize HBM FIT7 simulator for this port
     HBMSim_Init(thisUcb->port);
+#else
+    // Set FPGA registers for RS-485 mode (idempotent, safe to call multiple times)
+    SetFPGA_RS485();
+
+    // Open real Linux serial port
+    int fd = OpenLinuxSerial(thisUcb->port);
+    if (fd >= 0)
+    {
+        g_comFd[thisUcb->port] = fd;
+    }
+    else
+    {
+        RtPrintf("RtOpenComPort: WARNING - could not open COM%d serial device\n", thisUcb->port + 1);
+    }
 #endif
 
     thisUcb->state = COM_STATE_OPEN;
@@ -119,9 +256,30 @@ WORD Serial::RtReadComPort(BYTE *buffer, WORD bytesToRead, WORD *bytesRead)
 #ifdef _HBM_SIM_
     *bytesRead = (WORD)HBMSim_Read(this->ucbObj.port, buffer, bytesToRead);
 #else
-    (void)buffer;
-    (void)bytesToRead;
-    *bytesRead = 0;
+    int fd = g_comFd[this->ucbObj.port];
+    if (fd < 0)
+    {
+        *bytesRead = 0;
+        return COM_NORMAL;
+    }
+
+    // Non-blocking check: see if data is available before reading
+    int avail = 0;
+    ioctl(fd, FIONREAD, &avail);
+    if (avail <= 0)
+    {
+        *bytesRead = 0;
+        return COM_NORMAL;
+    }
+
+    int toRead = (avail < bytesToRead) ? avail : bytesToRead;
+    ssize_t n = read(fd, buffer, toRead);
+    if (n < 0)
+    {
+        *bytesRead = 0;
+        return COM_NORMAL;
+    }
+    *bytesRead = (WORD)n;
 #endif
     return COM_NORMAL;
 }
@@ -131,8 +289,20 @@ WORD Serial::RtWriteComPort(BYTE *buffer, WORD bytesToWrite, WORD *bytesWritten)
 #ifdef _HBM_SIM_
     *bytesWritten = (WORD)HBMSim_Write(this->ucbObj.port, buffer, bytesToWrite);
 #else
-    (void)buffer;
-    *bytesWritten = bytesToWrite;
+    int fd = g_comFd[this->ucbObj.port];
+    if (fd < 0)
+    {
+        *bytesWritten = bytesToWrite;  // Pretend written if no device
+        return COM_NORMAL;
+    }
+
+    ssize_t n = write(fd, buffer, bytesToWrite);
+    if (n < 0)
+    {
+        *bytesWritten = 0;
+        return COM_NORMAL;
+    }
+    *bytesWritten = (WORD)n;
 #endif
     return COM_NORMAL;
 }
@@ -158,7 +328,17 @@ WORD Serial::RtGetComBufferCount(WORD* count)
 #ifdef _HBM_SIM_
     *count = (WORD)HBMSim_Available(this->ucbObj.port);
 #else
-    *count = 0;
+    int fd = g_comFd[this->ucbObj.port];
+    if (fd < 0)
+    {
+        *count = 0;
+        return NO_ERRORS;
+    }
+
+    int avail = 0;
+    if (ioctl(fd, FIONREAD, &avail) < 0)
+        avail = 0;
+    *count = (WORD)avail;
 #endif
     return NO_ERRORS;
 }
@@ -173,6 +353,17 @@ WORD Serial::RtCloseComPort()
     {
         return COM_PORT_NOT_OPEN;
     }
+
+#ifndef _HBM_SIM_
+    // Close the real serial port
+    int fd = g_comFd[ucb->port];
+    if (fd >= 0)
+    {
+        close(fd);
+        g_comFd[ucb->port] = -1;
+        RtPrintf("Serial: Closed COM%d (fd=%d)\n", ucb->port + 1, fd);
+    }
+#endif
 
     ucb->state = COM_STATE_IDLE;
 
