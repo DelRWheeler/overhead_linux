@@ -4095,16 +4095,6 @@ void overhead::AverageWeight(int scale)
 
 							wt = app->ld_cel[scale]->read_load_cell(0);
 
-							// TEMP DEBUG: log HBM read_load_cell value
-							{
-								static int _dbg_avg_cnt = 0;
-								if ((_dbg_avg_cnt++ % 10) == 0) {
-									RtPrintf("AvgWt[%d] wt=%lld bird=%d shk2shk=%d step=%d trig=%d\n",
-										scale, (long long)wt, (int)g_hbm_bird_present,
-										app->shk2shk_ticks, w_avg[scale].step, w_avg[scale].avg_trigger_cntr);
-								}
-							}
-
 							// GLC 12/13/2004
 							// Check to see if digital load cell readings have stalled
 							// Need to warn user to check loadcell power and reset backend
@@ -8799,6 +8789,29 @@ void overhead::GradeProcess(int GradeSyncIndex)
 	}
 
     //RtPrintf("Grade process\n");
+    // TEMP DEBUG: Log GradeProcess entry and GradeArea values
+    {
+        static int gp_entry_count = 0;
+        gp_entry_count++;
+        if (gp_entry_count <= 20 || gp_entry_count % 200 == 0) {
+            FILE* gpf = fopen("/tmp/grade_process.txt", "a");
+            if (gpf) {
+                fprintf(gpf, "GP#%d syncIdx=%d sw=0x%02X MB_EN0=%d RG=%d shk=%d "
+                    "GA[1].sync=%d GA[1].off=%d GA[1].grade=%c Shackles=%d Grading=%d\n",
+                    gp_entry_count, GradeSyncIndex, (unsigned char)switch_in[0],
+                    MB_ENABLED(0) ? 1 : 0,
+                    pShm->sys_set.ResetGrading.ResetGrade ? 1 : 0,
+                    pShm->grade_shackle[GradeSyncIndex],
+                    pShm->sys_set.GradeArea[1].GradeSyncUsed,
+                    pShm->sys_set.GradeArea[1].offset,
+                    pShm->sys_set.GradeArea[1].grade,
+                    pShm->sys_set.Shackles,
+                    pShm->sys_set.Grading ? 1 : 0);
+                fclose(gpf);
+            }
+        }
+    }
+
     for (i = 1; i < MAXGRADES; i++)
     {
         if ((grade_bit[i] != NULL) && (pShm->sys_set.GradeArea[grade_index[i]].GradeSyncUsed == GradeSyncIndex))
@@ -8816,6 +8829,26 @@ void overhead::GradeProcess(int GradeSyncIndex)
 			//
 			//  This solution is probably not the best solution in terms of speed but, in terms
 			//    of not wanting to cause side effects, it seems to work.
+            // TEMP DEBUG: Log grade condition details to /tmp/grade_process.txt
+            {
+                static int gp_log_count = 0;
+                gp_log_count++;
+                if (gp_log_count <= 50 || gp_log_count % 500 == 0) {
+                    FILE* gpf = fopen("/tmp/grade_process.txt", "a");
+                    if (gpf) {
+                        fprintf(gpf, "#%d i=%d shk=%d bit=%d GI=%d d0=%d d1=%d RG=%d sw=0x%02X\n",
+                            gp_log_count, i, shackle,
+                            BITSET(switch_in[0], grade_bit[i]) ? 1 : 0,
+                            pShm->ShackleStatus[shackle].GradeIndex[0],
+                            pShm->ShackleStatus[shackle].dropped[0],
+                            pShm->ShackleStatus[shackle].dropped[1],
+                            pShm->sys_set.ResetGrading.ResetGrade ? 1 : 0,
+                            (unsigned char)switch_in[0]);
+                        fclose(gpf);
+                    }
+                }
+            }
+
             if ( (BITSET(switch_in[0], grade_bit[i])) &&
                  (pShm->ShackleStatus[shackle].GradeIndex[0] == 0) &&  // added 3/16/2006 LATER-J
 				  (
@@ -10036,6 +10069,7 @@ bool overhead::MissedBirdCheck(int curr_mb, int shackle, int mb_bit_state)
 
 				// Must assume it was dropped
 				shk->dropped[0] = 1;
+				shk->dropped[1] = 1; // for grading (single-scale: no scale 2, match empty shackle path)
 				return true;
             }  // single-scale
 

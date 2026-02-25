@@ -157,9 +157,11 @@ static int OpenLinuxSerial(int port_num)
     tty.c_cc[VMIN]  = 1;
     tty.c_cc[VTIME] = 1;
 
-    // Baud rate
-    cfsetispeed(&tty, B38400);
-    cfsetospeed(&tty, B38400);
+    // Baud rate — set directly in struct to avoid cfsetispeed/cfsetospeed
+    // which may require newer glibc on some systems
+    tty.c_cflag |= B38400;
+    tty.c_ispeed = B38400;
+    tty.c_ospeed = B38400;
 
     if (tcsetattr(fd, TCSANOW, &tty) != 0)
     {
