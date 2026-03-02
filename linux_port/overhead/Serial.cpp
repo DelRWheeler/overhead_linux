@@ -4,19 +4,29 @@
 //
 // Three modes (compile-time selection via overheadconst.h):
 //
-// 1. _HBM_SIM_ defined: routes serial I/O through the in-process
-//    HBM FIT7 load cell simulator (FIFO-based, no real serial port).
+// 1. _LC_SIM_ defined: routes serial I/O through in-process load cell
+//    simulators (HBM FIT7 or ISPD-20KG) based on per-port runtime
+//    selection via Serial_SetSimType().
 //
-// 2. _HBM_SIM_ NOT defined: uses real Linux serial ports via termios.
+// 2. _LC_SIM_ NOT defined: uses real Linux serial ports via termios.
 //    COM1 = /dev/ttyS0, COM2 = /dev/ttyS1.
 //    Sets SandCat FPGA registers for RS-485 transceiver mode.
+//
+// Legacy: _HBM_SIM_ is replaced by _LC_SIM_. If _HBM_SIM_ is defined
+//         but _LC_SIM_ is not, treat it as _LC_SIM_ for backwards compat.
 //
 //////////////////////////////////////////////////////////////////////
 
 #include "types.h"
 
-#ifdef _HBM_SIM_
+// Treat legacy _HBM_SIM_ as _LC_SIM_
+#if defined(_HBM_SIM_) && !defined(_LC_SIM_)
+#define _LC_SIM_
+#endif
+
+#ifdef _LC_SIM_
 #include "hbm_sim.h"
+#include "ispd_sim.h"
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -63,7 +73,23 @@ ser_typ::FIFO  fifoTbl[5] =
    {14,FCR_TRIGGER_14}
 };
 
-#ifndef _HBM_SIM_
+#ifdef _LC_SIM_
+//--------------------------------------------------------
+// Per-port simulator type selection (runtime)
+// 0 = HBM FIT7 (default), 1 = ISPD-20KG
+//--------------------------------------------------------
+static int g_simType[4] = {0, 0, 0, 0};
+
+void Serial_SetSimType(int port, int type)
+{
+    if (port >= 0 && port < 4)
+    {
+        g_simType[port] = type;
+        RtPrintf("Serial: COM%d simulator type set to %s\n",
+            port + 1, type == 1 ? "ISPD-20KG" : "HBM FIT7");
+    }
+}
+#else
 //--------------------------------------------------------
 // Real serial I/O support (Linux termios)
 //--------------------------------------------------------
@@ -176,7 +202,15 @@ static int OpenLinuxSerial(int port_num)
     RtPrintf("Serial: Opened %s (38400 8N1 RS-485) fd=%d\n", path, fd);
     return fd;
 }
-#endif // !_HBM_SIM_
+
+// Stub for Serial_SetSimType when not in sim mode
+void Serial_SetSimType(int port, int type)
+{
+    (void)port;
+    (void)type;
+    RtPrintf("Serial_SetSimType: ignored (not in simulator mode)\n");
+}
+#endif // _LC_SIM_
 
 //////////////////////////////////////////////////////////////////////
 // Construction/Destruction
@@ -229,9 +263,12 @@ WORD Serial::RtOpenComPort(WORD baudRate, BYTE wordSize, BYTE stopBits, BYTE par
     else if (thisUcb->port == COM4)
         pser4 = this;
 
-#ifdef _HBM_SIM_
-    // Initialize HBM FIT7 simulator for this port
-    HBMSim_Init(thisUcb->port);
+#ifdef _LC_SIM_
+    // Initialize the appropriate load cell simulator for this port
+    if (g_simType[thisUcb->port] == 1)
+        ISPDSim_Init(thisUcb->port);
+    else
+        HBMSim_Init(thisUcb->port);
 #else
     // Set FPGA registers for RS-485 mode (idempotent, safe to call multiple times)
     SetFPGA_RS485();
@@ -255,8 +292,11 @@ WORD Serial::RtOpenComPort(WORD baudRate, BYTE wordSize, BYTE stopBits, BYTE par
 
 WORD Serial::RtReadComPort(BYTE *buffer, WORD bytesToRead, WORD *bytesRead)
 {
-#ifdef _HBM_SIM_
-    *bytesRead = (WORD)HBMSim_Read(this->ucbObj.port, buffer, bytesToRead);
+#ifdef _LC_SIM_
+    if (g_simType[this->ucbObj.port] == 1)
+        *bytesRead = (WORD)ISPDSim_Read(this->ucbObj.port, buffer, bytesToRead);
+    else
+        *bytesRead = (WORD)HBMSim_Read(this->ucbObj.port, buffer, bytesToRead);
 #else
     int fd = g_comFd[this->ucbObj.port];
     if (fd < 0)
@@ -288,8 +328,11 @@ WORD Serial::RtReadComPort(BYTE *buffer, WORD bytesToRead, WORD *bytesRead)
 
 WORD Serial::RtWriteComPort(BYTE *buffer, WORD bytesToWrite, WORD *bytesWritten)
 {
-#ifdef _HBM_SIM_
-    *bytesWritten = (WORD)HBMSim_Write(this->ucbObj.port, buffer, bytesToWrite);
+#ifdef _LC_SIM_
+    if (g_simType[this->ucbObj.port] == 1)
+        *bytesWritten = (WORD)ISPDSim_Write(this->ucbObj.port, buffer, bytesToWrite);
+    else
+        *bytesWritten = (WORD)HBMSim_Write(this->ucbObj.port, buffer, bytesToWrite);
 #else
     int fd = g_comFd[this->ucbObj.port];
     if (fd < 0)
@@ -327,8 +370,11 @@ WORD Serial::RtGetComStatus(CSB *csb)
 
 WORD Serial::RtGetComBufferCount(WORD* count)
 {
-#ifdef _HBM_SIM_
-    *count = (WORD)HBMSim_Available(this->ucbObj.port);
+#ifdef _LC_SIM_
+    if (g_simType[this->ucbObj.port] == 1)
+        *count = (WORD)ISPDSim_Available(this->ucbObj.port);
+    else
+        *count = (WORD)HBMSim_Available(this->ucbObj.port);
 #else
     int fd = g_comFd[this->ucbObj.port];
     if (fd < 0)
@@ -356,7 +402,7 @@ WORD Serial::RtCloseComPort()
         return COM_PORT_NOT_OPEN;
     }
 
-#ifndef _HBM_SIM_
+#ifndef _LC_SIM_
     // Close the real serial port
     int fd = g_comFd[ucb->port];
     if (fd >= 0)

@@ -120,11 +120,15 @@ void HBMSim_Cleanup(int port_num);
 void HBMSim_CleanupAll(void);
 
 //--------------------------------------------------------
-// Bird-present signaling (set by PCM3724 sim)
+// Bird-present signaling (set by sync processing in overhead.cpp)
 //
-// When true, the HBM sim outputs bird weights from the table.
+// When true, the load cell sim outputs bird weights from the table.
 // When false, it outputs ~0 (empty shackle baseline).
-// This is how the sim models birds physically being on the scale.
+// Shared between HBM and ISPD simulators.
 //--------------------------------------------------------
-extern volatile bool g_hbm_bird_present;
-extern volatile int  g_hbm_shackle_seq;
+extern volatile bool g_lc_bird_present;
+extern volatile int  g_lc_shackle_seq;
+
+// Legacy aliases for backwards compatibility
+#define g_hbm_bird_present g_lc_bird_present
+#define g_hbm_shackle_seq  g_lc_shackle_seq

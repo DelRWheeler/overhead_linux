@@ -4,7 +4,10 @@
 
 #include "types.h"
 #include "telnetsrv.h"
-#ifdef _HBM_SIM_
+#ifdef _LC_SIM_
+#include "hbm_sim.h"
+#include "ispd_sim.h"
+#elif defined(_HBM_SIM_)
 #include "hbm_sim.h"
 #endif
 
@@ -26,6 +29,10 @@ HBMLoadCell::HBMinit*	pHBMLoadCellInit1 = NULL;
 HBMLoadCell::HBMinit*	pHBMLoadCellInit2 = NULL;
 HBMLoadCell::HBMinit*	pHBMLoadCellInit3 = NULL;
 HBMLoadCell::HBMinit*	pHBMLoadCellInit4 = NULL;
+ISPDLoadCell::ISPDinit*	pISPDLoadCellInit1 = NULL;
+ISPDLoadCell::ISPDinit*	pISPDLoadCellInit2 = NULL;
+ISPDLoadCell::ISPDinit*	pISPDLoadCellInit3 = NULL;
+ISPDLoadCell::ISPDinit*	pISPDLoadCellInit4 = NULL;
 HANDLE                  hLoadCellInitialized[MAXLOADCELLS];
 
 InterSystems*   Isys      = NULL;
@@ -3281,17 +3288,24 @@ void __stdcall overhead::Gp_Timer_Main(PVOID addr)
 #ifndef _WEIGHT_SIMULATION_MODE_
 
 		// Digital Load Cell Specific Checks
-		if (app->pShm->scl_set.LoadCellType == LOADCELL_TYPE_HBM)
+		if (app->pShm->scl_set.LoadCellType == LOADCELL_TYPE_HBM ||
+		    app->pShm->scl_set.LoadCellType == LOADCELL_TYPE_ISPD)
 		{
 			// If debug shell Readloadcell command completes, write file
 			if ( app->WriteLCReadsToFile == 0 )
 			{
 				app->WriteLCReadsToFile = app->pShm->scl_set.NumScales;
-				app->HBMLc->WriteLCReadsQ();
-
-				if(app->pShm->scl_set.NumScales == 2)
+				if (app->pShm->scl_set.LoadCellType == LOADCELL_TYPE_HBM)
 				{
-					app->HBMLc2->WriteLCReadsQ();
+					app->HBMLc->WriteLCReadsQ();
+					if(app->pShm->scl_set.NumScales == 2)
+						app->HBMLc2->WriteLCReadsQ();
+				}
+				else if (app->pShm->scl_set.LoadCellType == LOADCELL_TYPE_ISPD)
+				{
+					app->ISPDLc->WriteLCReadsQ();
+					if(app->pShm->scl_set.NumScales == 2)
+						app->ISPDLc2->WriteLCReadsQ();
 				}
 			}
 
@@ -3304,7 +3318,7 @@ void __stdcall overhead::Gp_Timer_Main(PVOID addr)
 	// Display the stuck load cell message if required GLC added 12/10/04
 	for (int scaleidx = 0; scaleidx < MAXSCALES; scaleidx++)
 	{
-		if ( (sec30_OK) && (app->pShm->scl_set.LoadCellType == LOADCELL_TYPE_HBM) && (app->StuckLoadCellWarning[scaleidx]) )
+		if ( (sec30_OK) && (app->pShm->scl_set.LoadCellType != LOADCELL_TYPE_1510) && (app->StuckLoadCellWarning[scaleidx]) )
 		{
 			app->StuckLoadCellWarning[scaleidx] = false;
 			sprintf(app_err_buf, "Load cell readings on scale %d are not changing!\n Check load cell power and data connections, then restart the controller application.\n", scaleidx + 1); //GLC added 12/10/04
@@ -10404,15 +10418,15 @@ void overhead::ProcessSyncs()
                         pShm->WeighZero[0] = true;
                         shm_updates[SCLWGHZ-1] = true;  // notify host only on transition
                     }
-#ifdef _HBM_SIM_
+#if defined(_LC_SIM_) || defined(_HBM_SIM_)
                     // Shackle 1 = empty (auto-zero). All others get bird weight.
                     // Increment sequence counter so the 600Hz measurement thread
                     // knows a new shackle arrived and advances the weight table.
                     if (pShm->WeighZero[0] && pSyncStat->shackleno > 1) {
-                        g_hbm_bird_present = true;
-                        g_hbm_shackle_seq++;
+                        g_lc_bird_present = true;
+                        g_lc_shackle_seq++;
                     } else {
-                        g_hbm_bird_present = false;
+                        g_lc_bird_present = false;
                     }
 #endif
                     pShm->WeighShackle[0] = pSyncStat->shackleno;
@@ -11591,6 +11605,100 @@ void overhead::InitLoadCell()
 			app->WriteLCReadsToFile = app->pShm->scl_set.NumScales;
         }
     }
+
+//------------- Initialize the ISPD serial load cell
+
+	if (app->pShm->scl_set.LoadCellType == LOADCELL_TYPE_ISPD)
+	{
+		RtPrintf("Using loadcell LOADCELL_TYPE_ISPD (H&B ISPD-20KG)\n");
+
+#ifdef _LC_SIM_
+		Serial_SetSimType(LOADCELL_1, 1);  // Route COM1 serial to ISPD sim
+#endif
+
+		pser = new Serial(ucbList[LOADCELL_1]);
+
+		if ((ISPDLc = new ISPDLoadCell) == NULL)
+		{
+			RtPrintf("Error file %s, line %d \n",_FILE_,__LINE__);
+			RtExitProcess(1);
+		}
+		else
+		{
+			pISPDLoadCellInit1 = (ISPDLoadCell::ISPDinit*)RtAllocateLockedMemory(sizeof(ISPDLoadCell::ISPDinit));
+			DebugTrace(_HBMLDCELL_, "ISPDLoadCell object created.\n");
+			pISPDLoadCellInit1->pISPDLoadCell = ISPDLc;
+			pISPDLoadCellInit1->pISPDLoadCell->LoadCellNum = LOADCELL_1;
+			pISPDLoadCellInit1->pSerial = pser;
+
+			ISPDLc->initialize(pISPDLoadCellInit1);
+			ld_cel[LOADCELL_1] = ISPDLc;
+
+			// Initialize remaining slots to prevent NULL pointer dereference
+			ld_cel[LOADCELL_2] = ISPDLc;
+			ld_cel[LOADCELL_3] = ISPDLc;
+			ld_cel[LOADCELL_4] = ISPDLc;
+		}
+
+		//----- Create/Open Mutex for load cell
+		load_cell_mutex[MAINBUFID] = RtCreateMutex( NULL, FALSE, "loadCell");
+		if ( load_cell_mutex[MAINBUFID] == NULL )
+		{
+			sprintf(app_err_buf,"Can't create load cell mutex %s line %d\n", _FILE_, __LINE__);
+			GenError(critical, app_err_buf);
+		}
+
+		load_cell_mutex[GPBUFID] = RtOpenMutex( NULL, FALSE, "loadCell");
+		if ( load_cell_mutex[GPBUFID] == NULL )
+		{
+			sprintf(app_err_buf,"Can't open load cell mutex %s line %d\n", _FILE_, __LINE__);
+			GenError(critical, app_err_buf);
+		}
+
+		Sleep(500);
+
+		// If a dual scale system, init the second loadcell
+		if (pShm->scl_set.NumScales > 1)
+		{
+#ifdef _LC_SIM_
+			Serial_SetSimType(LOADCELL_2, 1);  // Route COM2 serial to ISPD sim
+#endif
+			pser = new Serial(ucbList[LOADCELL_2]);
+
+			if ((ISPDLc2 = new ISPDLoadCell) == NULL)
+			{
+				RtPrintf("Error file %s, line %d \n",_FILE_,__LINE__);
+				RtExitProcess(1);
+			}
+			else
+			{
+				pISPDLoadCellInit2 = (ISPDLoadCell::ISPDinit*)RtAllocateLockedMemory(sizeof(ISPDLoadCell::ISPDinit));
+				DebugTrace(_HBMLDCELL_, "ISPDLoadCell2 object created.\n");
+				pISPDLoadCellInit2->pISPDLoadCell = ISPDLc2;
+				pISPDLoadCellInit2->pISPDLoadCell->LoadCellNum = LOADCELL_2;
+				pISPDLoadCellInit2->pSerial = pser;
+
+				ISPDLc2->initialize(pISPDLoadCellInit2);
+				ld_cel[LOADCELL_2] = ISPDLc2;
+			}
+		}
+
+		for(int i=0;i<pShm->scl_set.NumScales;i++)
+		{
+			if (RtWaitForSingleObject(hLoadCellInitialized[i], 5000) != WAIT_OBJECT_0)
+			{
+				sprintf(app_err_buf,"Load Cell %d initialization failed. Error %d file %s, line %d \n", i+1, GetLastError(), _FILE_, __LINE__);
+				GenError(critical, app_err_buf);
+				RtPrintf(app_err_buf);
+			}
+			else
+			{
+				RtPrintf("ISPD Load Cell %d initialized.\n", i + 1);
+			}
+
+			app->WriteLCReadsToFile = app->pShm->scl_set.NumScales;
+		}
+	}
 }
 
 

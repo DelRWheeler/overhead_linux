@@ -29,6 +29,8 @@ set(OVERHEAD_SOURCES
     DropManager.cpp
     Simulator.cpp
     hbm_sim.cpp
+    ispd_sim.cpp
+    ISPDLoadCell.cpp
     backendshell.cpp
     ../interface/console.cpp
 )

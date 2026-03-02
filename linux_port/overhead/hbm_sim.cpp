@@ -26,17 +26,10 @@
 // Global simulator states (one per load cell)
 HBMSimState g_hbmSim[HBM_SIM_MAX_LC];
 
-// Bird-present flag: set by PCM3724 sim when counter pulse fires
-// and the controller has zeroed (WeighZero = true).
-// When PCM3724 sim is not running (disabled), the HBM sim checks
-// WeighZero directly and always outputs bird weights after zeroing.
-volatile bool g_hbm_bird_present = false;
-
-// Sequence counter incremented by overhead.cpp on each new shackle trigger.
-// The measurement thread compares its local copy to detect new shackles
-// and advance the weight index (rising-edge detection on the bool flag
-// is too fast for the 600 Hz thread to catch).
-volatile int g_hbm_shackle_seq = 0;
+// Bird-present flag and shackle sequence counter.
+// These are now defined in ispd_sim.cpp as g_lc_bird_present / g_lc_shackle_seq
+// and aliased via #defines in hbm_sim.h for backwards compatibility.
+// (The actual globals live in ispd_sim.cpp to avoid duplicate definitions.)
 
 // Simulated weight table (pounds) - 2 to 6 lb range for testing schedules/grading
 static const double hbm_sim_weights[HBM_SIM_NUM_WEIGHTS] =

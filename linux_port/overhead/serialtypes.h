@@ -149,4 +149,8 @@ public:
     static   void __stdcall COM4Isr( void *junk);
 };
 
+// Runtime simulator type selection (used with _LC_SIM_)
+// type: 0 = HBM FIT7 (default), 1 = ISPD-20KG
+void Serial_SetSimType(int port, int type);
+
 #endif

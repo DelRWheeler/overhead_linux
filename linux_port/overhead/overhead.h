@@ -36,6 +36,10 @@ public:
 	HBMLoadCell*	    HBMLc2;
 	HBMLoadCell*	    HBMLc3;
 	HBMLoadCell*	    HBMLc4;
+    ISPDLoadCell*	    ISPDLc;
+	ISPDLoadCell*	    ISPDLc2;
+	ISPDLoadCell*	    ISPDLc3;
+	ISPDLoadCell*	    ISPDLc4;
     dig_lc_settings     LastDigLCSet[MAXLOADCELLS];    // last setting for the digital load cells
     dig_lc_settings     DefaultDigLCSet[MAXLOADCELLS]; // default settings for the digital load cells
 

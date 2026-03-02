@@ -19,6 +19,7 @@
 
 #define LOADCELL_TYPE_1510	0
 #define LOADCELL_TYPE_HBM	1
+#define LOADCELL_TYPE_ISPD	2
 
 #define _3724_IO_   // 6 primary i/o ports
 #define _VSBC6_IO_  // 2 secondary i/o ports
@@ -95,8 +96,8 @@
 
 //#define _SIMULATION_MODE_ //GLC  -- enables built-in sync/grade simulator (bypasses I/O)
 //#define _WEIGHT_SIMULATION_MODE_ //GLC  -- enables simulated weights (skips real load cell) -- CONFLICTS with _HBM_SIM_
-//#define _HBM_SIM_      // Virtual HBM FIT7 load cell simulator (exercises full serial path)
-                         // Disabled: now using real RS-485 serial to signal generator's HBM responder
+//#define _HBM_SIM_      // OBSOLETE - replaced by _LC_SIM_ (runtime selection of HBM or ISPD sim)
+#define _LC_SIM_         // Load cell simulator — routes serial I/O to HBM or ISPD sim based on LoadCellType
 //#define _ZERO_SIM_WEIGHT_
 //#define _NO_INTERFACE_
 //#define _SIM_LAPTOP_	// Simulation build for laptop

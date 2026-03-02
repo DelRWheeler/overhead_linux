@@ -38,6 +38,7 @@
 #include "LoadCell.h"
 #include "1510Loadcell.h"
 #include "HBMLoadCell.h"
+#include "ISPDLoadCell.h"
 
 // Application class
 #include "overhead.h"
