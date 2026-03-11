@@ -140,10 +140,36 @@ static void SetFPGA_RS485(void)
 }
 
 //--------------------------------------------------------
+// Map COM_BAUD_RATE_xxx index to termios speed_t constant.
+//--------------------------------------------------------
+static speed_t BaudIndexToSpeed(int baudIdx)
+{
+    switch (baudIdx)
+    {
+        case 0: return B2400;
+        case 1: return B4800;
+        case 2: return B9600;
+        case 3: return B19200;
+        case 4: return B38400;
+        case 5: return B57600;
+        case 6: return B115200;
+        default: return B38400;
+    }
+}
+
+static const char* BaudIndexToStr(int baudIdx)
+{
+    static const char* names[] = {"2400","4800","9600","19200","38400","57600","115200"};
+    if (baudIdx >= 0 && baudIdx <= 6) return names[baudIdx];
+    return "38400";
+}
+
+//--------------------------------------------------------
 // Open and configure a Linux serial port with termios
+// baudIdx: COM_BAUD_RATE_xxx constant (0-6)
 // Returns file descriptor or -1 on error.
 //--------------------------------------------------------
-static int OpenLinuxSerial(int port_num)
+static int OpenLinuxSerial(int port_num, int baudIdx)
 {
     if (port_num < 0 || port_num > 3)
         return -1;
@@ -162,7 +188,7 @@ static int OpenLinuxSerial(int port_num)
     if (flags >= 0)
         fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
 
-    // Configure termios: 38400 baud, 8N1, raw mode
+    // Configure termios: raw mode, 8N1
     struct termios tty;
     memset(&tty, 0, sizeof(tty));
 
@@ -183,11 +209,14 @@ static int OpenLinuxSerial(int port_num)
     tty.c_cc[VMIN]  = 1;
     tty.c_cc[VTIME] = 1;
 
-    // Baud rate — set directly in struct to avoid cfsetispeed/cfsetospeed
-    // which may require newer glibc on some systems
-    tty.c_cflag |= B38400;
-    tty.c_ispeed = B38400;
-    tty.c_ospeed = B38400;
+    // Set baud rate from baudIdx parameter
+    // Set speed in both c_cflag bitmask and c_ispeed/c_ospeed fields directly
+    // to avoid cfsetispeed/cfsetospeed GLIBC_2.42 symbol dependency
+    speed_t spd = BaudIndexToSpeed(baudIdx);
+    tty.c_cflag &= ~(CBAUD | CBAUDEX);  // clear existing baud bits
+    tty.c_cflag |= spd;                  // set new baud in cflag
+    tty.c_ispeed = spd;                  // set input speed field
+    tty.c_ospeed = spd;                  // set output speed field
 
     if (tcsetattr(fd, TCSANOW, &tty) != 0)
     {
@@ -199,7 +228,7 @@ static int OpenLinuxSerial(int port_num)
     // Flush any stale data
     tcflush(fd, TCIOFLUSH);
 
-    RtPrintf("Serial: Opened %s (38400 8N1 RS-485) fd=%d\n", path, fd);
+    RtPrintf("Serial: Opened %s (%s 8N1 RS-485) fd=%d\n", path, BaudIndexToStr(baudIdx), fd);
     return fd;
 }
 
@@ -273,8 +302,8 @@ WORD Serial::RtOpenComPort(WORD baudRate, BYTE wordSize, BYTE stopBits, BYTE par
     // Set FPGA registers for RS-485 mode (idempotent, safe to call multiple times)
     SetFPGA_RS485();
 
-    // Open real Linux serial port
-    int fd = OpenLinuxSerial(thisUcb->port);
+    // Open real Linux serial port at requested baud rate
+    int fd = OpenLinuxSerial(thisUcb->port, thisUcb->baudRate);
     if (fd >= 0)
     {
         g_comFd[thisUcb->port] = fd;

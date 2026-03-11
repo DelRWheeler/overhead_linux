@@ -789,8 +789,9 @@ void overhead::initialize()
     }
 
 #ifndef _WEIGHT_SIMULATION_MODE_       //GLC
-    // Set LoadCellType BEFORE InitLoadCell so the HBM path initializes
-    pShm->scl_set.LoadCellType = LOADCELL_TYPE_HBM;
+    // LoadCellType is set by InitDefaults (default HBM) then overwritten
+    // by saved settings from host.  Do NOT hardcode here.
+    RtPrintf("  LoadCellType = %d (0=1510, 1=HBM, 2=ISPD)\n", pShm->scl_set.LoadCellType);
     RtPrintf("  Calling InitLoadCell()...\n");
 		InitLoadCell();
     RtPrintf("  InitLoadCell complete\n");
@@ -9803,12 +9804,24 @@ void overhead::AddDropRecord(int shackle)
 
 void overhead::GenError(int sev, char* txt)
 {
-    if ((sev = informational) != 0)
+    if (sev == informational)
         RtPrintf("GenStatus:  %s",txt);  // change output from Error to Status for info-msgs.  Jim W.  3/20/2006
 	else
         RtPrintf("GenError: %s",txt);
 
-    send_error.sev      = sev;
+    // Map controller severity enum to API severity values:
+    // Controller: critical=1, warning=2, informational=3, logonly=4
+    // API:        Info=0, Warning=1, Error=2, Critical=3
+    int api_sev = 0; // default to Info
+    switch (sev)
+    {
+        case critical:      api_sev = 3; break; // Critical
+        case warning:        api_sev = 1; break; // Warning
+        case informational:  api_sev = 0; break; // Info
+        default:             api_sev = 0; break; // Info
+    }
+
+    send_error.sev      = api_sev;
     send_error.err_addr = txt;
     send_error.send     = true;
 
