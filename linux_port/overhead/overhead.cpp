@@ -3692,115 +3692,6 @@ void __stdcall overhead::App_Timer_Main(PVOID addr)
     {
         iop->readInputs();  // three primary input ports
 
-        // TEMP DEBUG: Track OR'd I/O bits over each 5-second window
-        {
-            static int dbg_io_count = 0;
-            static unsigned char or_sync_in[4] = {0,0,0,0};
-            static unsigned char or_sync_zero[4] = {0,0,0,0};
-            static unsigned char or_switch_in[4] = {0,0,0,0};
-            // Count rising edges per sync during window
-            static unsigned char prev_sync_in[4] = {0,0,0,0};
-            static int rising_edge_count[8] = {0,0,0,0,0,0,0,0};
-            static int zero_rising_count[8] = {0,0,0,0,0,0,0,0};
-            static unsigned char prev_sync_zero[4] = {0,0,0,0};
-            // Measure actual timer rate
-            static struct timespec dbg_last_time = {0,0};
-            static int dbg_tick_total = 0;
-            dbg_tick_total++;
-
-            // Accumulate OR of all I/O reads during this window
-            for (int bi = 0; bi < 4; bi++) {
-                or_sync_in[bi]   |= (unsigned char)app->sync_in[bi];
-                or_sync_zero[bi] |= (unsigned char)app->sync_zero[bi];
-                or_switch_in[bi] |= (unsigned char)app->switch_in[bi];
-            }
-            // Count rising edges (LOW→HIGH transitions)
-            for (int si = 0; si < 8; si++) {
-                int bi = si / 8;
-                int bit = si % 8;
-                unsigned char cur_s = (unsigned char)app->sync_in[bi];
-                unsigned char prv_s = prev_sync_in[bi];
-                if ((cur_s & (1<<bit)) && !(prv_s & (1<<bit)))
-                    rising_edge_count[si]++;
-                unsigned char cur_z = (unsigned char)app->sync_zero[bi];
-                unsigned char prv_z = prev_sync_zero[bi];
-                if ((cur_z & (1<<bit)) && !(prv_z & (1<<bit)))
-                    zero_rising_count[si]++;
-            }
-            for (int bi = 0; bi < 4; bi++) {
-                prev_sync_in[bi] = (unsigned char)app->sync_in[bi];
-                prev_sync_zero[bi] = (unsigned char)app->sync_zero[bi];
-            }
-
-            if (++dbg_io_count >= 1000) {  // every 5 seconds
-                dbg_io_count = 0;
-                struct timespec now;
-                clock_gettime(CLOCK_MONOTONIC, &now);
-                double elapsed_ms = 0;
-                if (dbg_last_time.tv_sec != 0) {
-                    elapsed_ms = (now.tv_sec - dbg_last_time.tv_sec) * 1000.0 +
-                                 (now.tv_nsec - dbg_last_time.tv_nsec) / 1e6;
-                }
-                dbg_last_time = now;
-
-                FILE* df = fopen("/tmp/io_debug.txt", "w");
-                if (df) {
-                    fprintf(df, "=== Timer: %d ticks in %.0fms (%.2f ms/tick) ===\n",
-                            dbg_tick_total, elapsed_ms,
-                            dbg_tick_total > 0 && elapsed_ms > 0 ? elapsed_ms / dbg_tick_total : 0);
-                    fprintf(df, "=== OR'd over 5s window (bits ever active) ===\n");
-                    fprintf(df, "sync_in[0]=0x%02X sync_in[1]=0x%02X\n",
-                            or_sync_in[0], or_sync_in[1]);
-                    fprintf(df, "sync_zero[0]=0x%02X sync_zero[1]=0x%02X\n",
-                            or_sync_zero[0], or_sync_zero[1]);
-                    fprintf(df, "switch_in[0]=0x%02X switch_in[1]=0x%02X\n",
-                            or_switch_in[0], or_switch_in[1]);
-                    fprintf(df, "=== Rising edges in window ===\n");
-                    for (int si = 0; si < 8; si++) {
-                        if (rising_edge_count[si] > 0 || zero_rising_count[si] > 0)
-                            fprintf(df, "Sync[%d] counter_edges=%d zero_edges=%d\n",
-                                    si, rising_edge_count[si], zero_rising_count[si]);
-                    }
-                    fprintf(df, "=== Instant snapshot ===\n");
-                    fprintf(df, "sync_in_now[0]=0x%02X sync_zero_now[0]=0x%02X switch_now[0]=0x%02X\n",
-                            (unsigned char)app->sync_in[0], (unsigned char)app->sync_zero[0],
-                            (unsigned char)app->switch_in[0]);
-                    fprintf(df, "sync_armed: ");
-                    for (int si = 0; si < 8; si++) fprintf(df, "%d ", app->sync_armed[si]);
-                    fprintf(df, "\nsync_zero_triggered: ");
-                    for (int si = 0; si < 8; si++) fprintf(df, "%d ", app->dbg_sync_zero_triggered[si]);
-                    fprintf(df, "\n");
-                    fprintf(df, "grade_zeroed[0]=%d grade_zeroed[1]=%d\n",
-                            app->grade_zeroed[0], app->grade_zeroed[1]);
-                    fprintf(df, "WeighZero[0]=%d WeighZero[1]=%d\n",
-                            app->pShm->WeighZero[0], app->pShm->WeighZero[1]);
-                    fprintf(df, "OpMode=%d config_Ok=%d Grading=%d\n",
-                            app->pShm->OpMode, app->config_Ok, app->pShm->sys_set.Grading);
-                    fprintf(df, "ReqZeroBeforeSync=%d NumSyncs_cfg=%d SyncOn=%d\n",
-                            app->pShm->sys_set.MiscFeatures.RequireZeroBeforeSync,
-                            app->pShm->scl_set.NumScales,
-                            app->pShm->sys_set.SyncOn);
-                    for (int si = 0; si < 8; si++) {
-                        fprintf(df, "Sync[%d] zeroed=%d shackleno=%d\n",
-                                si, app->pShm->SyncStatus[si].zeroed,
-                                app->pShm->SyncStatus[si].shackleno);
-                    }
-                    fclose(df);
-                }
-                // Reset accumulators
-                dbg_tick_total = 0;
-                for (int bi = 0; bi < 4; bi++) {
-                    or_sync_in[bi] = 0;
-                    or_sync_zero[bi] = 0;
-                    or_switch_in[bi] = 0;
-                }
-                for (int si = 0; si < 8; si++) {
-                    rising_edge_count[si] = 0;
-                    zero_rising_count[si] = 0;
-                }
-            }
-        }
-
         #ifdef _VSBC6_IO_
            #ifdef VSBC6_LOWIN_HIOUT
 				
@@ -3997,16 +3888,6 @@ void __stdcall overhead::App_Timer_Main(PVOID addr)
 	if (!app->weight_simulation_mode)
 		app->CaptureLcData();
 
-	// TEMP DEBUG: check why AverageWeight isn't being called
-	{
-		static int _dbg_trig_cnt = 0;
-		if ((_dbg_trig_cnt++ % 1000) == 0) {
-			RtPrintf("TRIG sc0=%d sc1=%d shk2shk=%d OpMode=%d WeighZero=%d weigh_state=%d\n",
-				app->w_avg[0].avg_trigger_cntr, app->w_avg[1].avg_trigger_cntr,
-				app->shk2shk_ticks, app->pShm->OpMode, app->pShm->WeighZero[0], app->weigh_state[0]);
-		}
-	}
-
 	for (i = 0; i < MAXSCALES; i++)
     {
         // If decrement wt avg trigger counters
@@ -4065,18 +3946,6 @@ void overhead::AverageWeight(int scale)
 
 //----- The object of all this is to mark the highest points at leading and falling
 //      edges of product. These marks are used to calculate an average weight.
-
-    // TEMP DEBUG: trace AverageWeight entry
-    {
-        static int _dbg_aw_cnt = 0;
-        if ((_dbg_aw_cnt++ % 500) == 0) {
-            int ss = (shk2shk_ticks - (int)((shk2shk_ticks * app->pShm->scl_set.LC_Sample_Adj[scale].start) / 100));
-            int se = (ss - (int)((ss * app->pShm->scl_set.LC_Sample_Adj[scale].end) / 100));
-            RtPrintf("AW[%d] step=%d trig=%d ss=%d se=%d idx=%d LCType=%d\n",
-                scale, w_avg[scale].step, w_avg[scale].avg_trigger_cntr, ss, se, w_avg[scale].curr_index,
-                app->pShm->scl_set.LoadCellType);
-        }
-    }
 
     switch(w_avg[scale].step)
     {
@@ -5678,22 +5547,6 @@ void overhead::GradeSyncs()
 			gradesync_zero_triggered[GradeSyncIndex] = false; //GLC added 3/9/05
 			//RtPrintf("Grade sync\n");
 
-			// TEMP DEBUG: Log grade sync fires (always log if zero active, first 20 + every 200th otherwise)
-			{
-				static int grade_fire_count = 0;
-				grade_fire_count++;
-				int zero_now = BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]) ? 1 : 0;
-				if (zero_now || grade_fire_count <= 20 || grade_fire_count % 200 == 0) {
-					FILE* gf = fopen("/tmp/grade_debug.txt", "a");
-					if (gf) {
-						fprintf(gf, "#%d sw=0x%02X zero=%d shk=%d\n",
-							grade_fire_count, (unsigned char)switch_in[0],
-							zero_now, pShm->grade_shackle[GradeSyncIndex]);
-						fclose(gf);
-					}
-				}
-			}
-
 			if ( BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]) )
 			{
 
@@ -6081,19 +5934,6 @@ void overhead::ProcessWeight()
             pShm->sys_stat.DispShackle.shackle[i] = pShm->WeighShackle[i];
             pShm->sys_stat.DispShackle.weight [i] = WEIGH_SHACKLE(i, pShm).weight[i];
             pShm->sys_stat.DispShackle.drop   [i] = WEIGH_SHACKLE(i, pShm).drop[i];
-
-            // TEMP DEBUG: log what goes into DispShackle
-            {
-                static int _dbg_disp_cnt = 0;
-                if ((_dbg_disp_cnt++ % 20) == 0) {
-                    RtPrintf("DISP[%d] shk=%d wt=%lld drop=%d tare=%lld abias=%lld\n",
-                        i, pShm->WeighShackle[i],
-                        (long long)WEIGH_SHACKLE(i, pShm).weight[i],
-                        WEIGH_SHACKLE(i, pShm).drop[i],
-                        (long long)TARE_SHACKLE(i, pShm),
-                        (long long)pShm->AutoBias[i]);
-                }
-            }
 
 //----- Update host. If one scale send, if two scales send after 2nd pass
 
@@ -8804,28 +8644,6 @@ void overhead::GradeProcess(int GradeSyncIndex)
 	}
 
     //RtPrintf("Grade process\n");
-    // TEMP DEBUG: Log GradeProcess entry and GradeArea values
-    {
-        static int gp_entry_count = 0;
-        gp_entry_count++;
-        if (gp_entry_count <= 20 || gp_entry_count % 200 == 0) {
-            FILE* gpf = fopen("/tmp/grade_process.txt", "a");
-            if (gpf) {
-                fprintf(gpf, "GP#%d syncIdx=%d sw=0x%02X MB_EN0=%d RG=%d shk=%d "
-                    "GA[1].sync=%d GA[1].off=%d GA[1].grade=%c Shackles=%d Grading=%d\n",
-                    gp_entry_count, GradeSyncIndex, (unsigned char)switch_in[0],
-                    MB_ENABLED(0) ? 1 : 0,
-                    pShm->sys_set.ResetGrading.ResetGrade ? 1 : 0,
-                    pShm->grade_shackle[GradeSyncIndex],
-                    pShm->sys_set.GradeArea[1].GradeSyncUsed,
-                    pShm->sys_set.GradeArea[1].offset,
-                    pShm->sys_set.GradeArea[1].grade,
-                    pShm->sys_set.Shackles,
-                    pShm->sys_set.Grading ? 1 : 0);
-                fclose(gpf);
-            }
-        }
-    }
 
     for (i = 1; i < MAXGRADES; i++)
     {
@@ -8844,26 +8662,6 @@ void overhead::GradeProcess(int GradeSyncIndex)
 			//
 			//  This solution is probably not the best solution in terms of speed but, in terms
 			//    of not wanting to cause side effects, it seems to work.
-            // TEMP DEBUG: Log grade condition details to /tmp/grade_process.txt
-            {
-                static int gp_log_count = 0;
-                gp_log_count++;
-                if (gp_log_count <= 50 || gp_log_count % 500 == 0) {
-                    FILE* gpf = fopen("/tmp/grade_process.txt", "a");
-                    if (gpf) {
-                        fprintf(gpf, "#%d i=%d shk=%d bit=%d GI=%d d0=%d d1=%d RG=%d sw=0x%02X\n",
-                            gp_log_count, i, shackle,
-                            BITSET(switch_in[0], grade_bit[i]) ? 1 : 0,
-                            pShm->ShackleStatus[shackle].GradeIndex[0],
-                            pShm->ShackleStatus[shackle].dropped[0],
-                            pShm->ShackleStatus[shackle].dropped[1],
-                            pShm->sys_set.ResetGrading.ResetGrade ? 1 : 0,
-                            (unsigned char)switch_in[0]);
-                        fclose(gpf);
-                    }
-                }
-            }
-
             if ( (BITSET(switch_in[0], grade_bit[i])) &&
                  (pShm->ShackleStatus[shackle].GradeIndex[0] == 0) &&  // added 3/16/2006 LATER-J
 				  (

@@ -97,7 +97,7 @@
 //#define _SIMULATION_MODE_ //GLC  -- enables built-in sync/grade simulator (bypasses I/O)
 //#define _WEIGHT_SIMULATION_MODE_ //GLC  -- enables simulated weights (skips real load cell) -- CONFLICTS with _HBM_SIM_
 //#define _HBM_SIM_      // OBSOLETE - replaced by _LC_SIM_ (runtime selection of HBM or ISPD sim)
-#define _LC_SIM_         // Load cell simulator — routes serial I/O to HBM or ISPD sim based on LoadCellType
+//#define _LC_SIM_         // Load cell simulator — routes serial I/O to HBM or ISPD sim based on LoadCellType
 //#define _ZERO_SIM_WEIGHT_
 //#define _NO_INTERFACE_
 //#define _SIM_LAPTOP_	// Simulation build for laptop

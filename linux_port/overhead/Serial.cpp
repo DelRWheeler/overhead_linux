@@ -130,13 +130,13 @@ static void SetFPGA_RS485(void)
     val = 0x03;
     write(fd, &val, 1);
 
-    // UARTMODE1: 0x33 = auto TX direction + UART enable for both
+    // UARTMODE1: 0x03 = UART enable for both, NO auto TX direction (4-wire full duplex)
     lseek(fd, FPGA_UARTMODE1, SEEK_SET);
-    val = 0x33;
+    val = 0x03;
     write(fd, &val, 1);
 
     close(fd);
-    RtPrintf("Serial: FPGA RS-485 registers set (XCVRMODE=0x03, UARTMODE1=0x33)\n");
+    RtPrintf("Serial: FPGA RS-422/485 registers set (XCVRMODE=0x03, UARTMODE1=0x03, 4-wire full duplex)\n");
 }
 
 //--------------------------------------------------------

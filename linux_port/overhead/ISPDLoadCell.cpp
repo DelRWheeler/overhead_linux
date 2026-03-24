@@ -715,8 +715,7 @@ int ISPDLoadCell::SendCommand(char* cmd, DWORD response_time)
 		if (this->blnResponseReceived == true)
 		{
 			rc = NO_ERRORS;
-			DebugTrace(_HBMLDCELL_, "ISPD Port %d SendCommand::received->%s\n",
-				this->serialObj->ucbObj.port, (char*)&this->rxmsg[0]);
+			RtPrintf("ISPD cmd '%s' -> response '%s'\n", cmd, (char*)&this->rxmsg[0]);
 		}
     }
 
