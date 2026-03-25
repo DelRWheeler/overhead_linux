@@ -1050,6 +1050,26 @@ int HBMLoadCell::init_adc(int mode, int num_reads)
 
     this->blnOutputStopped = false;
 
+	// Stop any active continuous output from a previous run that was killed
+	// without cleanly shutting down. The load cell may still be streaming.
+	RtPrintf("HBM Load Cell: Stopping any active streaming...\n");
+	for (int flush = 0; flush < 5; flush++)
+	{
+		// Drain any pending input
+		this->SerialRead(this->serialObj);
+		// Send stop command
+		this->SerialWrite((char*)"STP;");
+		this->blnCmdSent = false;
+		Sleep(200);
+	}
+	// Final drain
+	this->SerialRead(this->serialObj);
+	this->blnCmdSent = false;
+	this->blnResponseReceived = false;
+	memset(this->rxmsg, 0, sizeof(this->rxmsg));
+	Sleep(500);
+	RtPrintf("HBM Load Cell: Flush complete.\n");
+
 	// First verify load cell is responding with IDN? command
 	// Retry up to 3 times before giving up
 	{

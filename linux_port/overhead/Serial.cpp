@@ -110,10 +110,23 @@ static const char* g_comDevPath[4] = {
 #define FPGA_UARTMODE1  0xCB6   // UART mode 1
 
 //--------------------------------------------------------
-// Set SandCat FPGA registers for RS-485 transceiver mode
+// Set SandCat FPGA registers for RS-422/485 transceiver mode
 // via /dev/port direct I/O access.
+//
+// IMPORTANT: BIOS must be set to RS-422 mode in CMOS setup.
+// The BIOS switches the physical transceiver; these registers
+// configure the UART direction control.
+//
+// UARTMODE1 = 0x33:
+//   Bit 0 (UART1_EN=1): COM1 TX/RTS outputs enabled
+//   Bit 1 (UART2_EN=1): COM2 TX/RTS outputs enabled
+//   Bit 4 (UART1_485ADC=1): COM1 auto TX direction control
+//   Bit 5 (UART2_485ADC=1): COM2 auto TX direction control
+//
+// Without auto direction control, the TX output is controlled
+// by RTS and defaults to tri-stated (disabled).
 //--------------------------------------------------------
-static void SetFPGA_RS485(void)
+static void SetFPGA_RS422(void)
 {
     int fd = open("/dev/port", O_RDWR | O_SYNC);
     if (fd < 0)
@@ -125,18 +138,22 @@ static void SetFPGA_RS485(void)
 
     unsigned char val;
 
-    // XCVRMODE: 0x03 = both COM1+COM2 in RS-485 mode
+    // XCVRMODE: 0x03 = both COM1+COM2 in RS-422/485 mode
     lseek(fd, FPGA_XCVRMODE, SEEK_SET);
     val = 0x03;
     write(fd, &val, 1);
 
-    // UARTMODE1: 0x03 = UART enable for both, NO auto TX direction (4-wire full duplex)
+    // UARTMODE1: 0x33 = UART enable for both + auto TX direction control
     lseek(fd, FPGA_UARTMODE1, SEEK_SET);
-    val = 0x03;
+    val = 0x33;
     write(fd, &val, 1);
 
     close(fd);
-    RtPrintf("Serial: FPGA RS-422/485 registers set (XCVRMODE=0x03, UARTMODE1=0x03, 4-wire full duplex)\n");
+    RtPrintf("Serial: FPGA RS-422 registers set (XCVRMODE=0x03, UARTMODE1=0x33, auto direction control)\n");
+
+    // Allow transceiver to stabilize after mode switch
+    usleep(500000);  // 500ms
+    RtPrintf("Serial: Transceiver stabilization delay complete\n");
 }
 
 //--------------------------------------------------------
@@ -299,8 +316,8 @@ WORD Serial::RtOpenComPort(WORD baudRate, BYTE wordSize, BYTE stopBits, BYTE par
     else
         HBMSim_Init(thisUcb->port);
 #else
-    // Set FPGA registers for RS-485 mode (idempotent, safe to call multiple times)
-    SetFPGA_RS485();
+    // Set FPGA registers for RS-422 mode (BIOS must also be set to RS-422 in CMOS)
+    SetFPGA_RS422();
 
     // Open real Linux serial port at requested baud rate
     int fd = OpenLinuxSerial(thisUcb->port, thisUcb->baudRate);

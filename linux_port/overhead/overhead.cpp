@@ -1941,14 +1941,14 @@ void overhead::SetDefaults()
 		DefaultDigLCSet[i].ASF			= 5;
 		DefaultDigLCSet[i].FMD			= 1;
 		DefaultDigLCSet[i].ICR			= 4;
-		DefaultDigLCSet[i].CWT			= 500000;
+		DefaultDigLCSet[i].CWT			= 1000000;
 		DefaultDigLCSet[i].LDW			= 0;
-		DefaultDigLCSet[i].LWT			= 500000;
+		DefaultDigLCSet[i].LWT			= 1000000;
 		DefaultDigLCSet[i].NOV			= 0;
 		DefaultDigLCSet[i].RSN			= 1;
 		DefaultDigLCSet[i].MTD			= 0;
 		DefaultDigLCSet[i].LIC0			= 0;
-		DefaultDigLCSet[i].LIC1			= 500000;
+		DefaultDigLCSet[i].LIC1			= 1000000;
 		DefaultDigLCSet[i].LIC2			= 0;
 		DefaultDigLCSet[i].LIC3			= 0;
 		DefaultDigLCSet[i].ZTR			= 0;
