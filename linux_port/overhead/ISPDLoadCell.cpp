@@ -247,7 +247,11 @@ static void ISPDLoadCellThreadBody(ISPDLoadCell::ISPDinit* pISPDInit, int loadCe
 		}
     }
 
-	pISPDcObj->init_adc(AVG, 2);
+	if (pISPDcObj->init_adc(AVG, 2) != TRUE)
+	{
+		RtPrintf("ISPD Load Cell %d thread exiting - init failed.\n", loadCellIdx + 1);
+		for(;;) { Sleep(5000); }
+	}
 
 	if (!RtSetEvent(hLoadCellInitialized[loadCellIdx]))
     {
@@ -331,6 +335,34 @@ int ISPDLoadCell::init_adc(int mode, int num_reads)
 		this->FlushComInBuffer();
 		Sleep(10);
 		this->serialObj->RtGetComBufferCount((WORD*)&i);
+	}
+
+	// First verify load cell is responding with ID command
+	// Retry up to 3 times before giving up
+	{
+		bool lc_responding = false;
+		for (int retry = 0; retry < 3; retry++)
+		{
+			RtPrintf("ISPD Load Cell: Sending ID (attempt %d of 3)...\n", retry + 1);
+			int rc = this->SendCommand("ID\r", 3000);
+			if (rc == NO_ERRORS && this->rxmsg[0] != 0)
+			{
+				RtPrintf("ISPD Load Cell: Responded - %s\n", (char*)&this->rxmsg[0]);
+				lc_responding = true;
+				break;
+			}
+			RtPrintf("ISPD Load Cell: No response.\n");
+			Sleep(1000);
+		}
+		if (!lc_responding)
+		{
+			RtPrintf("\n");
+			RtPrintf("*** ISPD Load Cell is NOT responding. ***\n");
+			RtPrintf("*** Check power and serial connections. ***\n");
+			RtPrintf("\n");
+			app->GenError(warning, (char*)"ISPD Load Cell not responding - check power and connections.\n");
+			return(FALSE);
+		}
 	}
 
 	// Initialize ADC settings - same pattern as HBM

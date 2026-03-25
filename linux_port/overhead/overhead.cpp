@@ -9625,15 +9625,10 @@ void overhead::GenError(int sev, char* txt)
 
     if (sev == critical)
     {
-        // give time for message to be sent
-        Sleep(5000);
+        // Log the critical error but do NOT shut down — keep running
         RtPrintf("\n***********************************************\n");
-        RtPrintf("*   Critical error overhead.rtss shutdown     *\n");
+        RtPrintf("*   Critical error (non-fatal): %s", txt);
         RtPrintf("***********************************************\n");
-        if (isPShmValid()) {
-            logAppFlagsChange("GenError: critical severity shutdown");
-            pShm->AppFlags = 0;
-        }
     }
 }
 

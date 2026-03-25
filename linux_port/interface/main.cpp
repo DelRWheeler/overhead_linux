@@ -463,8 +463,6 @@ void Heartbeats()
     if (pShm->AppHeartbeat == prev_app_heartbeat)
     {
         app_fail_count++;
-        RtPrintf("Heartbeat check: AppHB=%d prev=%d fail=%d pShm=%p\n",
-                 pShm->AppHeartbeat, prev_app_heartbeat, app_fail_count, (void*)pShm);
 
         if (app_fail_count > 30) {
             logInterfaceAppFlags("Heartbeats: app_fail_count > 30, calling ErrorRoutine");

@@ -280,9 +280,15 @@ int RTFCNDCL HBMLoadCell::HBMLoadCellThread1(PVOID pHBMInit)
 		}
     }
     
-	pHBMcObj->init_adc(AVG, 2);
+	if (pHBMcObj->init_adc(AVG, 2) != TRUE)
+	{
+		// Load cell not responding — do not enter main loop
+		// Event is never signaled, overhead will report init failure
+		RtPrintf("HBM Load Cell thread exiting - init failed.\n");
+		for(;;) { Sleep(5000); } // Stay alive but idle
+	}
 
-	if (!RtSetEvent(hLoadCellInitialized[LOADCELL_1])) //hInit)) // GLC added 2/19/04 
+	if (!RtSetEvent(hLoadCellInitialized[LOADCELL_1])) //hInit)) // GLC added 2/19/04
     {
         RtPrintf("Error %u file %s, line %d \n",GetLastError(), _FILE_, __LINE__);
     }
@@ -291,7 +297,7 @@ int RTFCNDCL HBMLoadCell::HBMLoadCellThread1(PVOID pHBMInit)
 ///////////////////////////////////////////////////////////////////////////////
 
 	for(;;)
-    {   
+    {
 		if (LoopCnt%2500 == 0)
 		{
 			pHBMcObj->HBMCheckSettings(); //GLC
@@ -375,9 +381,13 @@ int RTFCNDCL HBMLoadCell::HBMLoadCellThread2(PVOID pHBMInit)
 		}
     }
 
- 	pHBMcObj->init_adc(AVG, 2);
+ 	if (pHBMcObj->init_adc(AVG, 2) != TRUE)
+	{
+		RtPrintf("HBM Load Cell 2 thread exiting - init failed.\n");
+		for(;;) { Sleep(5000); }
+	}
 
-	if (!RtSetEvent(hLoadCellInitialized[LOADCELL_2])) // GLC added 2/19/04 
+	if (!RtSetEvent(hLoadCellInitialized[LOADCELL_2])) // GLC added 2/19/04
     {
         RtPrintf("Error %u file %s, line %d \n",GetLastError(), _FILE_, __LINE__);
     }
@@ -464,9 +474,13 @@ int RTFCNDCL HBMLoadCell::HBMLoadCellThread3(PVOID pHBMInit)
 		}
     }
 	
-	pHBMcObj->init_adc(AVG, 2);
+	if (pHBMcObj->init_adc(AVG, 2) != TRUE)
+	{
+		RtPrintf("HBM Load Cell 3 thread exiting - init failed.\n");
+		for(;;) { Sleep(5000); }
+	}
 
-    if (!RtSetEvent(hLoadCellInitialized[LOADCELL_3])) // GLC added 2/19/04 
+    if (!RtSetEvent(hLoadCellInitialized[LOADCELL_3])) // GLC added 2/19/04
     {
         RtPrintf("Error %u file %s, line %d \n",GetLastError(), _FILE_, __LINE__);
     }
@@ -553,9 +567,13 @@ int RTFCNDCL HBMLoadCell::HBMLoadCellThread4(PVOID pHBMInit)
 		}
     }
 
-	pHBMcObj->init_adc(AVG, 2);
+	if (pHBMcObj->init_adc(AVG, 2) != TRUE)
+	{
+		RtPrintf("HBM Load Cell 4 thread exiting - init failed.\n");
+		for(;;) { Sleep(5000); }
+	}
 
-    if (!RtSetEvent(hLoadCellInitialized[3])) // GLC added 2/19/04 
+    if (!RtSetEvent(hLoadCellInitialized[3])) // GLC added 2/19/04
     {
         RtPrintf("Error %u file %s, line %d \n",GetLastError(), _FILE_, __LINE__);
     }
@@ -1029,10 +1047,39 @@ int HBMLoadCell::init_adc(int mode, int num_reads)
 	WORD buf_bytes = 0;
 	//char Cmd[8];
 	bool Config = true;
-	
+
     this->blnOutputStopped = false;
+
+	// First verify load cell is responding with IDN? command
+	// Retry up to 3 times before giving up
+	{
+		bool lc_responding = false;
+		for (int retry = 0; retry < 3; retry++)
+		{
+			RtPrintf("HBM Load Cell: Sending IDN? (attempt %d of 3)...\n", retry + 1);
+			int rc = this->SendCommand("IDN?;", 3000);
+			if (rc == NO_ERRORS && this->rxmsg[0] != 0)
+			{
+				RtPrintf("HBM Load Cell: Responded - %s\n", (char*)&this->rxmsg[0]);
+				lc_responding = true;
+				break;
+			}
+			RtPrintf("HBM Load Cell: No response.\n");
+			Sleep(1000);
+		}
+		if (!lc_responding)
+		{
+			RtPrintf("\n");
+			RtPrintf("*** HBM Load Cell is NOT responding. ***\n");
+			RtPrintf("*** Check power and serial connections. ***\n");
+			RtPrintf("\n");
+			app->GenError(warning, (char*)"HBM Load Cell not responding - check power and connections.\n");
+			return(FALSE);
+		}
+	}
+
 //DRW This is no longer used
-//	this->SendCommand("RES;", 0); 
+//	this->SendCommand("RES;", 0);
 
 	// Switch in the 500 ohm terminating resistor - RCB - 485
 	if (this->serialObj->ucbObj.mode == RS422) //Need to add 232/422 mode option
@@ -1041,7 +1088,7 @@ int HBMLoadCell::init_adc(int mode, int num_reads)
 	}
 	else
 	{
-		this->SendCommand("STR 0;", 3000); 
+		this->SendCommand("STR 0;", 3000);
 	}
 
 	this->serialObj->RtGetComBufferCount(&buf_bytes);
