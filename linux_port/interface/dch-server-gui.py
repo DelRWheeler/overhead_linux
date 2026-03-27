@@ -728,6 +728,67 @@ class DCHServerWindow(Gtk.Window):
         # Reset terminal and clear scrollback
         self.terminal.reset(True, True)
 
+    def warmup_loadcell(self):
+        """Warm up the load cell serial port with Python before the C controller opens it.
+        On cold boot, the SandCat's serial port needs to be opened/configured by Python first
+        before the C code's termios setup will work. Root cause unknown but this fixes it."""
+        import serial as pyserial
+        import struct
+
+        port = '/dev/ttyS0'
+        msg = "Initializing load cell serial port...\n"
+        self.terminal.feed(msg.encode())
+
+        # Read load cell type from settings file to determine protocol
+        lc_type = 1  # default HBM
+        settings_path = os.path.join(os.path.dirname(os.path.abspath(INTERFACE_BIN)), 'data', 'adc_settings.bin')
+        try:
+            with open(settings_path, 'rb') as f:
+                data = f.read()
+                if len(data) >= 76:
+                    lc_type = struct.unpack_from('<i', data, 72)[0]
+        except Exception:
+            pass
+
+        try:
+            if lc_type == 2:
+                # ISPD-20KG: 115200 baud, CR terminator, needs OP 1
+                self.terminal.feed(f"  Load cell type: ISPD-20KG (115200 baud)\n".encode())
+                ser = pyserial.Serial(port, 115200, timeout=1)
+                ser.reset_input_buffer()
+
+                ser.write(b'OP 1\r')
+                import time; time.sleep(0.3)
+                resp = ser.read(ser.in_waiting or 100)
+                self.terminal.feed(f"  OP 1 -> {resp}\n".encode())
+
+                ser.write(b'ID\r')
+                time.sleep(0.3)
+                resp = ser.read(ser.in_waiting or 100)
+                self.terminal.feed(f"  ID  -> {resp}\n".encode())
+
+                ser.close()
+            else:
+                # HBM FIT7: 38400 baud, LF+CR terminator
+                self.terminal.feed(f"  Load cell type: HBM (38400 baud)\n".encode())
+                ser = pyserial.Serial(port, 38400, timeout=1)
+                ser.reset_input_buffer()
+
+                ser.write(b'STP;\x0A\x0D')
+                import time; time.sleep(0.3)
+                ser.read(ser.in_waiting or 100)
+
+                ser.write(b'IDN?\x0A\x0D')
+                time.sleep(0.3)
+                resp = ser.read(ser.in_waiting or 100)
+                self.terminal.feed(f"  IDN -> {resp}\n".encode())
+
+                ser.close()
+
+            self.terminal.feed("  Load cell warmup complete.\n".encode())
+        except Exception as e:
+            self.terminal.feed(f"  Load cell warmup failed: {e}\n".encode())
+
     def spawn_interface(self):
         env = os.environ.copy()
         env['TERM'] = 'xterm-256color'

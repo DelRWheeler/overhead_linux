@@ -132,27 +132,44 @@ static void SetFPGA_RS422(void)
     if (fd < 0)
     {
         RtPrintf("Serial: Warning: could not open /dev/port for FPGA setup (%d)\n", errno);
-        RtPrintf("Serial: Continuing anyway (may already be set, or not running on SandCat)\n");
+        RtPrintf("Serial: Continuing anyway (may already be set by BIOS)\n");
         return;
     }
 
+    // Read current FPGA register values before writing
+    unsigned char current_xcvr = 0, current_uart = 0;
+    lseek(fd, FPGA_XCVRMODE, SEEK_SET);
+    read(fd, &current_xcvr, 1);
+    lseek(fd, FPGA_UARTMODE1, SEEK_SET);
+    read(fd, &current_uart, 1);
+
+    RtPrintf("Serial: FPGA current state: XCVRMODE=0x%02X, UARTMODE1=0x%02X\n", current_xcvr, current_uart);
+
+    if (current_xcvr == 0x03 && current_uart == 0x33)
+    {
+        // BIOS already configured correctly - do NOT re-write (disrupts transceiver)
+        RtPrintf("Serial: FPGA already configured by BIOS, skipping register writes\n");
+        close(fd);
+        return;
+    }
+
+    // Registers need setting (first boot or BIOS not configured)
+    RtPrintf("Serial: FPGA not configured, writing RS-422 registers...\n");
     unsigned char val;
 
-    // XCVRMODE: 0x03 = both COM1+COM2 in RS-422/485 mode
     lseek(fd, FPGA_XCVRMODE, SEEK_SET);
     val = 0x03;
     write(fd, &val, 1);
 
-    // UARTMODE1: 0x33 = UART enable for both + auto TX direction control
     lseek(fd, FPGA_UARTMODE1, SEEK_SET);
     val = 0x33;
     write(fd, &val, 1);
 
     close(fd);
-    RtPrintf("Serial: FPGA RS-422 registers set (XCVRMODE=0x03, UARTMODE1=0x33, auto direction control)\n");
+    RtPrintf("Serial: FPGA RS-422 registers set (XCVRMODE=0x03, UARTMODE1=0x33)\n");
 
-    // Allow transceiver to stabilize after mode switch
-    usleep(500000);  // 500ms
+    // Long stabilization delay - transceiver state machine needs time after reconfiguration
+    usleep(2000000);  // 2 seconds
     RtPrintf("Serial: Transceiver stabilization delay complete\n");
 }
 
@@ -205,39 +222,54 @@ static int OpenLinuxSerial(int port_num, int baudIdx)
     if (flags >= 0)
         fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
 
-    // Configure termios: raw mode, 8N1
-    struct termios tty;
-    memset(&tty, 0, sizeof(tty));
+    // Configure serial port using kernel termios2 ioctl (TCGETS2/TCSETS2).
+    // This correctly sets baud rate without needing cfsetispeed/cfsetospeed
+    // (which requires GLIBC 2.42, not available on SandCat's GLIBC 2.39).
+    // The standard termios bitmask approach does NOT work on this kernel.
+    struct {
+        unsigned int c_iflag, c_oflag, c_cflag, c_lflag;
+        unsigned char c_line, c_cc[19];
+        unsigned int c_ispeed, c_ospeed;
+    } tio;
 
-    // Input: no break, no CR->NL, no parity check, no strip, no flow ctrl
-    tty.c_iflag = 0;
+    #define TCGETS2_LOCAL _IOR('T', 0x2A, typeof(tio))
+    #define TCSETS2_LOCAL _IOW('T', 0x2B, typeof(tio))
 
-    // Output: raw
-    tty.c_oflag = 0;
-
-    // Control: 8-bit, enable receiver, local mode (no modem signals)
-    tty.c_cflag = CS8 | CREAD | CLOCAL;
-
-    // Local: completely raw
-    tty.c_lflag = 0;
-
-    // VMIN=1: block until at least 1 byte available
-    // VTIME=1: 100ms inter-character timeout
-    tty.c_cc[VMIN]  = 1;
-    tty.c_cc[VTIME] = 1;
-
-    // Set baud rate from baudIdx parameter
-    // Set speed in both c_cflag bitmask and c_ispeed/c_ospeed fields directly
-    // to avoid cfsetispeed/cfsetospeed GLIBC_2.42 symbol dependency
-    speed_t spd = BaudIndexToSpeed(baudIdx);
-    tty.c_cflag &= ~(CBAUD | CBAUDEX);  // clear existing baud bits
-    tty.c_cflag |= spd;                  // set new baud in cflag
-    tty.c_ispeed = spd;                  // set input speed field
-    tty.c_ospeed = spd;                  // set output speed field
-
-    if (tcsetattr(fd, TCSANOW, &tty) != 0)
+    if (ioctl(fd, TCGETS2_LOCAL, &tio) < 0)
     {
-        RtPrintf("Serial: tcsetattr failed for %s: errno=%d\n", path, errno);
+        RtPrintf("Serial: TCGETS2 failed for %s: errno=%d\n", path, errno);
+        close(fd);
+        return -1;
+    }
+
+    // Raw input: no break, no CR/NL translation, no parity, no strip, no flow ctrl
+    tio.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON | IXOFF);
+
+    // Raw output
+    tio.c_oflag &= ~OPOST;
+
+    // 8N1, enable receiver, local mode, no hardware flow control
+    tio.c_cflag &= ~(CSIZE | PARENB | CSTOPB | CRTSCTS);
+    tio.c_cflag |= CS8 | CREAD | CLOCAL;
+
+    // Raw mode (no echo, no canonical, no signals)
+    tio.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+
+    // VMIN=1, VTIME=1 (100ms inter-byte timeout)
+    tio.c_cc[6] = 1;   // VMIN
+    tio.c_cc[5] = 1;   // VTIME
+
+    // Set baud rate using integer speed (works with TCSETS2)
+    static const unsigned int baudRates[] = {2400, 4800, 9600, 19200, 38400, 57600, 115200};
+    unsigned int baudHz = (baudIdx >= 0 && baudIdx <= 6) ? baudRates[baudIdx] : 38400;
+    tio.c_cflag &= ~CBAUD;
+    tio.c_cflag |= 0x1000;  // BOTHER - use c_ispeed/c_ospeed for baud rate
+    tio.c_ispeed = baudHz;
+    tio.c_ospeed = baudHz;
+
+    if (ioctl(fd, TCSETS2_LOCAL, &tio) < 0)
+    {
+        RtPrintf("Serial: TCSETS2 failed for %s: errno=%d\n", path, errno);
         close(fd);
         return -1;
     }
@@ -245,7 +277,55 @@ static int OpenLinuxSerial(int port_num, int baudIdx)
     // Flush any stale data
     tcflush(fd, TCIOFLUSH);
 
-    RtPrintf("Serial: Opened %s (%s 8N1 RS-485) fd=%d\n", path, BaudIndexToStr(baudIdx), fd);
+    // Assert DTR and RTS - required for FPGA RS-422 transceiver to enable TX/RX
+    int modem_bits = TIOCM_DTR | TIOCM_RTS;
+    if (ioctl(fd, TIOCMBIS, &modem_bits) < 0)
+        RtPrintf("Serial: Warning: failed to set DTR/RTS on %s\n", path);
+
+    RtPrintf("Serial: Opened %s (%s 8N1 RS-422 DTR+RTS) fd=%d\n", path, BaudIndexToStr(baudIdx), fd);
+
+    // H&B ISPD-20KG cold boot workaround:
+    // After FPGA RS-422 setup, the port needs a real write/read cycle to initialize
+    // the transceiver properly. Send OP 1 (open device at address 1) which is required
+    // anyway for the ISPD after power cycle. Harmless for HBM (unrecognized command).
+    if (baudIdx == 6) // 115200 = ISPD baud rate
+    {
+        // ISPD-20KG requires OP 1 after power cycle to open device at address 1.
+        // Use non-blocking reads for warmup, then restore normal settings.
+        char rbuf[128];
+        int n;
+        struct termios warmup_tty;
+        tcgetattr(fd, &warmup_tty);
+        warmup_tty.c_cc[VMIN]  = 0;
+        warmup_tty.c_cc[VTIME] = 5;  // 500ms timeout
+        tcsetattr(fd, TCSANOW, &warmup_tty);
+
+        RtPrintf("Serial: ISPD warmup - sending OP 1...\n");
+        tcflush(fd, TCIOFLUSH);
+        write(fd, "OP 1\r", 5);
+        tcdrain(fd);
+        usleep(300000);
+        n = read(fd, rbuf, sizeof(rbuf) - 1);
+        if (n > 0) { rbuf[n] = 0; RtPrintf("Serial: OP 1 -> %s\n", rbuf); }
+        else { RtPrintf("Serial: OP 1 -> no response\n"); }
+
+        tcflush(fd, TCIOFLUSH);
+        write(fd, "ID\r", 3);
+        tcdrain(fd);
+        usleep(300000);
+        n = read(fd, rbuf, sizeof(rbuf) - 1);
+        if (n > 0) { rbuf[n] = 0; RtPrintf("Serial: ID -> %s\n", rbuf); }
+        else { RtPrintf("Serial: ID -> no response\n"); }
+
+        // Restore VMIN/VTIME for normal operation
+        warmup_tty.c_cc[VMIN]  = 1;
+        warmup_tty.c_cc[VTIME] = 1;
+        tcsetattr(fd, TCSANOW, &warmup_tty);
+        tcflush(fd, TCIOFLUSH);
+
+        RtPrintf("Serial: ISPD warmup complete\n");
+    }
+
     return fd;
 }
 
