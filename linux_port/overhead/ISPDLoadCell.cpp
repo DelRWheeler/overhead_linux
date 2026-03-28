@@ -223,14 +223,30 @@ static void ISPDLoadCellThreadBody(ISPDLoadCell::ISPDinit* pISPDInit, int loadCe
 		RtPrintf("Failed to open event -%s- \n", eventName);
 	}
 
-	//----- Skip C serial port open - Python bridge handles all ISPD serial I/O -----
-	RtPrintf("ISPD: Skipping C serial port open (Python bridge will handle serial I/O)\n");
+	//----- Open COM port at 115200 baud (same C serial driver as HBM) -----
+	DebugTrace(_HBMLDCELL_, "ISPD: Opening COM%d at 115200 baud . . .\n", serObj->ucbObj.port + 1);
 
-	if (pISPDcObj->init_adc(AVG, 2) != TRUE)
+	if (RtWaitForSingleObject(hSerialQ, 100) != WAIT_OBJECT_0)
 	{
-		RtPrintf("ISPD Load Cell %d thread exiting - init failed.\n", loadCellIdx + 1);
-		for(;;) { Sleep(5000); }
+		RtPrintf("hSerMtx RtWaitForSingleObject failed in file %s, line %d \n", _FILE_, __LINE__);
 	}
+	else
+	{
+		if ((rc = serObj->RtOpenComPort(ISPD_DEFAULT_BAUD_RATE, COM_WORDSIZE_8,
+                         COM_STOPBITS_1, COM_PARITY_NONE, COM_FLOW_CONTROL_NONE)) != NO_ERRORS)
+        {
+            RtPrintf("Error COM%d Open rc = %d file %s, line %d \n", serObj->ucbObj.port + 1,
+					rc, _FILE_, __LINE__);
+            return;
+        }
+
+		if (!RtReleaseMutex(hSerialQ))
+		{
+			RtPrintf("Release failed in file %s, line %d \n", _FILE_, __LINE__);
+		}
+    }
+
+	pISPDcObj->init_adc(AVG, 2);
 
 	if (!RtSetEvent(hLoadCellInitialized[loadCellIdx]))
     {
@@ -241,45 +257,32 @@ static void ISPDLoadCellThreadBody(ISPDLoadCell::ISPDinit* pISPDInit, int loadCe
 	//                           Main Loop
 	///////////////////////////////////////////////////////////////////////////
 
-	// Use Python bridge for ISPD serial I/O (pyserial is reliable on SandCat RS-422)
-	{
-		char bridgePath[256];
-		snprintf(bridgePath, sizeof(bridgePath),
-			"python3 -u %s/ispd_bridge.py /dev/ttyS%d",
-			"/home/dchservice/dchservices/bin", serObj->ucbObj.port);
+	for(;;)
+    {
+		LoopCnt++;
 
-		RtPrintf("ISPD: Starting Python bridge: %s\n", bridgePath);
-		FILE* bridge = popen(bridgePath, "r");
-		if (!bridge)
+        // Read measurements
+        if (pISPDcObj->ContMeasOut)
 		{
-			RtPrintf("ISPD: Failed to start Python bridge!\n");
-			for(;;) { Sleep(5000); }
-		}
+            pISPDcObj->SerialRead(serObj);
+			Sleep(MEASURE_MODE_SLEEP);
 
-		char line[64];
-		while (fgets(line, sizeof(line), bridge))
-		{
-			LoopCnt++;
-
-			// Parse integer value from bridge stdout
-			__int64 meas = 0;
-			int val = atoi(line);
-			meas = (__int64)val;
-
-			// Push to measurement queue (same interface as before)
-			pISPDcObj->MeasureQ(&meas, 0);
-
-			// Support load cell read sampling (debug feature)
-			if (TakeLoadCellReadsFlag > 0)
+			if (LoopCnt == 500)
 			{
-				pISPDcObj->SampleLCReadMeasureQ(&meas);
+				WORD dbgBytes = 0;
+				pISPDcObj->serialObj->RtGetComBufferCount(&dbgBytes);
+				RtPrintf("ISPD loop@500: buf=%d blnMeas=%d blnCmdSent=%d ContMeasOut=%d lineIdx=%d\n",
+					dbgBytes, pISPDcObj->blnMeas, pISPDcObj->blnCmdSent,
+					pISPDcObj->ContMeasOut, pISPDcObj->lineIdx);
 			}
 		}
-
-		RtPrintf("ISPD: Python bridge exited\n");
-		pclose(bridge);
-		for(;;) { Sleep(5000); }
-	}
+		else
+		{
+			Sleep(MISC_MODE_SLEEP);
+			if (LoopCnt == 5)
+				RtPrintf("ISPD loop: ContMeasOut is FALSE, sleeping 100ms\n");
+		}
+    }
 }
 
 int RTFCNDCL ISPDLoadCell::ISPDLoadCellThread1(PVOID pISPDInit)
@@ -340,11 +343,8 @@ int ISPDLoadCell::init_adc(int mode, int num_reads)
 		this->serialObj->RtGetComBufferCount((WORD*)&i);
 	}
 
-	// Python bridge handles all serial I/O (OP 1, ID, GS polling).
-	// Just initialize internal ADC settings here.
-	RtPrintf("ISPD Load Cell: Using Python bridge for serial I/O\n");
-
-	for(i = 0; i < ISPD_NUM_CH; i++)
+	// Initialize ADC settings - same pattern as HBM
+    for(i = 0; i < ISPD_NUM_CH; i++)
     {
         this->adc_offset   [i] = ADCOFFSET;
         this->num_adc_reads[i] = num_reads;
@@ -356,8 +356,41 @@ int ISPDLoadCell::init_adc(int mode, int num_reads)
         this->set_adc_mode     (i, adc_mode     [i]);
     }
 
-	this->ContMeasOut = true;
-	this->blnMeas = true;
+    if (this->ContMeasOut)
+    {
+        this->StopContinuousOutput();
+    }
+
+	// Open device at address 1 (must be first command)
+	RtPrintf("ISPD init: sending OP 1...\n");
+	this->SendCommand("OP 1\r", 3000);
+	RtPrintf("ISPD init: OP 1 done, responseReceived=%d, blnCmdSent=%d, blnMeas=%d, ContMeasOut=%d\n",
+		this->blnResponseReceived, this->blnCmdSent, this->blnMeas, this->ContMeasOut);
+
+	// Flush any leftover response data before starting stream
+	this->FlushComInBuffer();
+	Sleep(100);
+
+	// Verify serial port fd is valid
+	{
+		WORD testCount = 0;
+		this->serialObj->RtGetComBufferCount(&testCount);
+		RtPrintf("ISPD init: pre-SX buffer count = %d, port = %d\n", testCount, this->serialObj->ucbObj.port);
+	}
+
+	// Start continuous ADC sample output (SX)
+	RtPrintf("ISPD init: sending SX...\n");
+    this->StartContinuousOutput();
+	RtPrintf("ISPD init: SX done, blnCmdSent=%d, blnMeas=%d, ContMeasOut=%d\n",
+		this->blnCmdSent, this->blnMeas, this->ContMeasOut);
+
+	// Wait briefly then check if data is arriving
+	Sleep(100);
+	{
+		WORD testCount = 0;
+		this->serialObj->RtGetComBufferCount(&testCount);
+		RtPrintf("ISPD init: 100ms after SX, buffer has %d bytes\n", testCount);
+	}
 
     if (Config == true)
 	{
@@ -556,6 +589,13 @@ void ISPDLoadCell::SerialRead(Serial* serial)
 						// Write to the measurement queue (same interface as HBM)
 						this->MeasureQ(&tmpMeas, 0);
 
+						// Debug: log first 5 parsed values
+						if (this->cPrintCnt < 5)
+						{
+							RtPrintf("ISPD MeasQ write: value=%lld line='%s'\n", tmpMeas, this->lineBuf);
+							this->cPrintCnt++;
+						}
+
 						// Support load cell read sampling (debug feature)
 						if (TakeLoadCellReadsFlag > 0)
 						{
@@ -712,9 +752,8 @@ int ISPDLoadCell::SendCommand(char* cmd, DWORD response_time)
 		this->blnMeas = true;
 		DebugTrace(_HBMLDCELL_, "ISPD Continuous Output Mode Enabled\n");
 	}
-	else if (strncmp(cmd, "GS", 2) != 0)
+	else
 	{
-		// Don't clear blnMeas for GS polling commands
 		this->blnMeas = false;
 	}
 
@@ -754,14 +793,14 @@ int ISPDLoadCell::StartContinuousOutput()
 	// Reset line accumulation buffer before starting
 	this->lineIdx = 0;
 
-	// ISPD-20KG does NOT support SX command.
-	// Instead, we use polled mode: main loop sends GS repeatedly.
-	// Just set flags to enable the polling loop.
+	// SX = continuous raw ADC sample output
+	// Format: "S+015641\r" per reading
+    this->SerialWrite("SX\r");
   	this->ContMeasOut = true;
 	this->blnMeas = true;
 	this->blnOutputStopped = false;
 
-	RtPrintf("ISPD: Polling mode enabled (GS per iteration)\n");
+	RtPrintf("ISPD: Continuous Output Mode Enabled (SX)\n");
     return NO_ERRORS;
 }
 
