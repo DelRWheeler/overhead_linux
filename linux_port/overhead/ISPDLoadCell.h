@@ -136,6 +136,9 @@ public:
     bool		blnResponseReceived;
 	bool		bFirstCheck;
 
+	// Simple shared value - bypasses MeasureQ for debugging
+	volatile __int64	latestMeas;
+
 	// Measurement queue control
 	MeasQ_Item		MeasQ[ISPD_MEASQ_MAX_ITEMS];
 	MeasQ_Item*		pInMeasQ;

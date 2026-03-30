@@ -157,7 +157,7 @@ int main(int argc, char **argv)
         clock_gettime(CLOCK_MONOTONIC, &ts_now);
         double elapsed = (ts_now.tv_sec - ts_start.tv_sec) +
                          (ts_now.tv_nsec - ts_start.tv_nsec) / 1e9;
-        if (elapsed >= 5.0) break;
+        if (elapsed >= 300.0) break;  /* 5 minutes */
 
         /* Check available bytes */
         int avail = 0;
@@ -175,7 +175,7 @@ int main(int argc, char **argv)
                         line[line_idx] = 0;
                         if (line_idx >= 3 && (line[0] == 'S' || line[0] == 's')) {
                             sample_count++;
-                            if (sample_count <= 3 || sample_count % 500 == 0) {
+                            if (sample_count <= 3 || sample_count % 5000 == 0) {
                                 printf("  sample #%d at %.2fs: %s\n",
                                        sample_count, elapsed, line);
                             }
@@ -194,9 +194,9 @@ int main(int argc, char **argv)
             empty_polls = 0;
         } else {
             empty_polls++;
-            if (empty_polls == 1 && sample_count > 0)
-                printf("  (first empty poll after %d samples at %.2fs)\n",
-                       sample_count, elapsed);
+            if (empty_polls >= 100 && empty_polls % 1000 == 0)
+                printf("  WARNING: %d empty polls (%.0fms gap) at %.2fs after %d samples\n",
+                       empty_polls, empty_polls * 1.0, elapsed, sample_count);
             usleep(1000); /* 1ms */
         }
     }

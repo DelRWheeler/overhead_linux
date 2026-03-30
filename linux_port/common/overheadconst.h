@@ -227,9 +227,9 @@
 #define MAXPENDANT          2000    // max number of pendants
 #define MAXDROPRECS         200     // buffer of birds dropped
 #define DROPRECHISP         100     // high water mark, if exceeded save to files
-#define MAXSAVERECS         500     // file i/o buffer for saving drop records
+#define MAXSAVERECS         400     // max records per drop record file
 #define MINDSAVREC          10      // buffer of birds dropped
-#define MAXDSAVFILES        100
+#define MAXDSAVFILES        500
 #define MAXBCHLABELS        64
 #define LEN_UNKNOWN         99      // length of file unknown
 #define MAXAVGCNT           10      // # readings for auto bias average

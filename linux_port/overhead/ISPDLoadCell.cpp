@@ -56,7 +56,11 @@ ISPDLoadCell::ISPDLoadCell()
 
 	this->ContMeasOut = false;
 	this->blnMeas     = false;
+	this->blnCmdSent  = false;
+	this->blnResponseReceived = false;
+	this->blnOutputStopped = false;
 	this->bFirstCheck = true;
+	this->latestMeas  = 0;
 	this->num_adc_reads[0] = 5;
 
 	// Initialize line accumulation buffer
@@ -257,6 +261,10 @@ static void ISPDLoadCellThreadBody(ISPDLoadCell::ISPDinit* pISPDInit, int loadCe
 	//                           Main Loop
 	///////////////////////////////////////////////////////////////////////////
 
+	DWORD emptyCount = 0;           // Consecutive loops with no serial data
+	DWORD restartCount = 0;         // Number of SX restarts
+	#define ISPD_STREAM_TIMEOUT 500 // ~1 second of no data (500 * 2ms sleep)
+
 	for(;;)
     {
 		LoopCnt++;
@@ -264,16 +272,48 @@ static void ISPDLoadCellThreadBody(ISPDLoadCell::ISPDinit* pISPDInit, int loadCe
         // Read measurements
         if (pISPDcObj->ContMeasOut)
 		{
+			WORD preBytes = 0;
+			pISPDcObj->serialObj->RtGetComBufferCount(&preBytes);
+
             pISPDcObj->SerialRead(serObj);
 			Sleep(MEASURE_MODE_SLEEP);
 
-			if (LoopCnt == 500)
-			{
-				WORD dbgBytes = 0;
-				pISPDcObj->serialObj->RtGetComBufferCount(&dbgBytes);
-				RtPrintf("ISPD loop@500: buf=%d blnMeas=%d blnCmdSent=%d ContMeasOut=%d lineIdx=%d\n",
-					dbgBytes, pISPDcObj->blnMeas, pISPDcObj->blnCmdSent,
-					pISPDcObj->ContMeasOut, pISPDcObj->lineIdx);
+			if (preBytes > 0) {
+				emptyCount = 0;  // Data present, reset timeout
+			} else {
+				emptyCount++;
+				if (emptyCount >= ISPD_STREAM_TIMEOUT) {
+					// Stream died (ISPD sends ERR and stops after ~2.6s)
+					// Re-send SX to restart continuous output
+					restartCount++;
+					RtPrintf("ISPD: Stream timeout (%d empty loops) - restarting SX (restart #%d)\n",
+						emptyCount, restartCount);
+
+					WORD bw;
+					// Flush any stale data
+					WORD stale = 0;
+					pISPDcObj->serialObj->RtGetComBufferCount(&stale);
+					if (stale > 0) {
+						BYTE junk[1024];
+						WORD jr;
+						pISPDcObj->serialObj->RtReadComPort(junk, stale < 1024 ? stale : 1024, &jr);
+					}
+
+					// Re-send SX
+					pISPDcObj->lineIdx = 0;
+					pISPDcObj->serialObj->RtWriteComPort((BYTE*)"SX\r", 3, &bw);
+					Sleep(100);
+
+					pISPDcObj->serialObj->RtGetComBufferCount(&stale);
+					RtPrintf("ISPD: After SX restart, buffer has %d bytes\n", stale);
+
+					{
+						FILE* df = fopen("/tmp/ispd_debug.log", "a");
+						if (df) { fprintf(df, "SX_RESTART #%d: buf_after=%d\n", restartCount, stale); fclose(df); }
+					}
+
+					emptyCount = 0;
+				}
 			}
 		}
 		else
@@ -328,22 +368,11 @@ int RTFCNDCL ISPDLoadCell::ISPDLoadCellThread4(PVOID pISPDInit)
 int ISPDLoadCell::init_adc(int mode, int num_reads)
 {
 	int i;
-    int cntFlush = 0;
-	bool Config = true;
+	WORD bytes_wrtn, buf_bytes;
 
     this->blnOutputStopped = false;
 
-	// Flush any stale data in the receive buffer
-	this->serialObj->RtGetComBufferCount((WORD*)&i);
-
-	while ((i != 0) && (cntFlush++ <= 5))
-	{
-		this->FlushComInBuffer();
-		Sleep(10);
-		this->serialObj->RtGetComBufferCount((WORD*)&i);
-	}
-
-	// Initialize ADC settings - same pattern as HBM
+	// Initialize ADC settings
     for(i = 0; i < ISPD_NUM_CH; i++)
     {
         this->adc_offset   [i] = ADCOFFSET;
@@ -356,53 +385,78 @@ int ISPDLoadCell::init_adc(int mode, int num_reads)
         this->set_adc_mode     (i, adc_mode     [i]);
     }
 
-    if (this->ContMeasOut)
-    {
-        this->StopContinuousOutput();
-    }
+    this->ContMeasOut = false;
+    this->blnMeas = false;
+    this->blnCmdSent = false;
 
-	// Open device at address 1 (must be first command)
-	RtPrintf("ISPD init: sending OP 1...\n");
-	this->SendCommand("OP 1\r", 3000);
-	RtPrintf("ISPD init: OP 1 done, responseReceived=%d, blnCmdSent=%d, blnMeas=%d, ContMeasOut=%d\n",
-		this->blnResponseReceived, this->blnCmdSent, this->blnMeas, this->ContMeasOut);
+	// ---------------------------------------------------------------
+	// Simple direct-write init sequence (matches working standalone test).
+	// Do NOT use SendCommand - its state machine corrupts the sequence.
+	// ---------------------------------------------------------------
 
-	// Flush any leftover response data before starting stream
-	this->FlushComInBuffer();
+	// Flush any stale data
+	this->serialObj->RtGetComBufferCount(&buf_bytes);
+	if (buf_bytes > 0) {
+		BYTE junk[1024];
+		WORD junkRead;
+		this->serialObj->RtReadComPort(junk, buf_bytes < 1024 ? buf_bytes : 1024, &junkRead);
+	}
+	Sleep(50);
+
+	// Send OP 1 (open device at address 1) - direct write, wait for response
+	RtPrintf("ISPD init: sending OP 1 (direct)...\n");
+	this->serialObj->RtWriteComPort((BYTE*)"OP 1\r", 5, &bytes_wrtn);
+	Sleep(300);
+
+	// Read and discard response
+	this->serialObj->RtGetComBufferCount(&buf_bytes);
+	if (buf_bytes > 0) {
+		BYTE resp[256];
+		WORD respRead;
+		this->serialObj->RtReadComPort(resp, buf_bytes < 256 ? buf_bytes : 256, &respRead);
+		resp[respRead < 255 ? respRead : 255] = 0;
+		RtPrintf("ISPD init: OP 1 response: %d bytes [%s]\n", respRead, (char*)resp);
+	} else {
+		RtPrintf("ISPD init: OP 1 no response\n");
+	}
+
+	// Flush before streaming
+	Sleep(50);
+	this->serialObj->RtGetComBufferCount(&buf_bytes);
+	if (buf_bytes > 0) {
+		BYTE junk[1024];
+		WORD junkRead;
+		this->serialObj->RtReadComPort(junk, buf_bytes < 1024 ? buf_bytes : 1024, &junkRead);
+	}
+
+	// Send SX (start continuous streaming) - direct write
+	RtPrintf("ISPD init: sending SX (direct)...\n");
+	this->lineIdx = 0;
+	this->serialObj->RtWriteComPort((BYTE*)"SX\r", 3, &bytes_wrtn);
+
+	// Enable measurement mode AFTER SX is sent
+	this->ContMeasOut = true;
+	this->blnMeas = true;
+	this->blnOutputStopped = false;
+	this->blnCmdSent = false;
+
+	// Check if data arrives
 	Sleep(100);
+	this->serialObj->RtGetComBufferCount(&buf_bytes);
+	RtPrintf("ISPD init: 100ms after SX, buffer has %d bytes\n", buf_bytes);
 
-	// Verify serial port fd is valid
 	{
-		WORD testCount = 0;
-		this->serialObj->RtGetComBufferCount(&testCount);
-		RtPrintf("ISPD init: pre-SX buffer count = %d, port = %d\n", testCount, this->serialObj->ucbObj.port);
+		FILE* df = fopen("/tmp/ispd_debug.log", "a");
+		if (df) { fprintf(df, "init_adc: SX sent, buf_after=%d\n", buf_bytes); fclose(df); }
 	}
 
-	// Start continuous ADC sample output (SX)
-	RtPrintf("ISPD init: sending SX...\n");
-    this->StartContinuousOutput();
-	RtPrintf("ISPD init: SX done, blnCmdSent=%d, blnMeas=%d, ContMeasOut=%d\n",
-		this->blnCmdSent, this->blnMeas, this->ContMeasOut);
-
-	// Wait briefly then check if data is arriving
-	Sleep(100);
-	{
-		WORD testCount = 0;
-		this->serialObj->RtGetComBufferCount(&testCount);
-		RtPrintf("ISPD init: 100ms after SX, buffer has %d bytes\n", testCount);
+	if (buf_bytes > 0) {
+		RtPrintf("ISPD LoadCell %d initialized successfully - streaming\n", this->LoadCellNum);
+	} else {
+		RtPrintf("ISPD LoadCell %d initialized but NO DATA after SX\n", this->LoadCellNum);
 	}
 
-    if (Config == true)
-	{
-		RtPrintf("ISPD LoadCell %d initialized successfully\n", this->LoadCellNum);
-		return(TRUE);
-	}
-	else
-	{
-		sprintf(app_err_buf, "ISPDLoadCell::init_adc - Error in ISPD LoadCell Configuration\n");
-	    app->GenError(warning, app_err_buf);
-		return(FALSE);
-	}
+	return(TRUE);
 }
 
 //===========================================================================
@@ -510,6 +564,14 @@ void ISPDLoadCell::SerialRead(Serial* serial)
 	{
 	    rc = this->serialObj->RtGetComBufferCount(&buf_bytes);
 
+        { static int srDbg = 0;
+          if (srDbg++ < 10) {
+            FILE* df = fopen("/tmp/ispd_debug.log", "a");
+            if (df) { fprintf(df, "SerialRead: buf_bytes=%d blnCmdSent=%d blnMeas=%d ContMeasOut=%d\n",
+                buf_bytes, this->blnCmdSent, this->blnMeas, this->ContMeasOut); fclose(df); }
+          }
+        }
+
         memset((char*)&this->rxmsg[0], 0, ISPD_BUFFER_SIZE);
 
         if (this->blnCmdSent && !blnMeas)
@@ -586,6 +648,9 @@ void ISPDLoadCell::SerialRead(Serial* serial)
 						// Parse the ASCII measurement value
 						tmpMeas = this->ParseMeasurementLine(this->lineBuf, this->lineIdx);
 
+						// Store latest value for direct read (bypasses MeasureQ)
+						this->latestMeas = tmpMeas;
+
 						// Write to the measurement queue (same interface as HBM)
 						this->MeasureQ(&tmpMeas, 0);
 
@@ -593,6 +658,8 @@ void ISPDLoadCell::SerialRead(Serial* serial)
 						if (this->cPrintCnt < 5)
 						{
 							RtPrintf("ISPD MeasQ write: value=%lld line='%s'\n", tmpMeas, this->lineBuf);
+							FILE* df = fopen("/tmp/ispd_debug.log", "a");
+							if (df) { fprintf(df, "MeasQ_WRITE: value=%lld line='%s'\n", tmpMeas, this->lineBuf); fclose(df); }
 							this->cPrintCnt++;
 						}
 
@@ -922,6 +989,15 @@ int ISPDLoadCell::MeasureQ(__int64* measArr, int items)
 			this->pInMeasQ->meas = measArr[0];
 			this->pInMeasQ->state = true;
 
+			{ static int mwDbg = 0;
+			  if (mwDbg++ < 5) {
+			    FILE* df = fopen("/tmp/ispd_debug.log", "a");
+			    if (df) { fprintf(df, "MQ_WRITE_INSIDE: this=%p &MeasQ[0]=%p pIn=%p meas=%lld state=%d\n",
+			        (void*)this, (void*)&this->MeasQ[0], (void*)this->pInMeasQ,
+			        this->pInMeasQ->meas, this->pInMeasQ->state); fclose(df); }
+			  }
+			}
+
 			this->InvalidMeasureCnt = 0;
 
 			this->pOutMeasQ = this->pInMeasQ;
@@ -937,6 +1013,13 @@ int ISPDLoadCell::MeasureQ(__int64* measArr, int items)
 		default:
 			// Read one or more measurements
 			pTmpPointer = this->pOutMeasQ;
+			{ static int mqDbg = 0;
+			  if (mqDbg++ < 10) {
+			    FILE* df = fopen("/tmp/ispd_debug.log", "a");
+			    if (df) { fprintf(df, "MQ_READ: this=%p &MeasQ[0]=%p meas=%lld state=%d items=%d\n",
+			        (void*)this, (void*)&this->MeasQ[0], this->MeasQ[0].meas, this->MeasQ[0].state, items); fclose(df); }
+			  }
+			}
 			for (i = 0; i < items; i++)
 			{
 #ifndef _MEASUREQ_ALLOW_MULTI_READ_
@@ -998,6 +1081,17 @@ int ISPDLoadCell::MeasureQ(__int64* measArr, int items)
 
 __int64 ISPDLoadCell::read_load_cell(int channel)
 {
+    // Bypass MeasureQ - read directly from latestMeas set by SerialRead thread
+    __int64 val = this->latestMeas;
+    static int rlcDbg = 0;
+    if (rlcDbg++ < 20) {
+        RtPrintf("ISPD read_load_cell: latestMeas=%lld\n", val);
+        FILE* df = fopen("/tmp/ispd_debug.log", "a");
+        if (df) { fprintf(df, "read_lc: latestMeas=%lld\n", val); fclose(df); }
+    }
+    return val;
+
+    // --- Original MeasureQ code below (bypassed) ---
     int   k, rcnt;
     __int64 rdg, cum_rdg;
 

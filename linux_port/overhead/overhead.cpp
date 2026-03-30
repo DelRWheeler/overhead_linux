@@ -4606,7 +4606,6 @@ void overhead::ProcessMbxMsg()
         case IND_MODE_WT_LIM:
             {
                 UINT* lim = (UINT*) &MbMsg->gen.data;
-                RtPrintf("IND_MODE_WT_LIM %d\n",*lim);
                 individual_lim = *lim;
             }
             break;
@@ -4701,11 +4700,9 @@ void overhead::ProcessMbxMsg()
                 {
                     capt_wt.scale = *pScl;
                     capt_wt.mode  = *pMd;
-                    RtPrintf("SET_LC_CAPTURE enable scale %d mode %d\n",*pScl, *pMd);
                 }
                 else
                 {
-                    RtPrintf("Bad Loadcell capture parm %s, line %d \n",_FILE_, __LINE__);
                     //DumpData("lc_cap",(BYTE *)&MbMsg->gen.data, 8);
                 }
 
@@ -5114,7 +5111,6 @@ void overhead::RawMode()
 
     if ( (app->pShm->raw_scale < 0) || (app->pShm->raw_scale > 1) )
     {
-        RtPrintf("Error raw scale %d\n", pShm->raw_scale);
         return;
     }
 
@@ -5140,6 +5136,7 @@ void overhead::RawMode()
 			else
 			{
 				app->pShm->sys_stat.raw_weight = app->ld_cel[app->pShm->raw_scale]->read_load_cell(0); //RCB 485???
+
 
 				// GLC 12/10/2004
 				// Check to see if digital load cell readings have stalled
@@ -8837,10 +8834,29 @@ void overhead::WriteDropRecords(int cnt)
                     (BYTE*) &sav_rec_buf,
                     sizeof(app_drp_rec) * cnt) == ERROR_OCCURED)
     {
+        // Append failed - file missing or full.
+        // Try creating the SAME file first (normal case: first write).
         if (Write_File( CREATE_NEW, fname,
                         (BYTE*) &sav_rec_buf,
                         sizeof(app_drp_rec) * cnt) == ERROR_OCCURED)
-            RtPrintf("Error file %s, line %d\n", _FILE_, __LINE__);
+        {
+            // CREATE_NEW also failed (file exists but is full).
+            // Roll to next file.
+            sav_drp_rec_file_info.cur_cnt = 0;
+
+            if (++sav_drp_rec_file_info.cur_file >= MAXDSAVFILES)
+                sav_drp_rec_file_info.cur_file = 0;
+
+            sprintf( fname, DREC_FILE_PATH, sav_drp_rec_file_info.cur_file);
+            DeleteFile(fname);
+
+            if (Write_File( CREATE_NEW, fname,
+                            (BYTE*) &sav_rec_buf,
+                            sizeof(app_drp_rec) * cnt) == ERROR_OCCURED)
+                RtPrintf("Error file %s, line %d\n", _FILE_, __LINE__);
+            else
+                write_Ok = true;
+        }
         else
             write_Ok = true;
     }
