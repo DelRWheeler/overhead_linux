@@ -604,6 +604,25 @@ class DCHServerWindow(Gtk.Window):
             diag_menu.append(item)
 
         menubar.append(diag_item)
+
+        # System menu (Restart/Reboot/Shutdown)
+        system_menu = Gtk.Menu()
+        system_item = Gtk.MenuItem(label="System")
+        system_item.set_submenu(system_menu)
+
+        restart_app_item = Gtk.MenuItem(label="Restart App")
+        restart_app_item.connect("activate", self.on_restart_app)
+        system_menu.append(restart_app_item)
+
+        reboot_item = Gtk.MenuItem(label="Reboot System")
+        reboot_item.connect("activate", self.on_reboot_system)
+        system_menu.append(reboot_item)
+
+        shutdown_item = Gtk.MenuItem(label="Shutdown System")
+        shutdown_item.connect("activate", self.on_shutdown_system)
+        system_menu.append(shutdown_item)
+
+        menubar.append(system_item)
         return menubar
 
     def on_view_settings(self, widget, label):
@@ -727,6 +746,36 @@ class DCHServerWindow(Gtk.Window):
         """Clear the terminal screen."""
         # Reset terminal and clear scrollback
         self.terminal.reset(True, True)
+
+    def _confirm(self, question):
+        """Show a Yes/No confirmation dialog. Returns True if user clicked Yes."""
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text=question,
+        )
+        response = dialog.run()
+        dialog.destroy()
+        return response == Gtk.ResponseType.YES
+
+    def on_restart_app(self, widget):
+        """Restart the dch-server-gui service (kills + relaunches this GUI)."""
+        if not self._confirm("Restart the DCH Server application?"):
+            return
+        subprocess.Popen(["systemctl", "restart", "dch-server-gui"])
+
+    def on_reboot_system(self, widget):
+        """Reboot the SandCat controller."""
+        if not self._confirm("Reboot the controller now?\n\nThis will stop production and restart the system."):
+            return
+        subprocess.Popen(["reboot"])
+
+    def on_shutdown_system(self, widget):
+        """Power off the SandCat controller."""
+        if not self._confirm("Shut down the controller now?\n\nThis will stop production and power off the system."):
+            return
+        subprocess.Popen(["shutdown", "-h", "now"])
 
     def warmup_loadcell(self):
         """Warm up the load cell serial port with Python before the C controller opens it.
