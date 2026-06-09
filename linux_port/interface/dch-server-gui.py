@@ -525,11 +525,20 @@ class SettingsViewerWindow(Gtk.Window):
 class DCHServerWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title="DCH Server")
-        self.set_default_size(900, 550)   # fallback if the WM can't fullscreen
-        # Dedicated kiosk display — fill the whole screen (no title bar). Set
-        # DCH_GUI_NO_FULLSCREEN=1 to keep it windowed.
-        if os.environ.get("DCH_GUI_NO_FULLSCREEN", "") != "1":
-            self.fullscreen()
+        # Dedicated kiosk session has NO window manager, so WM hints
+        # (fullscreen/maximize) are ignored — size the window explicitly to the
+        # screen and force it on realize. DCH_GUI_NO_FULLSCREEN=1 keeps default.
+        screen = Gdk.Screen.get_default()
+        self._scr_w = screen.get_width() if screen else 1920
+        self._scr_h = screen.get_height() if screen else 1200
+        if os.environ.get("DCH_GUI_NO_FULLSCREEN", "") == "1":
+            self.set_default_size(900, 550)
+        else:
+            self.set_default_size(self._scr_w, self._scr_h)
+            self.set_decorated(False)
+            self.fullscreen()  # honored if a WM is ever present
+            self.connect("realize",
+                         lambda w: (w.move(0, 0), w.resize(self._scr_w, self._scr_h)))
         self.child_pid = -1
 
         # Main vertical box
