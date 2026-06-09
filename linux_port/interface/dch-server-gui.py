@@ -542,7 +542,7 @@ class DCHServerWindow(Gtk.Window):
 
         # Font — larger for small (10") kiosk displays; override with the
         # DCH_GUI_FONT_SIZE env var without editing this file.
-        font_pt = os.environ.get("DCH_GUI_FONT_SIZE", "16")
+        font_pt = os.environ.get("DCH_GUI_FONT_SIZE", "20")
         font_desc = Pango.FontDescription(f"Monospace {font_pt}")
         self.terminal.set_font(font_desc)
 
