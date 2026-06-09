@@ -525,7 +525,11 @@ class SettingsViewerWindow(Gtk.Window):
 class DCHServerWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title="DCH Server")
-        self.set_default_size(900, 550)
+        self.set_default_size(900, 550)   # fallback if the WM can't fullscreen
+        # Dedicated kiosk display — fill the whole screen (no title bar). Set
+        # DCH_GUI_NO_FULLSCREEN=1 to keep it windowed.
+        if os.environ.get("DCH_GUI_NO_FULLSCREEN", "") != "1":
+            self.fullscreen()
         self.child_pid = -1
 
         # Main vertical box
@@ -542,7 +546,7 @@ class DCHServerWindow(Gtk.Window):
 
         # Font — larger for small (10") kiosk displays; override with the
         # DCH_GUI_FONT_SIZE env var without editing this file.
-        font_pt = os.environ.get("DCH_GUI_FONT_SIZE", "20")
+        font_pt = os.environ.get("DCH_GUI_FONT_SIZE", "24")
         font_desc = Pango.FontDescription(f"Monospace {font_pt}")
         self.terminal.set_font(font_desc)
 
