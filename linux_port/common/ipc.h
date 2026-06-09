@@ -68,6 +68,14 @@ typedef struct {
     CHAR    Buffer[MAX_APP_MSG_SIZE];
 } APPIPCMSG, *PAPPIPCMSG;
 
+// 4-byte struct packing for all on-the-wire IPC/IS message structs below, to
+// match the RTX/EPM-19 build (/Zp4). Without this, the two structs carrying an
+// __int64 (tGenericMsg, tDrpReqMsg) get 8-byte alignment on 64-bit gcc, padding
+// msgdata to offset 32 instead of the wire's offset 28 — which made the SandCat
+// mis-read InterSystems Com-Chk ACKs (read seq_num as cmd) and time out against
+// the 32-bit EPM-19. pack(4) leaves mhdr at 28 bytes (no over-aligned member).
+#pragma pack(push, 4)
+
 // Message header, anything related to network messages
 typedef struct{
     ULONG    cs;
@@ -476,3 +484,5 @@ union uResp {
      tMaintRespMsg  maint;
      tPchkRespMsg   ptck;
 };
+
+#pragma pack(pop)   // end 4-byte wire packing (see pack(push,4) above)
