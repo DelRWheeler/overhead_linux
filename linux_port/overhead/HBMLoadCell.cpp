@@ -1667,7 +1667,6 @@ void HBMLoadCell::SerialRead( Serial* serial)
 	    {
 		    __int64 tmpMeas = 0;
 			BYTE CheckSum = 0;
-			WORD* pToValue;
 
 		    if (meas_mode.Mode == COF_MODE_BINARY) 
             {
@@ -1683,7 +1682,7 @@ void HBMLoadCell::SerialRead( Serial* serial)
 					{
 						break;
 					}
-				    rc = this->serialObj->RtReadComPort((BYTE*) &this->rxmsg[ReadCnt], (unsigned short)(meas_mode.Bytes), &bytes_read);
+				    rc = this->serialObj->RtReadComPort((BYTE*) &this->rxmsg[0], (unsigned short)(meas_mode.Bytes), &bytes_read);
 				    
 	                if (bytes_read == meas_mode.Bytes)
 	                {
@@ -1719,44 +1718,40 @@ void HBMLoadCell::SerialRead( Serial* serial)
 	                        break;
 	                    }
 	
-						// Need to do a check sum and compare to 4th byte
+						// Verify the XOR checksum (byte 4).  On a bad/misframed packet do NOT
+						// enqueue a sample - the old code wrote 0, which drags the per-shackle
+						// average to zero (or pegs it over-range).  Skip it and nudge alignment
+						// by one byte so the 4-byte packet stream re-syncs.  An occasional
+						// skipped sample is harmless (many samples per shackle at 600 Hz);
+						// a polluted sample is not.
 						CheckSum = (unsigned char)(this->rxmsg[0] ^ this->rxmsg[1] ^ this->rxmsg[2]);
-	
 						if (CheckSum != this->rxmsg[3])
 						{
-							tmpMeas = 0x0;			//we have a problem
 							this->CheckSumError++;
 							this->serialObj->RtGetComBufferCount(&NumBytes);
 							if (NumBytes > 0)
 							{
-								// Try to change our allignment by one byte
+								// Re-align by one byte; the next frame is retried.
 								this->serialObj->RtReadComPort((BYTE*) &tmpBuffer, 1, &rc);
 								this->ExtraReadCnt++;
-								//ReadCnt++;
 							}
+							continue;
 						}
-							
-						// This just used for debug to check on our status periodically
-						if( _HBMLDCELL_ & TraceMask )
-						{
-							this->cPrintCnt++;
-							if ((this->cPrintCnt%10000) == 0)
-							{
-								this->serialObj->RtGetComBufferCount(&NumBytes);
-								pToValue = (WORD *)&tmpMeas;
-								DebugTrace(_HBMLDCELL_, 
-									"SerialRead bytes in buffer = %d CheckSumError = %d Port = %d\n",
-									NumBytes, this->CheckSumError, 
-									this->serialObj->ucbObj.port);
-							}
-						}
-						//Write to the measurement queue
+						
+						// Good frame - enqueue the weight sample.
 						this->MeasureQ(&tmpMeas, 0);
-
-						// Set flag from debugshell
 						if (TakeLoadCellReadsFlag > 0)
 						{
 							this->SampleLCReadMeasureQ(&tmpMeas);
+						}
+						
+						// Periodic framing-health line (always on) so read loss shows in the log.
+						this->cPrintCnt++;
+						if ((this->cPrintCnt % 6000) == 0)
+						{
+							RtPrintf("HBM LC%d framing: good=%d cksum_err=%d realign=%d\n",
+								this->LoadCellNum + 1, this->cPrintCnt,
+								this->CheckSumError, this->ExtraReadCnt);
 						}
 					}
 				}
