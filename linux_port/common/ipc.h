@@ -209,6 +209,7 @@ typedef struct{
 
 typedef struct{
     UINT       seq_num;
+    UINT       _pad64;   // restore 8-byte alignment d_rec lost to pack(4): host parses app_drp_rec as 64-bit DrpRec (seq4+pad4+THostDropRec112=120)
     app_type::THostDropRec d_rec;
 } app_drp_rec;
 
