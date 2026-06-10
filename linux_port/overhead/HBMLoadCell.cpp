@@ -1745,13 +1745,23 @@ void HBMLoadCell::SerialRead( Serial* serial)
 							this->SampleLCReadMeasureQ(&tmpMeas);
 						}
 						
-						// Periodic framing-health line (always on) so read loss shows in the log.
-						this->cPrintCnt++;
-						if ((this->cPrintCnt % 6000) == 0)
+						// Framing health: stay SILENT while the stream is clean; only emit a line
+						// when a NEW checksum error / re-align occurs.  Uses a private good-frame
+						// counter (NOT this->cPrintCnt) so the legacy MeasureQ debug print stays off.
+						static unsigned s_goodFrames = 0;
+						s_goodFrames++;
+						if ((s_goodFrames % 6000) == 0)
 						{
-							RtPrintf("HBM LC%d framing: good=%d cksum_err=%d realign=%d\n",
-								this->LoadCellNum + 1, this->cPrintCnt,
-								this->CheckSumError, this->ExtraReadCnt);
+							static int s_lastErr = 0, s_lastRealign = 0;
+							if (this->CheckSumError != s_lastErr ||
+								this->ExtraReadCnt  != s_lastRealign)
+							{
+								RtPrintf("HBM LC%d framing ALERT: good=%u cksum_err=%d realign=%d\n",
+									this->LoadCellNum + 1, s_goodFrames,
+									this->CheckSumError, this->ExtraReadCnt);
+								s_lastErr     = this->CheckSumError;
+								s_lastRealign = this->ExtraReadCnt;
+							}
 						}
 					}
 				}
