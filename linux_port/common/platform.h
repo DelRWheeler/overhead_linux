@@ -1135,16 +1135,28 @@ static void* _timer_thread_func(void* arg)
         }
     }
 
-    // Wait for initial expiration
-    struct timespec delay;
-    delay.tv_sec = th->interval.it_value.tv_sec;
-    delay.tv_nsec = th->interval.it_value.tv_nsec;
-    nanosleep(&delay, NULL);
-
-    // Periodic loop
+    // Periodic interval.
     struct timespec period;
     period.tv_sec = th->interval.it_interval.tv_sec;
     period.tv_nsec = th->interval.it_interval.tv_nsec;
+
+    // Fire on an ABSOLUTE schedule (start + N*period), like the RTX hardware
+    // timer this emulates. The previous implementation did callback() then a
+    // RELATIVE nanosleep(period), so every tick took period + callback_time +
+    // wake-latency and the clock drifted slow without bound (measured ~18% slow
+    // on this hardware → ~11 s/minute; on the rig's SCHED_RR thread it showed as
+    // the late "PPM reset Timer 62"). That drift desynchronizes InterSystems
+    // batch/suspend coordination between a SandCat master and an EPM-19 slave.
+    // clock_nanosleep(TIMER_ABSTIME) against an absolute deadline is
+    // self-correcting: if a callback overruns, the next deadline is already in
+    // the past and the sleep returns immediately, so the timer catches up
+    // instead of accumulating drift.
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+    next.tv_sec  += th->interval.it_value.tv_sec;
+    next.tv_nsec += th->interval.it_value.tv_nsec;
+    if (next.tv_nsec >= 1000000000L) { next.tv_sec++; next.tv_nsec -= 1000000000L; }
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL) == EINTR) {}
 
     // Disable thread cancellation - timer threads must not be killed by pthread_cancel
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
@@ -1154,7 +1166,11 @@ static void* _timer_thread_func(void* arg)
             th->callback(th->context);
         }
         if (!th->active) break;
-        nanosleep(&period, NULL);
+        // Advance the absolute deadline by exactly one period.
+        next.tv_sec  += period.tv_sec;
+        next.tv_nsec += period.tv_nsec;
+        if (next.tv_nsec >= 1000000000L) { next.tv_sec++; next.tv_nsec -= 1000000000L; }
+        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL) == EINTR) {}
     }
 
     // Timer thread exiting — log this (should never happen during normal operation)
