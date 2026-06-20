@@ -142,7 +142,7 @@ private:
 
     // Arrays for error reporting
 	char		lc_err_buf[MAXERRMBUFSIZE];
-    bool		error_sent[HBM_NUM_CH];
+    bool		error_sent[2];   // indexed by adc_mode (INDIVID=0/AVG=1), NOT channel
 
     // Rx message char array
 	BYTE    rxmsg[HBM_BUFFER_SIZE];

@@ -5222,7 +5222,7 @@ void overhead::Check_Adc_Settings(int scale)
 				}
 				else
 				{
-					app->ld_cel[scale]->set_adc_mode(scale, app->pShm->scl_set.AdcMode[0]);
+					app->ld_cel[scale]->set_adc_mode(0, app->pShm->scl_set.AdcMode[0]);
 				}
 
                 if(!RtReleaseMutex(load_cell_mutex[GPBUFID]))
