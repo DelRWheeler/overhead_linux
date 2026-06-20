@@ -195,11 +195,11 @@ ser_typ::UCB   ucbList[COM_MAX_PORTS] = {
 	1						   //1 - RS422 option
 	},
 	{
-	COM4,                      //COM port
-	(PUCHAR)COM4_BADDR,        //base address
-	Serial::COM4Isr,           // isr handle
+	COM2,                      //COM port
+	(PUCHAR)COM2_BADDR,        //base address
+	Serial::COM2Isr,           // isr handle
 	0,                         //interrupt vector address
-	COM4_IRQ,                  //IRQ
+	COM2_IRQ,                  //IRQ
 	NULL,                      //pointer to input ring buff
 	NULL,                      //pointer to output ring buff
 	DEFAULT_FIFO_MASK,         //default FIFO mask
@@ -1271,6 +1271,7 @@ void overhead::ReadConfiguration()
         else
             fsave_grp_tbl[i].loaded = true;
     }
+
 
 //----- Read totals.
 
