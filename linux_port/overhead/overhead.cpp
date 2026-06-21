@@ -3800,6 +3800,26 @@ void __stdcall overhead::App_Timer_Main(PVOID addr)
     //  Keep ProcessSyncs before switch statement
     app->ProcessSyncs();
 
+    // Test Fire Drops (Delphi FireDrops): fire the kicker here — AFTER
+    // DecCntrlCtrs() and in the same part of the scan as production drops
+    // (SetOutput at the tail of ProcessSyncs), so the kick timer isn't
+    // decremented in the same pass. RTX did this in DebugThread, but on Linux
+    // iopl() is per-thread so a DebugThread outb() is silently lost — the main
+    // scan thread holds the port privilege.
+    //
+    // Hold the paddle open ~5 s (1000 ticks * 5 ms App timer) like the RTSS test
+    // fire, not the normal ~250 ms (DropOn) kick: long enough to watch on the line
+    // and verify the cylinder. THIS IS WHY TEST FIRE MUST NEVER RUN DURING
+    // PRODUCTION — a 5 s open paddle will catch the next bird and bend the cylinder.
+    if (app->pShm->dbg_set.dbg_output)
+    {
+        int testDrop = app->pShm->dbg_set.dbg_output;
+        app->SetOutput(testDrop, true);
+        if (testDrop >= 1 && testDrop <= MAXOUTPUTBYTS * 8)
+            app->output_timer[testDrop - 1] = 1000;   // ~5 s hold (1000 * 5 ms)
+        app->pShm->dbg_set.dbg_output = 0;
+    }
+
     switch(app->pShm->OpMode)
     {
         case ModeStart:
@@ -10602,12 +10622,8 @@ void __stdcall overhead::DebugThread(PVOID unused)
             app->pShm->sys_stat.dbg_switch[i] = app->switch_in[i];
         }
 
-        // Test Fire Outputs
-        if (app->pShm->dbg_set.dbg_output)
-        {
-            app->SetOutput(app->pShm->dbg_set.dbg_output,true);
-            app->pShm->dbg_set.dbg_output = 0;
-        }
+        // Test Fire Outputs are handled in the main scan loop (port-I/O privilege
+        // is per-thread on Linux; the DebugThread's outb would be lost).
 
         // Stop debugging if someone left it on.
 #if 0

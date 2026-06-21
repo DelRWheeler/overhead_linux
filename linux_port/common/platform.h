@@ -1124,6 +1124,13 @@ static void* _timer_thread_func(void* arg)
 {
     TimerHandle* th = (TimerHandle*)arg;
 
+    // Linux: I/O-port privilege (iopl) is PER-THREAD and is NOT inherited from the
+    // thread that raised it at startup. The App timer callback fires drop kickers
+    // via SetOutput()->outb() (production drops AND Test Fire Drops), so every
+    // timer thread must raise its own port privilege here or those writes fault
+    // and are silently lost. On RTX all threads shared I/O privilege implicitly.
+    iopl(3);
+
     // Set real-time scheduling to prevent CPU starvation from other threads.
     // GP_TIMER heartbeat must never be starved or CheckHeartbeats kills the process.
     {
