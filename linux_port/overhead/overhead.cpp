@@ -8349,12 +8349,16 @@ int overhead::CheckRange(int drop, int scale, TShackleStatus* pShk)
 		//	CHECK_GRADE
 		//----- See if the grade assigned to the shackle matches one in the schedule
 
-		if (pShm->sys_set.ResetGrading.ResetScale1Grade > 0)
-			grade = pShm->sys_set.GradeArea[pShk->GradeIndex[scale]].grade;
-		else\
-			grade = pShm->sys_set.GradeArea[pShk->GradeIndex[0]].grade;
-//DRW Added for resetting grade on empty shackles only
-		if (pShm->sys_set.ResetGrading.ResetS1Empty > 0)
+		// Dual-scale: when scale-1's grade is reset for scale 2 (all shackles via
+		// ResetScale1Grade, or empty-only via ResetS1Empty), test THIS SCALE's grade
+		// (GradeIndex[scale]) — for a scale-2 drop that is the reset grade already
+		// sitting in GradeIndex[1]. The original two separate if/else blocks let the
+		// ResetS1Empty branch clobber the ResetScale1Grade result back to
+		// GradeIndex[0], so scale-2 drops saw the scale-1 grade and rejected every
+		// bird (→ unassigned → GibDrop). Use one combined condition that matches the
+		// reset-firing logic in MissedBirdCheck (OR of both options). Single-scale is
+		// unaffected: scale==0 → GradeIndex[scale]==GradeIndex[0].
+		if ((pShm->sys_set.ResetGrading.ResetScale1Grade > 0) || (pShm->sys_set.ResetGrading.ResetS1Empty > 0))
 			grade = pShm->sys_set.GradeArea[pShk->GradeIndex[scale]].grade;
 		else
 			grade = pShm->sys_set.GradeArea[pShk->GradeIndex[0]].grade;
