@@ -11329,7 +11329,7 @@ shm_info tbl[ALL_SHM_IDS] = {
 	78,			_TSyncStatus,			sizeof(app->pShm->SyncStatus),					MAXSYNCS,		(void*) &app->pShm->SyncStatus,					"SyncStatus",			NO_GROUP,
 	SHKSTAT,	_TShackleStatus,		sizeof(app->pShm->ShackleStatus),				MAXPENDANT,		(void*) &app->pShm->ShackleStatus,				"ShackleStatus",		NO_GROUP,
 	SCLWGHZ,	_DBOOL,					sizeof(app->pShm->WeighZero),					MAXSCALES,		(void*) &app->pShm->WeighZero,					"WeighZero",			NO_GROUP,
-	81,			_uint,					sizeof(app->pShm->spare_int),					1,				(void*) &app->pShm->spare_int,					"spare_int",			NO_GROUP,
+	81,			_uint,					sizeof(app->pShm->ZeroFlagMode),				1,				(void*) &app->pShm->ZeroFlagMode,				"ZeroFlagMode",			NO_GROUP,
 	82,			_uint,					sizeof(app->pShm->WeighShackle),				MAXSCALES,		(void*) &app->pShm->WeighShackle,				"WeighShackle",			NO_GROUP,
 	GRD_SHKL,	_uint,					sizeof(app->pShm->grade_shackle),				MAXGRADESYNCS,	(void*) &app->pShm->grade_shackle,				"grade_shackle",		NO_GROUP,
 	SYS_SET,	_uint,					sizeof(app->pShm->sys_set),						1,				(void*) &app->pShm->sys_set,					"System Settings",		SYS_IN_GROUP,

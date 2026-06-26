@@ -512,7 +512,7 @@ typedef struct
 /*079*/        TShackleStatus       ShackleStatus[MAXPENDANT];     // self explanatory
 /*080*/        DBOOL                WeighZero[MAXSCALES];          // zeroed status of scale, set when zero flag passes
                char                 spare[2];                      // for 4 byte alignment
-/*081*/        int                  spare_int;                     // nothing
+/*081*/        int                  ZeroFlagMode;                  // was spare_int (RTSS keeps spare_int): 0=standard two-sensor zero, 1=single-sensor double-pulse zero. Same shmID 81/offset, host-pushed.
 /*082*/        int                  WeighShackle[MAXSCALES];       // shackle number just weighed
 /*083*/        int                  grade_shackle[MAXGRADESYNCS];	// shackle number at grade detect
 // Some group Ids (84-89) already defined. The stuff below was added later.
