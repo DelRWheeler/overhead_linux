@@ -510,6 +510,27 @@ const int  nxt_cap_buf[2] = {1,0};
 overhead::overhead()
 {
 	syncOffset = 0;// offset from the scale sync to the scale.
+
+	// Power-loss auto-shutdown (ported from EPM-19) -- default OFF / safe.
+	System_Power_Status = false;   // false = power ON
+	AutoShutdown        = false;
+	PowerDownSecs       = 0;
+}
+
+//--------------------------------------------------------
+//  PostShutdownMessage  (ported from EPM-19; Linux version)
+//
+//  Called when the power-loss countdown expires. On the SandCat
+//  (Linux) the controller runs as root, so trigger a graceful OS
+//  shutdown directly. TEST RIG: reboot (-r) so the box self-recovers.
+//  PRODUCTION: change -r to -h to power the box off before the UPS dies.
+//--------------------------------------------------------
+void overhead::PostShutdownMessage()
+{
+    RtPrintf("PostShutdownMessage: triggering graceful shutdown (power lost).\n");
+    int rc = system("/sbin/shutdown -r now");   // PRODUCTION: -h (poweroff)
+    if (rc != 0)
+        RtPrintf("PostShutdownMessage: shutdown command returned %d\n", rc);
 }
 
 overhead::~overhead()
@@ -1835,6 +1856,12 @@ void overhead::SetDefaults()
 // There is no need to set anything in shared memory (pShm->) to
 // zero or false, it is cleared after allocated.
 
+//----- Auto Power On/Off Settings (ported from EPM-19)
+    System_Power_Status = false;            // assume external power present at startup
+    AutoShutdown        = pShm->AutoShutdownEnabled ? true : false;
+    PowerDownSecs       = pShm->ShutdownDelaySecs;
+    RtPrintf("Auto-shutdown enabled: %d, shutdown delay (secs): %d\n", AutoShutdown, PowerDownSecs);
+
 //----- Grading stuff. See "The Rest" for schedule grades.
 
     pShm->sys_set.Grading                   = true;
@@ -3068,6 +3095,53 @@ void __stdcall overhead::Gp_Timer_Main(PVOID addr)
             }
         }
     }
+
+//================= Power-loss auto-shutdown ================= (ported from EPM-19)
+    {
+        static bool bPreviousPowerStatus = false;   // false = power ON at startup
+        static bool bShutdownWarningSent = false;
+        static int  nShutdownCountdown   = -1;      // -1 = inactive
+
+        // Refresh config from SHM each tick so a live UI toggle takes effect.
+        app->AutoShutdown  = app->pShm->AutoShutdownEnabled ? true : false;
+        app->PowerDownSecs = app->pShm->ShutdownDelaySecs;
+
+        // Power LOST (ON -> OFF)
+        if (app->System_Power_Status == true && bPreviousPowerStatus == false)
+        {
+            if (app->AutoShutdown && !bShutdownWarningSent)
+            {
+                RtPrintf("Power Interrupted. Auto-shutdown initiated.\n");
+                sprintf(app_err_buf, "Power Interrupted. Shutting down in %d secs.\n", app->PowerDownSecs);
+                app->GenError(warning, app_err_buf);
+                nShutdownCountdown   = app->PowerDownSecs * 2;  // Gp_Timer runs every 0.5s
+                bShutdownWarningSent = true;
+            }
+        }
+        // Power RESTORED (OFF -> ON)
+        else if (app->System_Power_Status == false && bPreviousPowerStatus == true)
+        {
+            RtPrintf("Power Restored.\n");
+            sprintf(app_err_buf, "Power Restored.\n");
+            app->GenError(informational, app_err_buf);
+            bShutdownWarningSent = false;
+            nShutdownCountdown   = -1;
+        }
+        bPreviousPowerStatus = app->System_Power_Status;
+
+        // Process the countdown
+        if (nShutdownCountdown > 0)
+        {
+            nShutdownCountdown--;
+            if (nShutdownCountdown == 0)
+            {
+                RtPrintf("Auto-shutdown countdown expired -- shutting down now.\n");
+                app->PostShutdownMessage();
+                nShutdownCountdown = -1;
+            }
+        }
+    }
+//================= end Power-loss auto-shutdown =================
 
 //----- Every hour, print the time for a time reference in the rtx log
 
@@ -11267,7 +11341,10 @@ shm_info tbl[ALL_SHM_IDS] = {
 	90,			___int64,				sizeof(app->pShm->AutoBias),					MAXSCALES,		(void*) &app->pShm->AutoBias,					"AutoBias",				NO_GROUP,
 	MBX_STAT,	_mbx_state,				sizeof(app->pShm->mbx_status),					MBX_STATUSES,	(void*) &app->pShm->mbx_status,					"Mailbox Status",		NO_GROUP,
 	APPVER,		_char,					sizeof(app->pShm->app_ver),						MAXVERINFO,		(void*) &app->pShm->app_ver,					"App Version",			NO_GROUP,
-	COMVER,		_char,					sizeof(app->pShm->comm_ver),					MAXVERINFO,		(void*) &app->pShm->comm_ver,					"Comm Version",			NO_GROUP
+	COMVER,		_char,					sizeof(app->pShm->comm_ver),					MAXVERINFO,		(void*) &app->pShm->comm_ver,					"Comm Version",			NO_GROUP,
+	// --- Power-loss auto-shutdown (host-pushed; ids 94/95 sit in the spare ALL_SHM_IDS slots, > MAXIDS so not saved/iterated) ---
+	94,			_int,					sizeof(app->pShm->AutoShutdownEnabled),			1,				(void*) &app->pShm->AutoShutdownEnabled,		"AutoShutdownEnabled",	NO_GROUP,
+	95,			_int,					sizeof(app->pShm->ShutdownDelaySecs),			1,				(void*) &app->pShm->ShutdownDelaySecs,			"ShutdownDelaySecs",	NO_GROUP
 };
 
 fsave_grp grp_tbl[MAX_GROUPS] = {

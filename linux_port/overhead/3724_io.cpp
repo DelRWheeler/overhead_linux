@@ -117,4 +117,13 @@ void io_3724::readInputs(void)
     }
     // switch_in Bits
     app->switch_in[SWITCH_0] = (unsigned char)(~RtReadPortUchar(PCM_3724_1_PORT_C0));
+
+    // Power-loss auto-shutdown: Port C0 bit 5 (input bit 21) = UPS "external power"
+    // signal. Ported from EPM-19 (overhead.cpp TG power read). NOTE: bit 5 is also
+    // GRADE4_BIT, so this input is only valid on systems using <=4 grades; the read
+    // itself is harmless (separate var) and is only acted on when AutoShutdown is on.
+    if BITSET(app->switch_in[SWITCH_0], 5)
+        app->System_Power_Status = true;    // power LOST
+    else
+        app->System_Power_Status = false;   // power OK
 }

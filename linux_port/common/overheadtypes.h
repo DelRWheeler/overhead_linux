@@ -521,6 +521,13 @@ typedef struct
 /*091*/        mbx_state            mbx_status[MBX_STATUSES];      // mailbox status
 /*092*/        char                 app_ver[MAXVERINFO];        // version information for this application
 /*093*/        char                 comm_ver[MAXVERINFO];       // version information for communications
+
+               // --- Auto-Shutdown Settings (ported from EPM-19 overhead.rtss) ---
+               // Appended at struct end so existing offsets do not shift. The
+               // controller reads these; the host (Go API) writes them via the
+               // interface. Zero-initialized => feature OFF by default.
+               BOOL                 AutoShutdownEnabled;
+               int                  ShutdownDelaySecs;
 } SHARE_MEMORY;
 
 typedef struct

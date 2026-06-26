@@ -50,6 +50,12 @@ public:
     bool                weight_simulation_mode;
 	bool				StuckLoadCellWarning[MAXSCALES];
     int                 this_lineid;
+
+    // --- Power-loss auto-shutdown (ported from EPM-19 overhead.rtss) ---
+    bool                System_Power_Status;        // true = external power LOST (3724 Port C0 bit5 / input 21)
+    bool                AutoShutdown;               // feature enabled (mirrors pShm->AutoShutdownEnabled)
+    int                 PowerDownSecs;              // grace delay before shutdown (mirrors pShm->ShutdownDelaySecs)
+
     int                 isys_fastest_idx[MAXDROPS]; // Index for fastest drop for intersystems.
                                                     // If equal to MAXIISYSLINES, then local is
                                                     // fastest
@@ -253,6 +259,7 @@ public:
 
     void    ClearOutputs();
     void    GenError(int sev, char* txt);
+    void    PostShutdownMessage();              // power-loss graceful shutdown (Linux)
     void    initialize();
     void    SaveDropRecords(bool save_all);
     void    SendSavedDropRecords();
