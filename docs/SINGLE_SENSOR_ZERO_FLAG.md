@@ -1,6 +1,9 @@
 # Single-Sensor Zero Flag (competitor-replacement feature)
 
-Status: design + delivery plumbing done; detector + simulator + UI in progress.
+Status: **DONE + rig-verified (2026-06-27).** Detector, delivery, ms tab window, simulator,
+host DB/API/UI all implemented and verified end-to-end on a 2-SandCat rig (10.5h soak clean,
+both lines; standard-mode regression clean). Demo-simulator synthesis is the only deferred
+piece. See `[[single_sensor_zero_flag_feature]]` memory for the full session record.
 Scope: **SandCat / Linux (`linux_port`) only** — the RTSS / `rtx_source` is obsolete and is
 NEVER modified. The Interface and the data structures sent to EPM-19 machines must stay
 byte-for-byte unchanged (we still support EPM-19 plants).
@@ -25,30 +28,55 @@ A **system-wide** setting on the Features screen: **Zero Flag Type = Standard | 
 - Single-Sensor: **ignore the odd zero bits entirely**; derive zero from the double-pulse on the
   even count bit. No I/O remap — even bits (0,2,4,6,…) stay as the count sensors.
 
-## Delivery (the EPM-19-safe part)
-Reuse the existing **`spare_int` field, shmID 81** (`NO_GROUP`, comment "nothing", verified unused
-in both `linux_port` and `rtx_source` — only the declaration + shm_tbl entry reference it).
-- In `linux_port` only, rename `spare_int` → `ZeroFlagMode` (same offset, same shmID 81). RTSS
-  keeps `spare_int`.
-- Go API pushes shmID 81 with the mode int32 on bootstrap + on Features save. Because 81 is an
-  **existing** shmID present in the EPM-19 shm_tbl, an EPM-19 simply writes its ignored `spare_int`
-  — no struct-size change, no unmapped write, **no gating needed**. (Contrast auto-shutdown's
-  94/95, which are linux-only and ARE gated to `arch=="sandcat"`.)
+## Delivery — over shmID 96 (NOT 81), SandCat-gated
+**The original "reuse spare_int shmID 81" plan DOES NOT WORK** and was abandoned. shmID **81 sits
+inside the controller's read-only `ZERO_CTR(71)..GRD_SHKL(83)` status range**, so a host
+`SHM_WRITE` to it is rejected by `ProcessMbxMsg`'s VALID_IDS gate (`SHM_WRITE Error id 81`).
+Confirmed on the rig — every push to 81 bounced and `ZeroFlagMode` stayed 0.
 
-## Detector algorithm (controller) — self-calibrating, no scope trace needed
+What we actually do:
+- `linux_port` only: `spare_int` is renamed `ZeroFlagMode` (the field is fine where it is; its own
+  shmID-81 slot just isn't host-writable). RTSS keeps `spare_int`.
+- Deliver over a **new shmID 96** — a spare `ALL_SHM_IDS` slot (`MAXIDS=93`, `MAX_GROUPS=5` →
+  94–98 valid, like auto-shutdown's 94/95). An added `shm_tbl` entry maps 96 → `&ZeroFlagMode`
+  (an alias). 96 passes VALID_IDS and is host-writable.
+- The tab window (below) ships as **shmIDs 97/98** the same way.
+- The Go API pushes 96/97/98 **gated to `arch=="sandcat"`** (96–98 don't exist on EPM-19, so an
+  EPM-19 would reject them). This loses nothing — single-sensor is a SandCat-only feature. The
+  earlier "ungated / EPM-19-safe" claim is void.
+- **No `SHARE_MEMORY` struct change** for the mode (reuses spare_int's slot); the window adds two
+  ints appended at the **end** of the struct (after the auto-shutdown fields) so no existing
+  offset shifts → interface wire format unchanged → EPM-19 unaffected.
+
+## Detector algorithm (controller) — configurable ms window + learned `T` as a sanity bound
 Geometry: trolleys on **6" centers**, block ~1.1–1.25" wide. Normal = one count edge per trolley
 interval `T`. Zero flag tab's rising edge lands at ~2.5" after the trolley = **~40% of `T`**.
+Tick unit = `App_Timer_Main` scans (**5 ms**); `ss_scan_tick` is a monotonic scan counter.
 
-In `ProcessSyncs()` / `GradeSyncs()`, when `ZeroFlagMode==1`:
-1. Per sync, track `lastEdgeTick`; maintain a running `T` = ticks between consecutive count edges.
-2. On a new count edge, `Δ = nowTick - lastEdgeTick`.
-3. If `Δ < K·T` (K ≈ 0.6) → it's the **tab** → ZERO for that sync (reset shackle count); do **not**
-   count the tab as a trolley. Else → normal trolley → count it; update the running `T` from this
-   (non-tab) interval only.
-4. The standard-mode `BITSET(switch_in, ZeroBit)` zero path is skipped in this mode.
+`SingleSensorIsZeroTab()` runs per confirmed count edge when `ZeroFlagMode==1`, per sync (and per
+grade sync). It keeps a per-sync `last_trolley_tick` + EMA `interval` (`T`):
+1. `Δ = ss_scan_tick - last_trolley_tick`.
+2. Seed timebase on the 1st edge; seed `interval` on the 2nd.
+3. `Δ > 3·T` → line was idle/stopped: resync timebase, keep `T`, treat as trolley.
+4. **TAB** if `Δ` is inside the **host-configured ms window** `[ZeroTabWindowMinMs, ZeroTabWindowMaxMs]`
+   (converted to ticks via /5) **AND** `2·Δ < T` (the learned `T` is the *backup sanity bound* so the
+   window can never misfire on a real trolley). On a tab: ZERO that sync, do **not** advance the
+   trolley timebase (so the trolley after the tab still measures a full `T`).
+5. Else trolley: count it, and fold `Δ` into the EMA **only if `Δ ≥ 0.7·T`** (a plausible full
+   trolley) — this guard stops a misclassified tab from poisoning `T` and death-spiralling.
+6. The standard-mode `BITSET(…ZeroBit)` path is taken byte-for-byte when `ZeroFlagMode==0`.
 
-Self-calibrates to line speed and trolley width. Needs a few normal trolleys at startup to seed
-`T` before zero detection is reliable (same as today's startup-zeroing revolution).
+**Why a ms window (not pure self-calibration):** the original `Δ < 0.6·T` alone was fragile at the
+edges (a single misclassification poisoned `T`). Operator-set min/max ms (default 30–250) is
+deterministic and tunable per line; defaults apply until the host pushes 97/98.
+
+### Single-sensor off-by-one (expected, handled)
+The marked trolley's *body* pulse counts (`shackleno → Shackles+1`) **before** its tab pulse resets
+it. So the "too many shackles" guard tolerates `Shackles+1` in single-sensor mode, and the
+"Zero Flag NOT Detected" warning is **throttled to ≤1/30 s** (`SingleSensorWarnOk()`) so imperfect
+tab timing during tuning can't flood the host (an unthrottled flood crashed the operator browser
+during bring-up). There is always an empty zero region (no bird on trolley 0 or the 2 ahead of it),
+so tares/auto-zero are **unchanged** from standard.
 
 ### `SkipTrollies` (turkey lines)
 The count sensor sees **every** trolley regardless of skip; `SkipTrollies` indexes shackles on top
@@ -60,16 +88,22 @@ Matching `zeroFlagMode`: in single-sensor mode generate count pulses on the **ev
 inject the **tab** (second block) at the zero position with the right bandwidth/timing, and
 **suppress the odd zero outputs**. Config field + web-UI toggle.
 
-## Integration points
-- `linux_port/common/overheadtypes.h`: `spare_int` → `ZeroFlagMode` (offset/shmID unchanged).
-- `linux_port/overhead/overhead.cpp`: `InitShmTbl` entry 81 label; read mode; `ProcessSyncs()`
-  (@~10136) + `GradeSyncs()` (@~5611) detector branch.
-- `apps/api`: `SystemFeatures.ZeroFlagMode`, migration, `CZeroFlagMode=81`, push on bootstrap +
-  Features save (ungated).
-- `apps/web/src/pages/Features.tsx`: Standard/Single-Sensor selector.
-- `apps/signal-generator`: `zeroFlagMode` generation + UI.
+## Integration points (as built)
+- `linux_port/common/overheadtypes.h`: `spare_int` → `ZeroFlagMode`; `ZeroTabWindowMinMs` +
+  `ZeroTabWindowMaxMs` appended at struct end.
+- `linux_port/overhead/overhead.cpp`: `shm_tbl` aliases **96**→`ZeroFlagMode`, **97/98**→window;
+  `ss_scan_tick++` in `App_Timer_Main`; `SingleSensorIsZeroTab()` + `SingleSensorWarnOk()`;
+  detector branch substituted in `ProcessSyncs()` + `GradeSyncs()` (gated on `ZeroFlagMode==1`).
+- `apps/api`: `SystemFeatures.{ZeroFlagMode,ZeroTabWindowMinMs,ZeroTabWindowMaxMs}`, migrations
+  029/030, `CZeroFlagMode=96` / `CZeroTabWindowMin=97` / `CZeroTabWindowMax=98`, `sendZeroFlagMode()`
+  pushed on bootstrap + Features save, **gated to `arch=="sandcat"`**.
+- `apps/web/src/pages/Features.tsx`: Standard/Single-Sensor selector + min/max ms inputs.
+- `apps/signal-generator`: `single_sensor` config; suppress odd zero outputs, inject the tab as a
+  2nd count pulse at `ZeroTabOffset=2.5"` (~42% of cycle); web-UI toggle.
 
-## Test plan (rig)
-Single-sensor end-to-end: siggen drives the double-pulse, controller zeros on the tab, shackle
-count tracks, production records correctly; verify on a turkey config (`SkipTrollies=1`). Then
-regression-test Standard mode is unchanged.
+## Test status (rig) — PASSED 2026-06-27
+2-SandCat rig (L1 .11, L2 .12, siggen .21, Pi .103): siggen drove the double-pulse, controller
+zeroed on the tab (`Δ≈28` ticks in the 30–250 ms window), shackle count tracked + wrapped, weights
+per bird, production records grew, **10.5h soak clean** (0 disconnects, 0 floods, steady
+production), and **standard-mode regression clean** (two-sensor zeroing unchanged).
+Remaining: turkey (`SkipTrollies=1`) spot-check; demo-simulator synthesis for off-rig demo.

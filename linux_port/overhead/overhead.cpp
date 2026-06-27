@@ -1762,6 +1762,20 @@ void overhead::InitLocals()
         sync_debounce[i] = pShm->sys_set.SyncOn;
     }
 
+    // Single-sensor zero-flag detector timebase (ZeroFlagMode==1 only)
+    ss_scan_tick = 0;
+    ss_last_warn_tick = -100000;  // allow the first warning immediately
+    for (i = 0; i < MAXSYNCS; i++)
+    {
+        ss_last_trolley_tick[i] = 0;
+        ss_trolley_interval[i]  = 0;
+    }
+    for (i = 0; i < MAXGRADESYNCS; i++)
+    {
+        ss_grade_last_trolley_tick[i] = 0;
+        ss_grade_trolley_interval[i]  = 0;
+    }
+
     for (i = 0; i < MAXGRADESYNCS; i++)
     {
         grade_armed[i]  = false;
@@ -3756,6 +3770,10 @@ void __stdcall overhead::App_Timer_Main(PVOID addr)
     // Guard: skip if pShm is invalid (prevents SIGSEGV in timer callback)
     if (!isPShmValid()) return;
 
+    // Monotonic scan counter for the single-sensor zero-flag detector (5 ms/tick).
+    // GradeSyncs() and ProcessSyncs() below share this value within one scan.
+    app->ss_scan_tick++;
+
     // Figure out how many ticks between shackles 1 & 2. It is used
     // to stop the weigh average routine in time to calculate average
     // weight before the next shackle.
@@ -5600,6 +5618,93 @@ void overhead::DecCntrlCtrs()
 }
 
 //--------------------------------------------------------
+//  SingleSensorIsZeroTab
+//
+// Single-sensor zero-flag detector (ZeroFlagMode==1). Competitor controllers we
+// are replacing (CA/Trinidad) use ONE sensor per sync; the zero marker is a
+// sheet-metal tab that makes the count sensor read a DOUBLE pulse:
+//   trolley block --(~0.4*T gap)--> tab block.
+// Trolleys are on 6" centers (interval T); the tab's rising edge lands ~2.5"
+// later (~40% of T). So a confirmed count edge that arrives well inside one
+// trolley interval is the TAB (= shackle zero); otherwise it is a real trolley.
+//
+// Called exactly once per confirmed count edge for the sync. Self-calibrating:
+// it learns T from real trolley-to-trolley intervals (EMA) and scales with line
+// speed and trolley width, so no scope trace / fixed timing is needed. The tab
+// does NOT advance the trolley timebase, so the trolley after the tab still
+// measures a full T. Returns true = this edge is the zero tab, false = trolley.
+//--------------------------------------------------------
+
+bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval)
+{
+    // App_Timer_Main (and thus ss_scan_tick) runs every 5 ms; convert the
+    // host-configured ms tab window to scan ticks. Defaults apply until the host
+    // pushes values (0) so the feature still works on first connect.
+    const __int64 SCAN_MS = 5;
+    int minMs = (pShm->ZeroTabWindowMinMs > 0) ? pShm->ZeroTabWindowMinMs : 30;
+    int maxMs = (pShm->ZeroTabWindowMaxMs > 0) ? pShm->ZeroTabWindowMaxMs : 250;
+    __int64 minTicks = minMs / SCAN_MS;
+    __int64 maxTicks = maxMs / SCAN_MS;
+
+    __int64 now = ss_scan_tick;
+
+    if (lastTrolleyTick == 0)            // very first edge: start the timebase
+    {
+        lastTrolleyTick = now;
+        return false;                    // can't classify yet -> trolley
+    }
+
+    __int64 delta = now - lastTrolleyTick;
+
+    if (interval <= 0)                   // second edge: seed the running interval
+    {
+        interval = delta;
+        lastTrolleyTick = now;
+        return false;                    // -> trolley
+    }
+
+    if (delta > interval * 3)            // line was stopped/idle: resync, keep T
+    {
+        lastTrolleyTick = now;
+        return false;                    // -> trolley (do not pollute the EMA)
+    }
+
+    // TAB if the gap is inside the configured ms window AND is a sane fraction of
+    // the learned trolley interval (must be well under one trolley — the learned T
+    // is the backup sanity bound so the window can't misfire on a real trolley).
+    if (delta >= minTicks && delta <= maxTicks && delta * 2 < interval)
+        return true;                     // ZERO; keep timebase (don't advance)
+
+    // Normal trolley. Advance the timebase, but only fold delta into the running
+    // interval if it is a PLAUSIBLE full-trolley gap (>= 0.7*T). This stops a
+    // misclassified tab (short gap) or noise from corrupting T and death-spiralling
+    // the window check. Outliers advance the timebase without polluting the EMA.
+    if (delta * 10 >= interval * 7)
+        interval = (interval * 3 + delta) / 4;
+    lastTrolleyTick = now;
+    return false;
+}
+
+//--------------------------------------------------------
+//  SingleSensorWarnOk
+//
+// Throttle for the "Zero Flag NOT Detected" warning in single-sensor mode. The
+// tab timing can be imperfect during tuning, and an unthrottled per-sync warning
+// floods the host UI (it overran memory and crashed the browser during bring-up).
+// Standard mode is unchanged (always returns true). Single-sensor allows at most
+// one send per ~30 s across all syncs; the safety RESET still happens every time.
+//--------------------------------------------------------
+bool overhead::SingleSensorWarnOk()
+{
+    if (pShm->ZeroFlagMode != 1)
+        return true;                        // standard mode: byte-for-byte unchanged
+    if (ss_scan_tick - ss_last_warn_tick < 6000)   // 6000 scans * 5 ms = 30 s
+        return false;
+    ss_last_warn_tick = ss_scan_tick;
+    return true;
+}
+
+//--------------------------------------------------------
 //  GradeSyncs
 //
 // The following block is needed for grade sync and count error
@@ -5619,7 +5724,8 @@ void overhead::GradeSyncs()
 	if (!(app->pShm->sys_set.MiscFeatures.EnableGradeSync2))
 	{
 		//GLC for Carolina Turkeys, check that the zero sensor is triggered before the sync
-		if (app->pShm->sys_set.MiscFeatures.RequireZeroBeforeSync)
+		//Single-sensor mode has no separate zero sensor, so this gate is bypassed.
+		if (app->pShm->sys_set.MiscFeatures.RequireZeroBeforeSync && pShm->ZeroFlagMode != 1)
 		{
 			if (BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex])) //GLC added 3/9/05
 			{
@@ -5639,7 +5745,13 @@ void overhead::GradeSyncs()
 			gradesync_zero_triggered[GradeSyncIndex] = false; //GLC added 3/9/05
 			//RtPrintf("Grade sync\n");
 
-			if ( BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]) )
+			// Standard mode reads the grade zero bit; single-sensor mode derives
+			// the grade zero from the double-pulse timing on the grade count bit.
+			bool grade_zero_detected = (pShm->ZeroFlagMode == 1)
+				? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex])
+				: BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]);
+
+			if ( grade_zero_detected )
 			{
 
 				//RtPrintf("Grade zero\n");
@@ -5714,15 +5826,17 @@ void overhead::GradeSyncs()
 				//RtPrintf("inc grade_shackle \n");
 			}
 
-			// Late zero flag
-			if ( (pShm->grade_shackle[GradeSyncIndex] > pShm->sys_set.Shackles ) )
+			// Late zero flag (single-sensor: tolerate one overshoot, see ProcessSyncs)
+			if ( (pShm->grade_shackle[GradeSyncIndex] > pShm->sys_set.Shackles + (pShm->ZeroFlagMode == 1 ? 1 : 0)) )
 			{
-                sprintf(app_err_buf,"Zero Flag NOT Detected. Grade Sync %d shackle %d expected %d\n", GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], pShm->sys_set.Shackles); //GLC added 2/14/05
-
 				trolly_counters[MAXSYNCS] = 0;
 				pShm->grade_shackle[GradeSyncIndex] = 1;
 
-				GenError(warning, app_err_buf);
+				if (SingleSensorWarnOk())
+				{
+					sprintf(app_err_buf,"Zero Flag NOT Detected. Grade Sync %d shackle %d expected %d\n", GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], pShm->sys_set.Shackles); //GLC added 2/14/05
+					GenError(warning, app_err_buf);
+				}
 			}
 
 			if ( (pShm->OpMode == ModeRun) && (grade_zeroed[GradeSyncIndex]) )
@@ -5748,7 +5862,8 @@ void overhead::GradeSyncs()
 		for (GradeSyncIndex = 0; GradeSyncIndex < MAXGRADESYNCS; GradeSyncIndex++)
 		{
 			//GLC for Carolina Turkeys, check that the zero sensor is triggered before the sync
-			if (app->pShm->sys_set.MiscFeatures.RequireZeroBeforeSync)
+			//Single-sensor mode has no separate zero sensor, so this gate is bypassed.
+			if (app->pShm->sys_set.MiscFeatures.RequireZeroBeforeSync && pShm->ZeroFlagMode != 1)
 			{
 				if (BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex])) //GLC added 3/9/05
 				{
@@ -5768,7 +5883,13 @@ void overhead::GradeSyncs()
 				gradesync_zero_triggered[GradeSyncIndex] = false; //GLC added 3/9/05
 				//RtPrintf("Grade sync\n");
 
-				if ( BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]) )
+				// Standard mode reads the grade zero bit; single-sensor mode derives
+				// the grade zero from the double-pulse timing on the grade count bit.
+				bool grade_zero_detected = (pShm->ZeroFlagMode == 1)
+					? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex])
+					: BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]);
+
+				if ( grade_zero_detected )
 				{
 
 					//GLC added 2/15/05
@@ -5839,16 +5960,18 @@ void overhead::GradeSyncs()
 					//RtPrintf("inc grade_shackle \n");
 				}
 
-				// Late zero flag
-				if ( (pShm->grade_shackle[GradeSyncIndex] > pShm->sys_set.Shackles ) )
+				// Late zero flag (single-sensor: tolerate one overshoot, see ProcessSyncs)
+				if ( (pShm->grade_shackle[GradeSyncIndex] > pShm->sys_set.Shackles + (pShm->ZeroFlagMode == 1 ? 1 : 0)) )
 				{
-	                sprintf(app_err_buf,"Zero Flag NOT Detected. Grade Sync %d shackle %d expected %d\n",
-						GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], pShm->sys_set.Shackles); //GLC added 2/14/05
-
 					trolly_counters[MAXSYNCS + GradeSyncIndex]   = 0;
 					pShm->grade_shackle[GradeSyncIndex]         = 1;
 
-					GenError(warning, app_err_buf);
+					if (SingleSensorWarnOk())
+					{
+						sprintf(app_err_buf,"Zero Flag NOT Detected. Grade Sync %d shackle %d expected %d\n",
+							GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], pShm->sys_set.Shackles); //GLC added 2/14/05
+						GenError(warning, app_err_buf);
+					}
 				}
 
 				// Hard coded for now. We should not need more than 2 grade syncs
@@ -10174,7 +10297,8 @@ void overhead::ProcessSyncs()
          pSyncStat = &pShm->SyncStatus[i];
 
 		//GLC for Carolina Turkeys, check that the zero sensor is triggered before the sync
-		 if (app->pShm->sys_set.MiscFeatures.RequireZeroBeforeSync)
+		//Single-sensor mode has no separate zero sensor, so this gate is bypassed.
+		 if (app->pShm->sys_set.MiscFeatures.RequireZeroBeforeSync && pShm->ZeroFlagMode != 1)
 		 {
 			 if (BITSET(sync_zero[byte], i)) //GLC added 3/8/05
 			 {
@@ -10207,10 +10331,18 @@ void overhead::ProcessSyncs()
 
 				//----- Zero flag detected -----
 
+ 				 // Zero-flag decision. Standard mode (ZeroFlagMode==0) reads the
+				 // dedicated odd zero bit, byte-for-byte unchanged. Single-sensor mode
+				 // (ZeroFlagMode==1) ignores the zero bit and derives zero from the
+				 // double-pulse timing on this even count bit (self-calibrating).
+                 bool zero_detected = (pShm->ZeroFlagMode == 1)
+                     ? SingleSensorIsZeroTab(ss_last_trolley_tick[i], ss_trolley_interval[i])
+                     : BITSET(sync_zero[byte], i);
+
  				 // Only zero the sync if the grade syncs have already zeroed. This is to prevent misgrading
 				 // in the time period between a scale sync zero and grade sync zero (if the zero flag passes
 				 // the scale before it passes the grade sync).
-                 if (BITSET(sync_zero[byte], i) && (grade_zeroed[0] & grade_zeroed[1])) //RCB test
+                 if (zero_detected && (grade_zeroed[0] & grade_zeroed[1])) //RCB test
                  {
 
 					 // GLC 2/14/05
@@ -10309,8 +10441,14 @@ void overhead::ProcessSyncs()
 //----- Too many shackles, flag error
 
                 // GLC Only report late zeroes on syncs if grade sync has already zeroed or grading is disabled
-				if ((pSyncStat->shackleno > pShm->sys_set.Shackles) && grade_zeroed[0] && grade_zeroed[1])
+                // Single-sensor: the marked trolley's body pulse counts (shackleno -> Shackles+1)
+                // BEFORE its tab pulse resets it, so tolerate one overshoot; the tab does the zero.
+                int shackleLimit = pShm->sys_set.Shackles + (pShm->ZeroFlagMode == 1 ? 1 : 0);
+				if ((pSyncStat->shackleno > shackleLimit) && grade_zeroed[0] && grade_zeroed[1])
                 {
+                     // Single-sensor: throttle these warnings (>= ~30s apart across all
+                     // syncs) so imperfect tab timing can never flood the host UI.
+                     if (SingleSensorWarnOk())
                      {
                         sprintf(app_err_buf,"Zero Flag NOT Detected. %s shackle %d expected %d\n",
 							sync_desc[i], pSyncStat->shackleno, pShm->sys_set.Shackles); //GLC added 2/14/05
@@ -11344,7 +11482,16 @@ shm_info tbl[ALL_SHM_IDS] = {
 	COMVER,		_char,					sizeof(app->pShm->comm_ver),					MAXVERINFO,		(void*) &app->pShm->comm_ver,					"Comm Version",			NO_GROUP,
 	// --- Power-loss auto-shutdown (host-pushed; ids 94/95 sit in the spare ALL_SHM_IDS slots, > MAXIDS so not saved/iterated) ---
 	94,			_int,					sizeof(app->pShm->AutoShutdownEnabled),			1,				(void*) &app->pShm->AutoShutdownEnabled,		"AutoShutdownEnabled",	NO_GROUP,
-	95,			_int,					sizeof(app->pShm->ShutdownDelaySecs),			1,				(void*) &app->pShm->ShutdownDelaySecs,			"ShutdownDelaySecs",	NO_GROUP
+	95,			_int,					sizeof(app->pShm->ShutdownDelaySecs),			1,				(void*) &app->pShm->ShutdownDelaySecs,			"ShutdownDelaySecs",	NO_GROUP,
+	// --- Single-sensor zero-flag mode (host-pushed). The natural shmID 81 (the
+	// ZeroFlagMode field's own slot) sits inside the read-only ZERO_CTR..GRD_SHKL
+	// status range, so host SHM_WRITEs to 81 are rejected by ProcessMbxMsg. Deliver
+	// over id 96 instead — a spare ALL_SHM_IDS slot (> MAXIDS, like 94/95) that
+	// passes the VALID_IDS gate — aliased to the same &ZeroFlagMode field. ---
+	96,			_int,					sizeof(app->pShm->ZeroFlagMode),				1,				(void*) &app->pShm->ZeroFlagMode,				"ZeroFlagMode(wr)",		NO_GROUP,
+	// --- Single-sensor zero-flag tab window (host-pushed ms; spare ALL_SHM_IDS slots) ---
+	97,			_int,					sizeof(app->pShm->ZeroTabWindowMinMs),			1,				(void*) &app->pShm->ZeroTabWindowMinMs,			"ZeroTabWindowMinMs",	NO_GROUP,
+	98,			_int,					sizeof(app->pShm->ZeroTabWindowMaxMs),			1,				(void*) &app->pShm->ZeroTabWindowMaxMs,			"ZeroTabWindowMaxMs",	NO_GROUP
 };
 
 fsave_grp grp_tbl[MAX_GROUPS] = {

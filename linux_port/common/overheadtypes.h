@@ -528,6 +528,13 @@ typedef struct
                // interface. Zero-initialized => feature OFF by default.
                BOOL                 AutoShutdownEnabled;
                int                  ShutdownDelaySecs;
+
+               // --- Single-sensor zero-flag tab window (host-pushed, ms). A second
+               // count edge whose gap after the trolley edge falls in
+               // [ZeroTabWindowMinMs, ZeroTabWindowMaxMs] is the zero TAB. Appended
+               // at struct end so existing offsets do not shift. SandCat/Linux only.
+               int                  ZeroTabWindowMinMs;
+               int                  ZeroTabWindowMaxMs;
 } SHARE_MEMORY;
 
 typedef struct

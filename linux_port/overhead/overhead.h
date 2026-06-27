@@ -84,6 +84,19 @@ public:
     int                 trolly_counters[MAXSYNCS+1];
     __int64             true_shackle_count[MAXSYNCS+1]; //GLC added 2/14/05 for detailed late zero message
     __int64				true_grade_shackle_count[MAXGRADESYNCS+1]; //GLC added 2/14/05 for detailed late zero message
+
+    // ---- Single-sensor zero-flag (ZeroFlagMode==1) double-pulse detector state ----
+    // Competitor-replacement feature (CA/Trinidad): one sensor per sync; the zero
+    // marker is a sheet-metal tab making the count sensor read a *double pulse*
+    // (trolley block -> ~0.4*T gap -> tab block). We derive zero from edge timing.
+    // Tick unit = App_Timer_Main scans (5 ms each). Only used when ZeroFlagMode==1;
+    // ZeroFlagMode==0 (standard two-sensor) never touches this state.
+    __int64             ss_scan_tick;                        // monotonic scan counter (++ once per App_Timer_Main)
+    __int64             ss_last_trolley_tick[MAXSYNCS];      // tick of last confirmed TROLLEY edge (not tab) per count sync
+    __int64             ss_trolley_interval[MAXSYNCS];       // running EMA of trolley-to-trolley interval T (ticks)
+    __int64             ss_grade_last_trolley_tick[MAXGRADESYNCS];
+    __int64             ss_grade_trolley_interval[MAXGRADESYNCS];
+    __int64             ss_last_warn_tick; // single-sensor: throttle "Zero Flag NOT Detected" sends to the host
 	int                 weigh_state[MAXSCALES];
     int                 tare_start_shkl;                 // starting shackle for tares
     bool                get_weight_init[MAXSCALES];
@@ -218,6 +231,11 @@ private:
     bool    MissedBirdCheck(int curr_mb, int shackle, int mb_bit_state);
     void    ProcessMbxMsg();
     void    ProcessSyncs();
+    // Single-sensor zero-flag detector: classify one confirmed count edge as the
+    // zero TAB (true) or a normal trolley (false), updating the per-sync timebase.
+    bool    SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval);
+    // Rate-limit "Zero Flag NOT Detected" sends in single-sensor mode (anti-flood).
+    bool    SingleSensorWarnOk();
     void    ProcessWeight();
     void    BatchResetStation();
 	void    RawMode();
