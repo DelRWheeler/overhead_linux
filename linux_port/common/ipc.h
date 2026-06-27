@@ -160,6 +160,10 @@ enum {
 	MASTER_STARTED,				//Master line is running again, retake mastership
 	LAST_BIRD_CLEARED,			//	Sent between lines when they share an InterSystem drop and the last bird for a batch arrives at the drop
 	REMOTE_BATCH_RESET,			//	Sent between lines when they share an InterSystem drop and the remote batch reset button is pressed on one of them
+    // --- Sensor Scope (SandCat/Linux only, host arch-gated). Appended at the END so existing
+    //     IDs do not shift; EPM-19's rtx_source ipc.h is never edited and never sees these. ---
+    SET_SYNC_CAPTURE,			//	332 host->ctrl: start/stop raw-input pulse capture {mode,triggerSync,pre,post}
+    SYNC_CAPTURE_INFO,			//	333 ctrl->host: window of per-scan input bytes + detector event flags
     LAST_APP_MSG
 };
 

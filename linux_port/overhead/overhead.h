@@ -97,6 +97,24 @@ public:
     __int64             ss_grade_last_trolley_tick[MAXGRADESYNCS];
     __int64             ss_grade_trolley_interval[MAXGRADESYNCS];
     __int64             ss_last_warn_tick; // single-sensor: throttle "Zero Flag NOT Detected" sends to the host
+
+    // --- Sensor Scope: raw-input pulse capture (SandCat only; host arch-gated) ---
+    // Sampled in App_Timer_Main every 5 ms; streamed as SYNC_CAPTURE_INFO. One sample =
+    // {sync_in[0], sync_zero[0], switch_in[0], eventFlags}. Process memory only (NOT pShm),
+    // so the interface wire layout / EPM-19 compatibility is unchanged.
+    // eventFlags: 0=none; else 0x40=a zero fired this scan, |0x80 if single-sensor TAB
+    // (else standard zero bit), |0x20 if grade sync; low 3 bits = sync/grade index.
+    enum { SYNC_CAP_MAXSAMPLES = 1500, SYNC_CAP_CHANS = 4 };
+    int                 syncCapMode;         // 0 off, 1 live, 2 trigger-on-zero
+    int                 syncCapTriggerSync;  // sync index to trigger on (-1 = any)
+    int                 syncCapPre;          // samples kept before the trigger
+    int                 syncCapPost;         // samples kept after the trigger
+    unsigned char       syncCapBuf[SYNC_CAP_MAXSAMPLES][SYNC_CAP_CHANS];
+    int                 syncCapHead;         // ring write index
+    int                 syncCapCount;        // valid samples in ring
+    int                 syncCapPostLeft;     // remaining post-trigger samples
+    bool                syncCapTriggered;    // armed -> triggered latch
+    unsigned char       syncCapEventAccum;   // detector event flags for the current scan
 	int                 weigh_state[MAXSCALES];
     int                 tare_start_shkl;                 // starting shackle for tares
     bool                get_weight_init[MAXSCALES];
@@ -236,6 +254,10 @@ private:
     bool    SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval);
     // Rate-limit "Zero Flag NOT Detected" sends in single-sensor mode (anti-flood).
     bool    SingleSensorWarnOk();
+    // Sensor Scope capture (SandCat only): append a scan sample + drive streaming.
+    void    SyncCaptureScan();
+    void    SyncCaptureSend(int windowLen, int triggerIdx);
+    void    SetSyncCapture(int mode, int triggerSync, int pre, int post);
     void    ProcessWeight();
     void    BatchResetStation();
 	void    RawMode();

@@ -1765,6 +1765,17 @@ void overhead::InitLocals()
     // Single-sensor zero-flag detector timebase (ZeroFlagMode==1 only)
     ss_scan_tick = 0;
     ss_last_warn_tick = -100000;  // allow the first warning immediately
+
+    // Sensor Scope capture off until the host enables it
+    syncCapMode = 0;
+    syncCapTriggerSync = -1;
+    syncCapPre = 200;
+    syncCapPost = 200;
+    syncCapHead = 0;
+    syncCapCount = 0;
+    syncCapPostLeft = 0;
+    syncCapTriggered = false;
+    syncCapEventAccum = 0;
     for (i = 0; i < MAXSYNCS; i++)
     {
         ss_last_trolley_tick[i] = 0;
@@ -3885,12 +3896,19 @@ void __stdcall overhead::App_Timer_Main(PVOID addr)
     // Decrement output counters and turn off output
     app->DecCntrlCtrs();
 
+    // Sensor Scope: clear this scan's detector-event flags before sync processing
+    // sets them, so SyncCaptureScan (after ProcessSyncs) records a fresh value.
+    app->syncCapEventAccum = 0;
+
     //grade sync and count error handling
     if (app->pShm->sys_set.Grading) app->GradeSyncs();
 
     //  Main sync processing routine
     //  Keep ProcessSyncs before switch statement
     app->ProcessSyncs();
+
+    // Sensor Scope: append this scan's raw inputs + event flags (no-op when off)
+    app->SyncCaptureScan();
 
     // Test Fire Drops (Delphi FireDrops): fire the kicker here — AFTER
     // DecCntrlCtrs() and in the same part of the scan as production drops
@@ -4823,6 +4841,13 @@ void overhead::ProcessMbxMsg()
             }
             break;
 
+        case SET_SYNC_CAPTURE:           // Sensor Scope: {mode, triggerSync, pre, post}
+            {
+                int *p = (int*) &MbMsg->gen.data;
+                SetSyncCapture(p[0], p[1], p[2], p[3]);
+            }
+            break;
+
 //----- These cases below are for testing without a host. The messages can be redirected
 //      to self and responses will be generated here.
 
@@ -5705,6 +5730,106 @@ bool overhead::SingleSensorWarnOk()
 }
 
 //--------------------------------------------------------
+//  Sensor Scope raw-input capture (SandCat only; host arch-gated)
+//
+//  SetSyncCapture handles the SET_SYNC_CAPTURE command; SyncCaptureScan appends one
+//  5 ms sample and drives streaming; SyncCaptureSend linearizes the ring tail and
+//  emits a SYNC_CAPTURE_INFO window. All process-memory only -- no pShm/struct change,
+//  so the interface wire format and EPM-19 compatibility are untouched.
+//--------------------------------------------------------
+void overhead::SetSyncCapture(int mode, int triggerSync, int pre, int post)
+{
+    if (mode < 0 || mode > 2) mode = 0;
+    if (pre  < 1) pre  = 1;
+    if (post < 1) post = 1;
+    if (pre + post > SYNC_CAP_MAXSAMPLES) post = SYNC_CAP_MAXSAMPLES - pre;
+    syncCapMode        = mode;
+    syncCapTriggerSync = triggerSync;
+    syncCapPre         = pre;
+    syncCapPost        = post;
+    syncCapHead        = 0;
+    syncCapCount       = 0;
+    syncCapPostLeft    = 0;
+    syncCapTriggered   = false;
+}
+
+void overhead::SyncCaptureScan()
+{
+    if (syncCapMode == 0) return;
+
+    // append this scan's raw inputs + the detector's event flags for the scan
+    syncCapBuf[syncCapHead][0] = (unsigned char) sync_in[0];
+    syncCapBuf[syncCapHead][1] = (unsigned char) sync_zero[0];
+    syncCapBuf[syncCapHead][2] = (unsigned char) switch_in[0];
+    syncCapBuf[syncCapHead][3] = syncCapEventAccum;
+    syncCapHead = (syncCapHead + 1) % SYNC_CAP_MAXSAMPLES;
+    if (syncCapCount < SYNC_CAP_MAXSAMPLES) syncCapCount++;
+
+    bool zeroFired = (syncCapEventAccum & 0x40) != 0;
+    int  evtSync   = syncCapEventAccum & 0x07;
+
+    if (syncCapMode == 2)                    // trigger-on-zero
+    {
+        if (!syncCapTriggered)
+        {
+            if (zeroFired && (syncCapTriggerSync < 0 || evtSync == syncCapTriggerSync))
+            {
+                syncCapTriggered = true;
+                syncCapPostLeft  = syncCapPost;
+            }
+        }
+        else if (--syncCapPostLeft <= 0)
+        {
+            int windowLen = syncCapPre + syncCapPost;
+            if (windowLen > syncCapCount) windowLen = syncCapCount;
+            SyncCaptureSend(windowLen, windowLen - syncCapPost);  // trigger at pre offset
+            syncCapTriggered = false;
+            syncCapHead = 0; syncCapCount = 0; // re-arm fresh
+        }
+    }
+    else if (syncCapMode == 1)               // live continuous: flush ~1 s windows
+    {
+        if (syncCapCount >= 200)
+        {
+            SyncCaptureSend(syncCapCount, -1);
+            syncCapHead = 0; syncCapCount = 0;
+        }
+    }
+}
+
+void overhead::SyncCaptureSend(int windowLen, int triggerIdx)
+{
+    if (!isPShmValid() || windowLen < 1) return;
+    if (windowLen > syncCapCount) windowLen = syncCapCount;
+
+    // linearize the last windowLen samples (oldest->newest) ending at syncCapHead
+    static unsigned char out[16 + SYNC_CAP_MAXSAMPLES * SYNC_CAP_CHANS];
+    int *hdr = (int*) out;
+    hdr[0] = windowLen;
+    hdr[1] = 5;                  // sample period ms
+    hdr[2] = triggerIdx;
+    hdr[3] = SYNC_CAP_CHANS;
+    int start = (syncCapHead - windowLen + SYNC_CAP_MAXSAMPLES) % SYNC_CAP_MAXSAMPLES;
+    unsigned char *p = out + 16;
+    for (int s = 0; s < windowLen; s++)
+    {
+        int idx = (start + s) % SYNC_CAP_MAXSAMPLES;
+        for (int c = 0; c < SYNC_CAP_CHANS; c++) *p++ = syncCapBuf[idx][c];
+    }
+    int len = 16 + windowLen * SYNC_CAP_CHANS;
+
+    if(RtWaitForSingleObject(trc[GPBUFID].mutex, WAIT100MS) != WAIT_OBJECT_0)
+        RtPrintf("Wait failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
+    else
+    {
+        if HOST_OK
+            SendHostMsg( SYNC_CAPTURE_INFO, NULL, (BYTE*) out, len );
+        if(!RtReleaseMutex(trc[GPBUFID].mutex))
+            RtPrintf("Release failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
+    }
+}
+
+//--------------------------------------------------------
 //  GradeSyncs
 //
 // The following block is needed for grade sync and count error
@@ -5753,6 +5878,8 @@ void overhead::GradeSyncs()
 
 			if ( grade_zero_detected )
 			{
+				// Sensor Scope: mark a grade zero/tab for the scope overlay
+				syncCapEventAccum = 0x40 | 0x20 | (pShm->ZeroFlagMode == 1 ? 0x80 : 0) | (GradeSyncIndex & 0x07);
 
 				//RtPrintf("Grade zero\n");
 				//GLC added 2/15/05
@@ -5891,6 +6018,8 @@ void overhead::GradeSyncs()
 
 				if ( grade_zero_detected )
 				{
+					// Sensor Scope: mark a grade zero/tab for the scope overlay
+					syncCapEventAccum = 0x40 | 0x20 | (pShm->ZeroFlagMode == 1 ? 0x80 : 0) | (GradeSyncIndex & 0x07);
 
 					//GLC added 2/15/05
 					if ((pShm->grade_shackle[GradeSyncIndex] < true_grade_shackle_count[GradeSyncIndex]) &&
@@ -7702,6 +7831,16 @@ int overhead::SendHostMsg( int cmd, int var, BYTE *data, int len)
 
                 //RtPrintf("\nWeight read1 %d read2 %d samples %d\n",
                 //          *rd1,*rd2, ((len/4) - 2) );
+
+            }
+            break;
+
+        case SYNC_CAPTURE_INFO:   // Sensor Scope: same generic payload copy as LC capture
+
+            {
+                for (i = 0; i < len; i++ )
+                    pappMsg->gen.data[i] = data[i];
+                pappMsg->gen.hdr.len = len;
 /*
                 // the loop is just debug (NEEDS UPDATING, now has 4 read indexes
                 for (i = 0; i < ((len/4) - 2); i++ )
@@ -10344,6 +10483,8 @@ void overhead::ProcessSyncs()
 				 // the scale before it passes the grade sync).
                  if (zero_detected && (grade_zeroed[0] & grade_zeroed[1])) //RCB test
                  {
+                     // Sensor Scope: mark a zero/tab on this sync for the scope overlay
+                     syncCapEventAccum = 0x40 | (pShm->ZeroFlagMode == 1 ? 0x80 : 0) | (i & 0x07);
 
 					 // GLC 2/14/05
 					 // If this sync has already zeroed before, show late or early zero flag if applicable
