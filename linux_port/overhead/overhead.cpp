@@ -9008,7 +9008,7 @@ void overhead::GradeProcess(int GradeSyncIndex)
         if ((grade_bit[i] != NULL) && (pShm->sys_set.GradeArea[grade_index[i]].GradeSyncUsed == GradeSyncIndex))
         {
             shackle = RingSub(pShm->grade_shackle[GradeSyncIndex],
-                              pShm->sys_set.GradeArea[grade_index[i]].offset,
+                              pShm->sys_set.GradeArea[grade_index[i]].offset + pShm->ScaleSyncOffset,
                               pShm->sys_set.Shackles);
 
             //I added the three elements to the if statement below because:
@@ -9053,7 +9053,7 @@ void overhead::GradeProcess(int GradeSyncIndex)
 		if (pShm->sys_set.GradeArea[grade_index[MAXGRADES - 1]].GradeSyncUsed == GradeSyncIndex)
 		{
 			shackle = RingSub(pShm->grade_shackle[GradeSyncIndex],
-				pShm->sys_set.GradeArea[grade_index[MAXGRADES - 1]].offset - 2,
+				pShm->sys_set.GradeArea[grade_index[MAXGRADES - 1]].offset - 2 + pShm->ScaleSyncOffset,
 				pShm->sys_set.Shackles);
 
 			pShm->ShackleStatus[shackle].GradeIndex[0] = 0; // added 3/16/2006 LATER-J
@@ -10750,7 +10750,7 @@ void overhead::ProcessSyncs()
                         {
                             // Get the Drop location based on this shackle
                             shk = RingSub(pSyncStat->shackleno,
-                                          pShm->sys_set.DropSettings[j-1].Offset,
+                                          pShm->sys_set.DropSettings[j-1].Offset + pShm->ScaleSyncOffset,
                                           pShm->sys_set.Shackles);
 
 //----- Test fire drop
@@ -10881,7 +10881,7 @@ void overhead::ProcessSyncs()
                     {
                         if ( i == pShm->sys_set.MBSync[k] + 1)
                         {
-                           shk = RingSub(pSyncStat->shackleno, pShm->sys_set.MBOffset[k], pShm->sys_set.Shackles);
+                           shk = RingSub(pSyncStat->shackleno, pShm->sys_set.MBOffset[k] + pShm->ScaleSyncOffset, pShm->sys_set.Shackles);
                            temp = ~RtReadPortUchar(PCM_3724_1_PORT_C0);
 						   //show GradeIndex before next call jdc
 //RtPrintf("GradeIndex = %d; shackle = %d\n",pShm->ShackleStatus[pSyncStat->shackleno].GradeIndex[0], pSyncStat->shackleno);
@@ -11632,7 +11632,9 @@ shm_info tbl[ALL_SHM_IDS] = {
 	96,			_int,					sizeof(app->pShm->ZeroFlagMode),				1,				(void*) &app->pShm->ZeroFlagMode,				"ZeroFlagMode(wr)",		NO_GROUP,
 	// --- Single-sensor zero-flag tab window (host-pushed ms; spare ALL_SHM_IDS slots) ---
 	97,			_int,					sizeof(app->pShm->ZeroTabWindowMinMs),			1,				(void*) &app->pShm->ZeroTabWindowMinMs,			"ZeroTabWindowMinMs",	NO_GROUP,
-	98,			_int,					sizeof(app->pShm->ZeroTabWindowMaxMs),			1,				(void*) &app->pShm->ZeroTabWindowMaxMs,			"ZeroTabWindowMaxMs",	NO_GROUP
+	98,			_int,					sizeof(app->pShm->ZeroTabWindowMaxMs),			1,				(void*) &app->pShm->ZeroTabWindowMaxMs,			"ZeroTabWindowMaxMs",	NO_GROUP,
+	// --- Scale sync offset (host-pushed signed int; spare slot 99, > MAXIDS so not saved) ---
+	99,			_int,					sizeof(app->pShm->ScaleSyncOffset),				1,				(void*) &app->pShm->ScaleSyncOffset,			"ScaleSyncOffset",		NO_GROUP
 };
 
 fsave_grp grp_tbl[MAX_GROUPS] = {

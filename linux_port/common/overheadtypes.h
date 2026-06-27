@@ -535,6 +535,13 @@ typedef struct
                // at struct end so existing offsets do not shift. SandCat/Linux only.
                int                  ZeroTabWindowMinMs;
                int                  ZeroTabWindowMaxMs;
+
+               // --- Scale sync offset (host-pushed, signed, normally 0/-1/-2/-3). The
+               // trolleys between the scale sync sensor and the weigh deck. Added into
+               // the drop/grade/missed-bird fire offsets so drop offsets are counted
+               // from 0 instead of baked-in. 0 = legacy (offsets carry it themselves).
+               // Appended at struct end so existing offsets do not shift. SandCat only. ---
+               int                  ScaleSyncOffset;
 } SHARE_MEMORY;
 
 typedef struct

@@ -504,7 +504,9 @@ enum {
 
 #define MAXDBGIDS           5
 #define MAXIDS              93 //83 //GLC 79 //76
-#define ALL_SHM_IDS         MAXIDS + MAX_GROUPS
+// +1 spare host-push slot (id 99) for ScaleSyncOffset; the 5 from MAX_GROUPS (ids
+// 94-98) are taken by power-loss + single-sensor. Does NOT add a save group.
+#define ALL_SHM_IDS         (MAXIDS + MAX_GROUPS + 1)
 
 enum {
     _int,
