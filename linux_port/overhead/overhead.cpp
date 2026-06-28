@@ -6180,6 +6180,11 @@ void overhead::ProcessWeight()
 
             WEIGH_SHACKLE(i, pShm).weight[i] -= (__int64) pShm->AutoBias[i];
 
+            // Auto-Cal: is this the reference shackle? (declared before the switch so
+            // it is in scope for both the ModeRun monitor call and the FindDrops omit.)
+            int  acRefShk = pShm->AutoCalRefShackle > 0 ? pShm->AutoCalRefShackle : AUTOCAL_REF_SHACKLE;
+            bool acIsRef  = pShm->AutoCalEnable && (pShm->WeighShackle[i] == acRefShk);
+
             switch(pShm->OpMode)
             {
               case ModeATare1:
@@ -6242,6 +6247,15 @@ void overhead::ProcessWeight()
                        WEIGH_SHACKLE(i, pShm).weight[i] += (__int64) spn_bias;
                    }
 
+                   // Auto-Calibration (Part 2): when the permanent reference shackle
+                   // (pinned by observation; default trolley 1 == shackleno 2) is
+                   // weighed, verify span vs its known weight and slowly trim SpanBias
+                   // for genuine gain drift only. The reference is monitored here and
+                   // OMITTED from FindDrops below so its known weight is never dropped
+                   // as a phantom bird.
+                   if (acIsRef)
+                       AutoCalMonitor(i, WEIGH_SHACKLE(i, pShm).weight[i]);
+
 //----- Find a drop
 
                    //RtPrintf("WBird Weight %ld\n", WEIGH_SHACKLE(i, pShm).weight[i] );
@@ -6255,7 +6269,10 @@ void overhead::ProcessWeight()
                        config_Ok )
                   {
                         cfg_err_sent = false;
-                        FindDrops(i+1);
+                        // Auto-Cal: the reference shackle carries a permanent known
+                        // weight, not a bird — never assign it to a drop or count it.
+                        if (!acIsRef)
+                            FindDrops(i+1);
                   }
                   else
                   {
@@ -6674,7 +6691,17 @@ void overhead::AutoTare ( int s )
 		case 3:
 		case 4:
 
-			if (pShm->AutoTareStep == 1)
+			// Auto-Cal Part 1: the reference shackle (trolley 1 == shackleno 2) is
+			// NOT tared. Average its (raw - AutoBias) reading here instead, so at
+			// completion we set SpanBias from it vs the entered known weight. This
+			// folds the morning Auto Span into Calibrate Shackle Tares.
+			if (pShm->AutoCalEnable && pShm->WeighShackle[s] == AUTOCAL_REF_SHACKLE)
+			{
+				TARE_SHACKLE(s, pShm) = 0;
+				if (pShm->AutoTareStep == 1) { autocal_ref_accum[s] = wt; autocal_ref_cnt[s] = 1; }
+				else                         { autocal_ref_accum[s] += wt; autocal_ref_cnt[s]++; }
+			}
+			else if (pShm->AutoTareStep == 1)
 			{
 				// 1st read, just set tare = raw weight
 				TARE_SHACKLE(s, pShm) = wt;
@@ -6688,6 +6715,25 @@ void overhead::AutoTare ( int s )
 				// Done, calculate average and go back to run mode
 				if (pShm->sys_set.TareTimes == pShm->AutoTareStep)
 				{
+					if (pShm->AutoCalEnable && pShm->WeighShackle[s] == AUTOCAL_REF_SHACKLE)
+					{
+						// Set SpanBias from the averaged reference reading vs known:
+						// avg_ref * (1 + span/1000) == known => span = 1000*(known/avg_ref - 1)
+						__int64 avg_ref = autocal_ref_cnt[s] > 0 ? autocal_ref_accum[s] / autocal_ref_cnt[s] : 0;
+						__int64 known   = pShm->AutoCalKnownWeight;
+						if (avg_ref > 0 && known > 0)
+						{
+							double  spd  = 1000.0 * ((double) known / (double) avg_ref - 1.0);
+							__int64 span = (__int64)(spd + (spd >= 0 ? 0.5 : -0.5));
+							pShm->scl_set.SpanBias[s]    = span;
+							pShm->AutoCalSpanBaseline[s] = span;   // clamp anchor for Part 2
+							pShm->AutoCalAlarm[s]        = 0;
+							fsave_grp_tbl[shm_tbl[SCL_SET-1].group].changed = true;
+							fsave_grp_tbl[shm_tbl[SCL_SET-1].group].loaded  = true;
+							shm_updates[32-1] = true;
+						}
+					}
+					else
 					TARE_SHACKLE(s, pShm) /= pShm->AutoTareStep;
 					if (pShm->WeighShackle[0] == end_shackle)
 					{
@@ -6756,6 +6802,117 @@ void overhead::AutoTare ( int s )
                                  (int)TARE_SHACKLE(s, pShm));
             strcat((char*) &trc_buf[MAINBUFID], (char*) &tmp_trc_buf[MAINBUFID] );
         //}
+    }
+}
+
+//--------------------------------------------------------
+//  AutoCalMonitor  (Auto-Calibration Part 2)
+//
+//  Called once per revolution when the reference shackle (trolley 1 ==
+//  shackleno 2, welded to a permanent known weight) is weighed in ModeRun.
+//  final_ref is the fully processed weight: (raw - AutoBias - tare) * (1 +
+//  SpanBias/1000); the reference shackle has tare 0, and AutoBias has already
+//  removed load-cell ZERO/offset drift -- so any residual vs the known weight
+//  is GENUINE GAIN error. We trim SpanBias slowly toward it, never chasing
+//  offset drift (the safety crux, see docs/AUTO_CALIBRATION.md).
+//
+//  Guards: zero must be active; reference must be present; outliers rejected;
+//  deadband; slow integral; hard clamp vs the AutoTare baseline with
+//  alarm-and-HOLD beyond it (weight shifted/fell, cell dying -> do not chase).
+//--------------------------------------------------------
+
+// Conservative internal tuning (clamp is host-tunable; these stay fixed).
+#define AUTOCAL_DEADBAND_PPT   5      // ignore |error| below 0.5% (no chase on noise)
+#define AUTOCAL_OUTLIER_PCT    10     // discard a reading >10% off known (swing/transient)
+#define AUTOCAL_MISSING_PCT    50     // below 50% of known => weight gone -> alarm, no trim
+#define AUTOCAL_INTEGRAL_DIV   16     // move 1/16 of the gap per accepted sample (slow)
+
+void overhead::AutoCalMonitor(int s, __int64 final_ref)
+{
+    __int64 known = pShm->AutoCalKnownWeight;
+    if (known <= 0) return;                              // not configured yet
+
+    int     clamp_ppt = pShm->AutoCalClampPpt > 0 ? pShm->AutoCalClampPpt : 20;  // default 2%
+    __int64 baseline  = pShm->AutoCalSpanBaseline[s];
+    // Lazy baseline: if AutoTare-with-autocal has not set one, anchor on current span.
+    if (baseline == 0 && pShm->AutoCalAlarm[s] == 0)
+        baseline = pShm->AutoCalSpanBaseline[s] = pShm->scl_set.SpanBias[s];
+
+    __int64 err     = final_ref - known;                 // signed gain residual (offset already gone)
+    __int64 abs_err = err < 0 ? -err : err;
+    __int64 err_ppt = (err * 1000) / known;              // residual in parts-per-thousand
+    bool    adjusted = false;
+    int     flag = 0;    // 0 ok / 1 held / 2 zero-off / 3 weight-missing / 4 outlier(reject)
+
+    // --- Sanity gates: set a flag, skip the trim, but still log the crossing -
+    if (!pShm->WeighZero[s])
+        flag = 2;                                        // zero bias not active
+    else if (final_ref < (known * AUTOCAL_MISSING_PCT) / 100)
+        flag = 3;                                        // reference weight gone
+    else if (abs_err > (known * AUTOCAL_OUTLIER_PCT) / 100)
+        flag = 4;                                        // outlier (swing/transient) -> reject
+    else if (err_ppt > AUTOCAL_DEADBAND_PPT || err_ppt < -AUTOCAL_DEADBAND_PPT)
+    {
+        // Good in-band reading outside the deadband -> trim span toward target.
+        // Back out the pre-span value, then the SpanBias that makes final_ref==known:
+        //   final_ref = pre * (1000 + span)/1000.
+        __int64 cur_span = pShm->scl_set.SpanBias[s];
+        double  pre      = (double) final_ref * 1000.0 / (double)(1000 + cur_span);
+        double  target   = 1000.0 * ((double) known / pre - 1.0);   // target SpanBias (ppt)
+        double  next     = (double) cur_span + (target - (double) cur_span) / AUTOCAL_INTEGRAL_DIV;
+        __int64 new_span = (__int64) (next + (next >= 0 ? 0.5 : -0.5));
+
+        // Hard clamp vs baseline; alarm-and-HOLD if it wants to exceed (do not chase).
+        __int64 lo = baseline - clamp_ppt, hi = baseline + clamp_ppt;
+        if      (new_span > hi) { new_span = hi; flag = 1; }
+        else if (new_span < lo) { new_span = lo; flag = 1; }
+
+        if (new_span != cur_span)
+        {
+            pShm->scl_set.SpanBias[s] = new_span;
+            // persist (SCL group writes to disk) + notify host of the span change
+            fsave_grp_tbl[shm_tbl[SCL_SET-1].group].changed = true;
+            fsave_grp_tbl[shm_tbl[SCL_SET-1].group].loaded  = true;
+            shm_updates[32-1] = true;
+            adjusted = true;
+        }
+    }
+
+    // Alarm state mirrors the flag (outlier=4 is transient, leave prior alarm).
+    int prev_alarm = pShm->AutoCalAlarm[s];
+    if (flag != 4) pShm->AutoCalAlarm[s] = flag;         // 0/1/2/3
+    // Raise a host warning on a NEW hold/zero-off/missing (rides existing ERROR_MSG channel).
+    if (pShm->AutoCalAlarm[s] != 0 && pShm->AutoCalAlarm[s] != prev_alarm && flag != 4)
+    {
+        const char* why = pShm->AutoCalAlarm[s] == 1 ? "span clamp hold" :
+                          pShm->AutoCalAlarm[s] == 2 ? "zero bias off"   : "reference weight missing";
+        sprintf(app_err_buf, "Auto-Cal scale %d: %s (span held at %ld)\n",
+                s + 1, why, (long) pShm->scl_set.SpanBias[s]);
+        GenError(warning, app_err_buf);
+    }
+
+    // Emit one reading record per crossing (auto_cal_log feed). Flat __int64[9] so
+    // there is no 32/64-bit struct-packing ambiguity; the host parses by fixed offset.
+    __int64 rec[9];
+    rec[0] = this_lineid;
+    rec[1] = s;                                          // scale 0/1
+    rec[2] = final_ref;                                  // measured (internal counts)
+    rec[3] = known;                                      // known weight (internal counts)
+    rec[4] = err_ppt;                                    // residual ppt
+    rec[5] = pShm->scl_set.SpanBias[s];                  // span after this sample
+    rec[6] = pShm->AutoBias[s];                          // zero bias (context)
+    rec[7] = adjusted ? 1 : 0;
+    rec[8] = flag;
+    if (HOST_OK)
+        SendHostMsg(AUTO_CAL_REC, 0, (BYTE*) rec, sizeof(rec));
+
+    if( (!trc[MAINBUFID].buffer_full) && (TraceMask & _AUTOZ_) )
+    {
+        sprintf((char*) &tmp_trc_buf[MAINBUFID],
+            "AutoCal\tscl\t%d\tref\t%ld\tknown\t%ld\terr_ppt\t%ld\tspan\t%ld\tbase\t%ld\tadj\t%d\tflag\t%d\n",
+            s, (long) final_ref, (long) known, (long) err_ppt,
+            (long) pShm->scl_set.SpanBias[s], (long) baseline, adjusted ? 1 : 0, flag);
+        strcat((char*) &trc_buf[MAINBUFID], (char*) &tmp_trc_buf[MAINBUFID]);
     }
 }
 
@@ -7835,6 +7992,7 @@ int overhead::SendHostMsg( int cmd, int var, BYTE *data, int len)
             }
             break;
 
+        case AUTO_CAL_REC:        // Auto-Cal: flat __int64[9] reading record, generic payload copy
         case SYNC_CAPTURE_INFO:   // Sensor Scope: same generic payload copy as LC capture
 
             {
@@ -8218,6 +8376,18 @@ bool overhead::AssignDrop(int scale, int drop, TShackleStatus* pShk )
 //	TShackleStatus    *pShk;	RED replaced with passed in parameter
     int  drop_plus1 = drop + 1;
 //    bool bch_stat   = false;	RED - Removed because not referenced
+
+//----- Auto-Cal: the reference shackle carries a permanent known weight, not a
+//      bird. This is the single chokepoint for ALL drop assignment (local AND
+//      intersystems via the drop manager, plus gib/grade drops), so guarding
+//      here guarantees the reference is never assigned to a drop, counted as a
+//      bird (AddBird), batched, or dropped downstream. Omitted only when the
+//      feature is on; default behavior is byte-identical when off.
+    {
+        int acRefShk = pShm->AutoCalRefShackle > 0 ? pShm->AutoCalRefShackle : AUTOCAL_REF_SHACKLE;
+        if (pShm->AutoCalEnable && pShm->WeighShackle[scale] == acRefShk)
+            return false;
+    }
 
 //----- Short cuts
 
@@ -11634,7 +11804,12 @@ shm_info tbl[ALL_SHM_IDS] = {
 	97,			_int,					sizeof(app->pShm->ZeroTabWindowMinMs),			1,				(void*) &app->pShm->ZeroTabWindowMinMs,			"ZeroTabWindowMinMs",	NO_GROUP,
 	98,			_int,					sizeof(app->pShm->ZeroTabWindowMaxMs),			1,				(void*) &app->pShm->ZeroTabWindowMaxMs,			"ZeroTabWindowMaxMs",	NO_GROUP,
 	// --- Scale sync offset (host-pushed signed int; spare slot 99, > MAXIDS so not saved) ---
-	99,			_int,					sizeof(app->pShm->ScaleSyncOffset),				1,				(void*) &app->pShm->ScaleSyncOffset,			"ScaleSyncOffset",		NO_GROUP
+	99,			_int,					sizeof(app->pShm->ScaleSyncOffset),				1,				(void*) &app->pShm->ScaleSyncOffset,			"ScaleSyncOffset",		NO_GROUP,
+	// --- Auto-Calibration (host-pushed; spare slots 100/101/102, > MAXIDS so not saved) ---
+	AUTOCAL_ENABLE,		_int,			sizeof(app->pShm->AutoCalEnable),				1,				(void*) &app->pShm->AutoCalEnable,				"AutoCalEnable",		NO_GROUP,
+	AUTOCAL_KNOWN_WT,	___int64,		sizeof(app->pShm->AutoCalKnownWeight),			1,				(void*) &app->pShm->AutoCalKnownWeight,			"AutoCalKnownWeight",	NO_GROUP,
+	AUTOCAL_CLAMP,		_int,			sizeof(app->pShm->AutoCalClampPpt),				1,				(void*) &app->pShm->AutoCalClampPpt,			"AutoCalClampPpt",		NO_GROUP,
+	AUTOCAL_REFSHK_ID,	_int,			sizeof(app->pShm->AutoCalRefShackle),			1,				(void*) &app->pShm->AutoCalRefShackle,			"AutoCalRefShackle",	NO_GROUP
 };
 
 fsave_grp grp_tbl[MAX_GROUPS] = {

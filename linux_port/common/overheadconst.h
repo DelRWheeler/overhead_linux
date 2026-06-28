@@ -504,9 +504,18 @@ enum {
 
 #define MAXDBGIDS           5
 #define MAXIDS              93 //83 //GLC 79 //76
-// +1 spare host-push slot (id 99) for ScaleSyncOffset; the 5 from MAX_GROUPS (ids
-// 94-98) are taken by power-loss + single-sensor. Does NOT add a save group.
-#define ALL_SHM_IDS         (MAXIDS + MAX_GROUPS + 1)
+// Spare host-push slots above MAXIDS (do NOT add save groups; > MAXIDS so not
+// iterated/saved): the 5 from MAX_GROUPS = ids 94-98 (power-loss 94/95,
+// single-sensor 96/97/98), then +1 = id 99 (ScaleSyncOffset), then +4 more =
+// ids 100/101/102/103 for Auto-Calibration (enable / known-weight / clamp / ref-shackle).
+#define ALL_SHM_IDS         (MAXIDS + MAX_GROUPS + 5)
+
+// Auto-Calibration host-pushed settings (spare shmIDs, SandCat only)
+#define AUTOCAL_ENABLE      100   // int  AutoCalEnable (0/1, per line)
+#define AUTOCAL_KNOWN_WT    101   // __int64 AutoCalKnownWeight (internal weight units)
+#define AUTOCAL_CLAMP       102   // int  AutoCalClampPpt (ppt, default 20 = 2%)
+#define AUTOCAL_REFSHK_ID   103   // int  AutoCalRefShackle (reference shackle no, host-pushed)
+#define AUTOCAL_REF_SHACKLE 2     // default reference shackle = trolley 1 = shackleno 2 (pinned by observation)
 
 enum {
     _int,

@@ -542,6 +542,19 @@ typedef struct
                // from 0 instead of baked-in. 0 = legacy (offsets carry it themselves).
                // Appended at struct end so existing offsets do not shift. SandCat only. ---
                int                  ScaleSyncOffset;
+
+               // --- Auto-Calibration (continuous span verify vs a permanent welded
+               // known weight on the reference shackle = trolley 1 = shackleno 2).
+               // SandCat/Linux only; competitor-parity, deletes the morning Auto Span.
+               // Appended at struct end so existing offsets do not shift. Host-pushed
+               // fields (Enable/KnownWeight/ClampPpt) ride spare shmIDs 100/101/102;
+               // the rest are controller-owned state. See docs/AUTO_CALIBRATION.md. ---
+               int                  AutoCalEnable;                 // 0=off (Auto Span normal), 1=on (per line)
+               int                  AutoCalRefShackle;             // reference shackle no (pinned by observation, 0=>default 2). Monitored for span + OMITTED from drop assignment.
+               __int64              AutoCalKnownWeight;            // expected final_ref in internal weight units (host converts lbs)
+               int                  AutoCalClampPpt;               // max |SpanBias - baseline| allowed, parts-per-thousand (default 20 = 2%)
+               __int64              AutoCalSpanBaseline[MAXSCALES];// SpanBias captured at AutoTare; clamp reference (controller-owned)
+               int                  AutoCalAlarm[MAXSCALES];       // 0=ok 1=held(clamp) 2=zero-bias-off 3=weight-missing (controller-owned)
 } SHARE_MEMORY;
 
 typedef struct

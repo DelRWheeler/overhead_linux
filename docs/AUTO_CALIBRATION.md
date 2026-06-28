@@ -1,5 +1,72 @@
 # Auto-Calibration (continuous span verify against a permanent known weight)
 
+Status: **ALL 3 PHASES implemented + RIG-PROVEN on the single-line SandCat (line 1, .11), 2026-06-28.**
+End-to-end verified: the reference reading flows controller `AutoCalMonitor` -> `AUTO_CAL_REC`
+(cmd 334) -> rebuilt interface relay -> host parse -> `auto_cal_log`; the reference reads on the
+right shackle (`measured 5.04 lb, flag=0`) and is OMITTED from drops (0 phantom drops). Remaining:
+deploy to line 2 (.12), the offset-vs-gain drift demonstration, and the full span-convergence soak.
+
+## Reference-shackle mapping + drop omission (LEARNED ON THE RIG 2026-06-28 — read carefully)
+- **The reference is shackle 2 = Trolley 1** (Trolley 0 = the empty zero/check trolley = shackle 1;
+  the known weight rides the very next trolley = Trolley 1 = shackle 2). The zero TAB is on Trolley 3
+  (= shackle 4, can't hold a shackle). Single-sensor: tab = a double-pulse (trolley pulse + a second
+  blip one trolley-width later); standard: the zero flag spans at most TWO trolleys, never several.
+- **`AutoCalRefShackle` is host-pushed (shmID 103), default 2, pinned by OBSERVATION** (List Weights).
+  The controller monitors it for span AND omits it from drop assignment. NOT derived on paper.
+- **Omission is at the single chokepoint `AssignDrop()`** (overhead.cpp): every path — local
+  `FindDrops`, InterSystems (drop manager / `CHECK_DROP_LOCAL`), and gib/grade drops — funnels
+  through `AssignDrop`, so one guard there guarantees the reference is never assigned a drop,
+  `AddBird`-counted, batched, or dropped downstream. Off by default = byte-identical legacy.
+- **Simulator alignment (siggen, test-tool only):** near the zero flag the siggen pins its sync
+  counter across a ~2-shackle window, so the known weight injected on `refCounter` can bleed onto
+  two shackles. Fixed with a single-shackle latch + a configurable `refSubShackle` (which shackle of
+  the window). On this rig: `refCounter=0, refSubShackle=1` lands the weight on shackle 2.
+  (A leftover `if refCounter==0 {refCounter=1}` in the siggen API was forcing it off shackle 2 — removed.)
+
+(Original status / implementation detail below.)
+
+Status (earlier): **Phase 1 (controller) CORE implemented + compiles (x86_64), 2026-06-28.** NOT deployed,
+NOT committed. Safe to deploy anytime (AutoCalEnable zero-inits to 0 = byte-identical legacy until
+turned on), but pointless until host (enable/known-weight/clamp push) + siggen (inject known weight
+on the reference shackle) land. Remaining in Phase 1: the per-crossing reading-record IPC + pushing
+`AutoCalAlarm` back to the host (overlaps Phase 2's 4-places rule).
+
+## Implementation status (2026-06-28)
+**Controller, `overhead_controller/linux_port` (Phase 1 core, compiles):**
+- Data model: `SHARE_MEMORY` gained `AutoCalEnable` / `AutoCalKnownWeight (__int64)` /
+  `AutoCalClampPpt` (host-pushed) + `AutoCalSpanBaseline[MAXSCALES]` / `AutoCalAlarm[MAXSCALES]`
+  (controller-owned), appended at struct end (no offset shift). New spare shmIDs **100/101/102**
+  (`AUTOCAL_ENABLE/KNOWN_WT/CLAMP`), `ALL_SHM_IDS` `+1`→`+4`, shm_tbl rows (NO_GROUP, not saved —
+  host re-pushes on connect). `AUTOCAL_REF_SHACKLE 2` constant. Class members
+  `autocal_ref_accum/cnt[MAXSCALES]`.
+- **Part 1** (`AutoTare`, overhead.cpp ~6677): when `AutoCalEnable` and the weigh shackle is the
+  reference (shackleno 2), skip its tare (=0) and average its `(raw-AutoBias)` reading; at the
+  averaging-complete step set `SpanBias[s] = 1000*(known/avg_ref - 1)` and capture
+  `AutoCalSpanBaseline[s]` (clamp anchor). Persists SCL group + shmID 32 update.
+- **Part 2** (`AutoCalMonitor`, new; called from `ProcessWeight` ModeRun right after span is
+  applied): `final_ref = (raw-AutoBias)*(1+SpanBias/1000)` for the reference shackle; gates (zero
+  active `WeighZero[s]`; weight present > `MISSING_PCT`); outlier reject (>`OUTLIER_PCT`); deadband
+  (`DEADBAND_PPT`); slow integral toward `target = 1000*(known/pre - 1)` at `1/INTEGRAL_DIV` per
+  accepted sample; hard clamp to `baseline ± AutoCalClampPpt` with **alarm-and-HOLD** beyond; writes
+  + persists SpanBias; sets `AutoCalAlarm[s]` (0 ok / 1 held / 2 zero-off / 3 weight-missing). Trace
+  under `_AUTOZ_`. Tunables: DEADBAND_PPT=5, OUTLIER_PCT=10, MISSING_PCT=50, INTEGRAL_DIV=16.
+
+**UNITS CONTRACT (critical for Phase 2 host push):** `AutoCalKnownWeight` (shmID 101) is in the
+controller's INTERNAL weight units = raw ADC counts after AutoBias (same units as
+`ShackleStatus.weight`), NOT lbs. The host MUST convert the operator's lbs entry:
+`known_counts = lbs * counts_per_pound` (from `loadcell_config`, per line/scale) before pushing.
+Same scaling the rest of the weight pipeline uses (host divides raw by counts-per-pound for lbs).
+
+**Reference-shackle reads 0 in simulation:** `ProcessWeight`/`AutoTare` zero the weight when
+`weight_simulation_mode` is set (the empty-deck sim) — so on the siggen the reference shackle will
+read 0 and Part 1/2 can't see the known weight. Phase 3 (siggen) MUST inject a steady known weight
+on shackleno 2 every rev and the sim path must not zero it. On a real rig with a welded weight this
+is moot.
+
+---
+
+(Original spec below.)
+
 Status: **design / spec, 2026-06-27.** Not started.
 Scope: **SandCat / Linux only** (competitor-replacement feature). EPM-19 keeps working with the
 interface and does NOT get this; the `rtx_source` is never modified. Builds on the **scale sync
