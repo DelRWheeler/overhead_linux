@@ -1780,11 +1780,13 @@ void overhead::InitLocals()
     {
         ss_last_trolley_tick[i] = 0;
         ss_trolley_interval[i]  = 0;
+        ss_trolley_stall[i]     = 0;
     }
     for (i = 0; i < MAXGRADESYNCS; i++)
     {
         ss_grade_last_trolley_tick[i] = 0;
         ss_grade_trolley_interval[i]  = 0;
+        ss_grade_trolley_stall[i]     = 0;
     }
 
     for (i = 0; i < MAXGRADESYNCS; i++)
@@ -5660,7 +5662,7 @@ void overhead::DecCntrlCtrs()
 // measures a full T. Returns true = this edge is the zero tab, false = trolley.
 //--------------------------------------------------------
 
-bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval)
+bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval, int &stall)
 {
     // App_Timer_Main (and thus ss_scan_tick) runs every 5 ms; convert the
     // host-configured ms tab window to scan ticks. Defaults apply until the host
@@ -5688,11 +5690,23 @@ bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval
         return false;                    // -> trolley
     }
 
-    if (delta > interval * 3)            // line was stopped/idle: resync, keep T
+    if (delta > interval * 3)            // oversized gap: genuine stop OR corrupt-small T
     {
+        // A real line stop is a one-off big gap, then normal trolleys resume. But if
+        // oversized gaps PERSIST, the learned T has been corrupted SMALL (a bad seed
+        // from a stop/start), so every real trolley now reads as "stopped", T never
+        // grows, and the zero tab can NEVER fire -> the line silently stops zeroing
+        // until a power cycle. Self-heal: after a few consecutive oversized gaps,
+        // re-seed T from the actual trolley interval so detection recovers on its own.
+        if (++stall >= 4)
+        {
+            interval = delta;            // adopt the real trolley gap as the new T
+            stall = 0;
+        }
         lastTrolleyTick = now;
         return false;                    // -> trolley (do not pollute the EMA)
     }
+    stall = 0;                           // a normally-spaced edge arrived: not stalled
 
     // TAB if the gap is inside the configured ms window AND is a sane fraction of
     // the learned trolley interval (must be well under one trolley — the learned T
@@ -5873,7 +5887,7 @@ void overhead::GradeSyncs()
 			// Standard mode reads the grade zero bit; single-sensor mode derives
 			// the grade zero from the double-pulse timing on the grade count bit.
 			bool grade_zero_detected = (pShm->ZeroFlagMode == 1)
-				? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex])
+				? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex])
 				: BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]);
 
 			if ( grade_zero_detected )
@@ -6013,7 +6027,7 @@ void overhead::GradeSyncs()
 				// Standard mode reads the grade zero bit; single-sensor mode derives
 				// the grade zero from the double-pulse timing on the grade count bit.
 				bool grade_zero_detected = (pShm->ZeroFlagMode == 1)
-					? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex])
+					? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex])
 					: BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]);
 
 				if ( grade_zero_detected )
@@ -10645,7 +10659,7 @@ void overhead::ProcessSyncs()
 				 // (ZeroFlagMode==1) ignores the zero bit and derives zero from the
 				 // double-pulse timing on this even count bit (self-calibrating).
                  bool zero_detected = (pShm->ZeroFlagMode == 1)
-                     ? SingleSensorIsZeroTab(ss_last_trolley_tick[i], ss_trolley_interval[i])
+                     ? SingleSensorIsZeroTab(ss_last_trolley_tick[i], ss_trolley_interval[i], ss_trolley_stall[i])
                      : BITSET(sync_zero[byte], i);
 
  				 // Only zero the sync if the grade syncs have already zeroed. This is to prevent misgrading
