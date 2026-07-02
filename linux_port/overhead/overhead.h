@@ -70,6 +70,7 @@ public:
 
     bool                grade_zeroed[MAXGRADESYNCS];
     bool                grade_armed[MAXGRADESYNCS]; // FLAG TO PREVENT GRADING TWICE
+    int                 grade_debounce[MAXGRADESYNCS]; // SyncOn debounce (mirrors sync_debounce) so the grade single-sensor edge is confirmed once per pulse
     bool                sync_armed[MAXSYNCS];
     bool                dbg_sync_zero_triggered[MAXSYNCS]; // mirror of static local in ProcessSyncs for debug
     bool                dual_scale;
@@ -164,6 +165,8 @@ public:
     __int64             individual_wts [ADCREADSMAX];	 //MAX_ADC_READS];
     __int64             individual_lim;
     int                 capture_period;
+    int                 cap_slowdown;                    // timer-path capture throttle (re-phased each shackle so lead-in sample count is deterministic)
+    int                 capt_avg_slowdown;               // averaging-path capture throttle (subsamples the plateau to the same cadence -> uniform buffer)
     t_capture_info      capt_wt;                         // weight capture for fine tuning reads
     bool                calc_shk2shk_ticks;              // flag to start shk2shk timing
     int                 cur_shk2shk_ticks;               // # of ticks between shackles for w_avg

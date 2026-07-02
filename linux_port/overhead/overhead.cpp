@@ -1793,7 +1793,11 @@ void overhead::InitLocals()
     {
         grade_armed[i]  = false;
         grade_zeroed[i] = false;
+        grade_debounce[i] = pShm->sys_set.SyncOn;
     }
+
+    cap_slowdown      = CAPTURE_SPEED;
+    capt_avg_slowdown = CAPTURE_SPEED;
 
 //----- Weight stuff
 
@@ -4148,8 +4152,18 @@ void overhead::AverageWeight(int scale)
                     if ( (capt_wt.mode  == prod_capt) && (capt_wt.scale == scale + 1) )
                     {
                         w_avg[scale].capt_hold = true;
-                        CAPTURE_WT = wt;
-                        capt_wt.curr_index++;
+                        // Subsample the plateau capture to the SAME 1-per-CAPTURE_SPEED
+                        // cadence the timer path uses for the lead-in/lead-out, so the
+                        // whole buffer is uniformly sampled (buffer index == linear time
+                        // and the red marks line up with the green plateau). The real
+                        // weight average (w_avg above) is untouched -- this only thins
+                        // the display capture.
+                        if ( --capt_avg_slowdown <= 0 )
+                        {
+                            capt_avg_slowdown = CAPTURE_SPEED;
+                            CAPTURE_WT = wt;
+                            capt_wt.curr_index++;
+                        }
                     }
 
                     // Just started, apply first mark
@@ -4309,7 +4323,10 @@ void overhead::AverageWeight(int scale)
 
 void overhead::CaptureLcData()
 {
-    static int cap_slowdown = CAPTURE_SPEED;
+    // cap_slowdown is now a member, re-phased to CAPTURE_SPEED at each shackle sync
+    // (ProcessSyncs) so the number of lead-in samples before the bird arrives is the
+    // same every frame -- the free-running static used to drift it +/-1, which slid
+    // the whole waveform back and forth relative to the fixed measurement lines.
 
 //----- Reset variables if mode changed to no capture.
 
@@ -5878,7 +5895,12 @@ void overhead::GradeSyncs()
 
 		if ( ( BITSET(switch_in[0], GradeSyncBit[GradeSyncIndex]) ) &&
 			grade_armed[GradeSyncIndex] &&
-			gradesync_zero_triggered[GradeSyncIndex] )
+			gradesync_zero_triggered[GradeSyncIndex] &&
+			// Debounce the grade count edge exactly like the scale syncs (ProcessSyncs):
+			// only after the bit has been high SyncOn scans is it a confirmed edge, so
+			// SingleSensorIsZeroTab gets one clean edge per pulse instead of a raw latch
+			// on every transition (which broke the single-sensor double-pulse detection).
+			( grade_debounce[GradeSyncIndex] > 0 ? (--grade_debounce[GradeSyncIndex] == 0) : true ) )
 		{
 			grade_armed[GradeSyncIndex] = false;
 			gradesync_zero_triggered[GradeSyncIndex] = false; //GLC added 3/9/05
@@ -5994,6 +6016,7 @@ void overhead::GradeSyncs()
 			if ( !(BITSET(switch_in[0], GradeSyncBit[GradeSyncIndex])) )
 			{
 				grade_armed[GradeSyncIndex] = true;
+				grade_debounce[GradeSyncIndex] = pShm->sys_set.SyncOn;
 			}
 		}
 	}
@@ -6018,7 +6041,10 @@ void overhead::GradeSyncs()
 
 			if ( ( BITSET(switch_in[0], GradeSyncBit[GradeSyncIndex]) ) &&
 				grade_armed[GradeSyncIndex] &&
-				gradesync_zero_triggered[GradeSyncIndex] ) //GLC added 3/9/05
+				gradesync_zero_triggered[GradeSyncIndex] && //GLC added 3/9/05
+				// Debounce mirror (see grade sync 1 above) so SingleSensorIsZeroTab gets
+				// one confirmed edge per pulse for grade sync 2 as well.
+				( grade_debounce[GradeSyncIndex] > 0 ? (--grade_debounce[GradeSyncIndex] == 0) : true ) )
 			{
 				grade_armed[GradeSyncIndex] = false;
 				gradesync_zero_triggered[GradeSyncIndex] = false; //GLC added 3/9/05
@@ -6134,6 +6160,7 @@ void overhead::GradeSyncs()
 				if ( !(BITSET(switch_in[0], GradeSyncBit[GradeSyncIndex])) )
 				{
 					grade_armed[GradeSyncIndex] = true;
+					grade_debounce[GradeSyncIndex] = pShm->sys_set.SyncOn;
 				}
 			}
 		}
@@ -10871,12 +10898,27 @@ void overhead::ProcessSyncs()
                 // capture scale 1
                 if (( i == SCALE1SYNCBIT) && (app->previousShackle1 != app->pSyncStat->shackleno))
                 {
+                    // Single-sensor zero fires TWO count edges on the zero trolley: the
+                    // trolley-block (increments the shackle + arms here) then ~1/3-cycle
+                    // later the tab-block that resets the shackle to 1. That second (reset)
+                    // pass must NOT re-arm the capture or restart the weight average, or the
+                    // waveform jumps by the tab gap every revolution. Two-sensor zeroing is a
+                    // single edge, so it runs normally (this gate is single-sensor only).
+                    bool ssZeroReset1 = (pShm->ZeroFlagMode == 1) &&
+                                        (app->pSyncStat->shackleno < app->previousShackle1);
                     app->previousShackle1 = app->pSyncStat->shackleno;
-					if ( (capt_wt.scale == 1) &&
+                    if (!ssZeroReset1)
+                    {
+                    if ( (capt_wt.scale == 1) &&
                          (capt_wt.mode  == prod_capt) )
                     {
                         capt_wt.capture = true;
                         capture_period  = app->shk2shk_ticks - 3;
+                        // Re-phase the capture throttles to THIS shackle so the lead-in
+                        // and plateau sample counts are deterministic every frame (stops
+                        // the waveform sliding back and forth vs the fixed measurement lines).
+                        cap_slowdown      = CAPTURE_SPEED;
+                        capt_avg_slowdown = CAPTURE_SPEED;
                     }
 
                     // Clear wt average info and set trigger counter.
@@ -10884,6 +10926,7 @@ void overhead::ProcessSyncs()
                     // average finishes before the next shackle.
                     memset(&w_avg[i], 0, sizeof(t_wt_avg));
                     w_avg[i].avg_trigger_cntr = app->shk2shk_ticks - 3;
+                    }
 
                     //RtPrintf("shkl %d prevShackle %d\n",
                     //          app->pSyncStat->shackleno, app->previousShackle1);
@@ -10896,12 +10939,23 @@ void overhead::ProcessSyncs()
                 if ((( i == SCALE2SYNCBIT) && (app->previousShackle2 != app->pSyncStat->shackleno)) &&
                       dual_scale )
                 {
+                    // See scale-1 note: in single-sensor mode the zero trolley's tab-block
+                    // reset must not re-arm the capture / restart the average.
+                    bool ssZeroReset2 = (pShm->ZeroFlagMode == 1) &&
+                                        (app->pSyncStat->shackleno < app->previousShackle2);
                     app->previousShackle2 = app->pSyncStat->shackleno;
-					if ( (capt_wt.scale == 2) &&
+                    if (!ssZeroReset2)
+                    {
+                    if ( (capt_wt.scale == 2) &&
                           (capt_wt.mode  == prod_capt) )
                     {
                         capt_wt.capture = true;
                         capture_period  = app->shk2shk_ticks - 3;
+                        // Re-phase the capture throttles to THIS shackle so the lead-in
+                        // and plateau sample counts are deterministic every frame (stops
+                        // the waveform sliding back and forth vs the fixed measurement lines).
+                        cap_slowdown      = CAPTURE_SPEED;
+                        capt_avg_slowdown = CAPTURE_SPEED;
                     }
 
                     // Clear wt average info and set trigger counter.
@@ -10909,6 +10963,7 @@ void overhead::ProcessSyncs()
                     // average finishes before the next shackle.
                     memset(&w_avg[i], 0, sizeof(t_wt_avg));
                     w_avg[i].avg_trigger_cntr = app->shk2shk_ticks - 3;
+                    }
 
                     //RtPrintf("cap_prd %d shkl %d\n",
                     //          w_avg[i].avg_trigger_cntr,
