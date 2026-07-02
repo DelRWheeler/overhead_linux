@@ -1,4 +1,55 @@
-# Auto-Calibration (continuous span verify against a permanent known weight)
+# Auto-Calibration (permanent known weight: cal-time span + drift monitor)
+
+## ★ REDESIGN 2026-07-02 — cal-time span ONLY + record/alarm (SUPERSEDES continuous-trim) ★
+
+Del's rethink: the old manual flow made operators hang a known weight 6-8× per line and averaged
+the first four to build the span bias. This feature keeps a known weight welded on the line 100% of
+the time, but we **do NOT trim span continuously** (that risked drifting span all day). Instead:
+
+**1. Span bias is created ONLY during Calibrate Shackle Tares** (the existing menu; the operator
+   already picks the number of cycles there — most plants use **2**, sometimes 1, sometimes 3-4,
+   depending on time before birds exit the chiller):
+   - **N = 1** → span bias from the **first** reference-shackle reading.
+   - **N ≥ 2** → **average** of the first N reference readings → span bias.
+   - The N readings that fed the span are **marked as "used"** in the log; the reference shackle is
+     still skipped for tare (it is not empty).
+   - This is the existing controller **Part 1** (`AutoTare`) — it already averages the reference over
+     the tare cycles and sets `SpanBias`. It stays. N == the existing tare cycle count (no new setting).
+
+**2. Between calibrations the span is FROZEN.** The reference is read every revolution ONLY to be
+   **recorded** (`auto_cal_log`) — never to adjust span. The old **Part 2 continuous trim
+   (`AutoCalMonitor`: deadband / slow integral / clamp / alarm-and-HOLD span adjustment) is REMOVED**
+   and replaced by **record + drift check**:
+   - Once per revolution, when the reference crosses the scale, compare `measured` vs `known`.
+   - If `|measured − known| / known > threshold%` → set a **drift alarm** flag on that reading; the
+     host raises it to the web as a **timed red box** (auto-dismiss; re-fires once per revolution
+     while still out — ~once per 5+ min on a ~1000-shackle line ≤190 SPM, so not spammy).
+   - Span is **not** touched by the drift check.
+
+**3. Threshold is operator-editable** — a **drift %** field on the **same screen as the known weight**
+   (Line Setup), default **2%**. Reuse `AutoCalClampPpt` / `auto_cal_clamp_pct` as this threshold.
+
+**4. List Weights:** the reference-shackle reading is shown **YELLOW** (it currently colors each
+   shackle red if drop-assignment==0, green if assigned; the reference is the one shackle that is
+   OMITTED from drops, so make it the single **yellow** row so operators can eyeball its drift).
+
+**5. New Calibration Log screen** — view `auto_cal_log`: the calibration events (marked "used"
+   readings) and the ongoing per-rev monitoring readings, per line/scale, with the drift-alarm ones
+   highlighted. (This screen was already on the open list from the 6/30 session.)
+
+### Code deltas vs the (implemented) continuous-trim version below
+| Layer | Change |
+|---|---|
+| Controller `overhead.cpp` (SandCat) | Keep Part 1 (cal-time span; verify N=1 = first reading). **Gut `AutoCalMonitor`**: drop the integral/deadband/clamp span *write*; keep reading the reference + emitting `AUTO_CAL_REC` (cmd 334) every crossing; set the alarm flag purely from `|measured−known| > threshold` (no HOLD-on-span, no span change). |
+| API + DB | `auto_cal_log` already fits (add/repurpose `adjusted`→"used in cal" + a drift-alarm flag value). Drift % is `auto_cal_clamp_pct` surfaced as an editable Line Setup field. Emit a drift event to the web when a logged reading is flagged. |
+| Web | Rev-count already lives on Calibrate Shackle Tares. Add: editable drift-% next to known weight (Line Setup); timed red drift box; yellow reference on List Weights; the Calibration Log screen. |
+
+Everything from here down describes the **prior continuous-trim implementation** — kept for reference;
+the parts marked REMOVED above no longer apply.
+
+---
+
+# Auto-Calibration (continuous span verify against a permanent known weight) — PRIOR MODEL
 
 Status: **ALL 3 PHASES implemented + RIG-PROVEN on the single-line SandCat (line 1, .11), 2026-06-28.**
 End-to-end verified: the reference reading flows controller `AutoCalMonitor` -> `AUTO_CAL_REC`

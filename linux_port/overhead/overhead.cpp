@@ -6741,6 +6741,17 @@ void overhead::AutoTare ( int s )
 				TARE_SHACKLE(s, pShm) = 0;
 				if (pShm->AutoTareStep == 1) { autocal_ref_accum[s] = wt; autocal_ref_cnt[s] = 1; }
 				else                         { autocal_ref_accum[s] += wt; autocal_ref_cnt[s]++; }
+				// Log each calibration reading (used-in-cal = 1, flag 0) so the
+				// Calibration Log shows exactly which readings built the span bias.
+				if (HOST_OK)
+				{
+					__int64 kn = pShm->AutoCalKnownWeight, crec[9];
+					crec[0] = this_lineid; crec[1] = s; crec[2] = wt; crec[3] = kn;
+					crec[4] = kn > 0 ? (wt - kn) * 1000 / kn : 0;
+					crec[5] = pShm->scl_set.SpanBias[s]; crec[6] = pShm->AutoBias[s];
+					crec[7] = 1; crec[8] = 0;
+					SendHostMsg(AUTO_CAL_REC, 0, (BYTE*) crec, sizeof(crec));
+				}
 			}
 			else if (pShm->AutoTareStep == 1)
 			{
@@ -6862,73 +6873,41 @@ void overhead::AutoTare ( int s )
 //  alarm-and-HOLD beyond it (weight shifted/fell, cell dying -> do not chase).
 //--------------------------------------------------------
 
-// Conservative internal tuning (clamp is host-tunable; these stay fixed).
-#define AUTOCAL_DEADBAND_PPT   5      // ignore |error| below 0.5% (no chase on noise)
-#define AUTOCAL_OUTLIER_PCT    10     // discard a reading >10% off known (swing/transient)
-#define AUTOCAL_MISSING_PCT    50     // below 50% of known => weight gone -> alarm, no trim
-#define AUTOCAL_INTEGRAL_DIV   16     // move 1/16 of the gap per accepted sample (slow)
+// REDESIGN 2026-07-02: span is set ONLY at Calibrate Shackle Tares (Part 1).
+// This monitor NEVER trims span -- it records the reference reading every
+// crossing and raises a DRIFT ALARM when the reading strays past the operator
+// threshold (AutoCalClampPpt, default 20 ppt = 2%). No deadband/integral/clamp.
+#define AUTOCAL_MISSING_PCT    50     // below 50% of known => weight gone -> alarm
 
 void overhead::AutoCalMonitor(int s, __int64 final_ref)
 {
     __int64 known = pShm->AutoCalKnownWeight;
     if (known <= 0) return;                              // not configured yet
 
-    int     clamp_ppt = pShm->AutoCalClampPpt > 0 ? pShm->AutoCalClampPpt : 20;  // default 2%
-    __int64 baseline  = pShm->AutoCalSpanBaseline[s];
-    // Lazy baseline: if AutoTare-with-autocal has not set one, anchor on current span.
-    if (baseline == 0 && pShm->AutoCalAlarm[s] == 0)
-        baseline = pShm->AutoCalSpanBaseline[s] = pShm->scl_set.SpanBias[s];
-
-    __int64 err     = final_ref - known;                 // signed gain residual (offset already gone)
+    int     drift_ppt = pShm->AutoCalClampPpt > 0 ? pShm->AutoCalClampPpt : 20;  // threshold, default 2%
+    __int64 err     = final_ref - known;                 // signed residual (offset already gone)
     __int64 abs_err = err < 0 ? -err : err;
     __int64 err_ppt = (err * 1000) / known;              // residual in parts-per-thousand
-    bool    adjusted = false;
-    int     flag = 0;    // 0 ok / 1 held / 2 zero-off / 3 weight-missing / 4 outlier(reject)
+    int     flag = 0;    // 0 ok / 2 zero-off / 3 weight-missing / 5 drift-over-threshold
 
-    // --- Sanity gates: set a flag, skip the trim, but still log the crossing -
+    // Sanity gates first, then the drift check. Span is NEVER touched here.
     if (!pShm->WeighZero[s])
         flag = 2;                                        // zero bias not active
     else if (final_ref < (known * AUTOCAL_MISSING_PCT) / 100)
         flag = 3;                                        // reference weight gone
-    else if (abs_err > (known * AUTOCAL_OUTLIER_PCT) / 100)
-        flag = 4;                                        // outlier (swing/transient) -> reject
-    else if (err_ppt > AUTOCAL_DEADBAND_PPT || err_ppt < -AUTOCAL_DEADBAND_PPT)
-    {
-        // Good in-band reading outside the deadband -> trim span toward target.
-        // Back out the pre-span value, then the SpanBias that makes final_ref==known:
-        //   final_ref = pre * (1000 + span)/1000.
-        __int64 cur_span = pShm->scl_set.SpanBias[s];
-        double  pre      = (double) final_ref * 1000.0 / (double)(1000 + cur_span);
-        double  target   = 1000.0 * ((double) known / pre - 1.0);   // target SpanBias (ppt)
-        double  next     = (double) cur_span + (target - (double) cur_span) / AUTOCAL_INTEGRAL_DIV;
-        __int64 new_span = (__int64) (next + (next >= 0 ? 0.5 : -0.5));
+    else if (abs_err * 1000 > known * (__int64) drift_ppt)   // |err|/known > threshold
+        flag = 5;                                        // drift past the operator threshold
 
-        // Hard clamp vs baseline; alarm-and-HOLD if it wants to exceed (do not chase).
-        __int64 lo = baseline - clamp_ppt, hi = baseline + clamp_ppt;
-        if      (new_span > hi) { new_span = hi; flag = 1; }
-        else if (new_span < lo) { new_span = lo; flag = 1; }
-
-        if (new_span != cur_span)
-        {
-            pShm->scl_set.SpanBias[s] = new_span;
-            // persist (SCL group writes to disk) + notify host of the span change
-            fsave_grp_tbl[shm_tbl[SCL_SET-1].group].changed = true;
-            fsave_grp_tbl[shm_tbl[SCL_SET-1].group].loaded  = true;
-            shm_updates[32-1] = true;
-            adjusted = true;
-        }
-    }
-
-    // Alarm state mirrors the flag (outlier=4 is transient, leave prior alarm).
+    // Alarm state + host warning on a NEW alarm (rides ERROR_MSG channel; host pops the red box,
+    // once per revolution while still out -- the reference crosses the scale only once/rev).
     int prev_alarm = pShm->AutoCalAlarm[s];
-    if (flag != 4) pShm->AutoCalAlarm[s] = flag;         // 0/1/2/3
-    // Raise a host warning on a NEW hold/zero-off/missing (rides existing ERROR_MSG channel).
-    if (pShm->AutoCalAlarm[s] != 0 && pShm->AutoCalAlarm[s] != prev_alarm && flag != 4)
+    pShm->AutoCalAlarm[s] = flag;                         // 0/2/3/5
+    if (flag != 0 && flag != prev_alarm)
     {
-        const char* why = pShm->AutoCalAlarm[s] == 1 ? "span clamp hold" :
-                          pShm->AutoCalAlarm[s] == 2 ? "zero bias off"   : "reference weight missing";
-        sprintf(app_err_buf, "Auto-Cal scale %d: %s (span held at %ld)\n",
-                s + 1, why, (long) pShm->scl_set.SpanBias[s]);
+        const char* why = flag == 5 ? "reference weight drifted past threshold -- recalibrate" :
+                          flag == 2 ? "zero bias off" : "reference weight missing";
+        sprintf(app_err_buf, "Auto-Cal scale %d: %s (ref %ld vs known %ld)\n",
+                s + 1, why, (long) final_ref, (long) known);
         GenError(warning, app_err_buf);
     }
 
@@ -6940,9 +6919,9 @@ void overhead::AutoCalMonitor(int s, __int64 final_ref)
     rec[2] = final_ref;                                  // measured (internal counts)
     rec[3] = known;                                      // known weight (internal counts)
     rec[4] = err_ppt;                                    // residual ppt
-    rec[5] = pShm->scl_set.SpanBias[s];                  // span after this sample
+    rec[5] = pShm->scl_set.SpanBias[s];                  // span (unchanged) for context
     rec[6] = pShm->AutoBias[s];                          // zero bias (context)
-    rec[7] = adjusted ? 1 : 0;
+    rec[7] = 0;                                          // used-in-cal: 0 (this is a monitoring read)
     rec[8] = flag;
     if (HOST_OK)
         SendHostMsg(AUTO_CAL_REC, 0, (BYTE*) rec, sizeof(rec));
@@ -6950,9 +6929,8 @@ void overhead::AutoCalMonitor(int s, __int64 final_ref)
     if( (!trc[MAINBUFID].buffer_full) && (TraceMask & _AUTOZ_) )
     {
         sprintf((char*) &tmp_trc_buf[MAINBUFID],
-            "AutoCal\tscl\t%d\tref\t%ld\tknown\t%ld\terr_ppt\t%ld\tspan\t%ld\tbase\t%ld\tadj\t%d\tflag\t%d\n",
-            s, (long) final_ref, (long) known, (long) err_ppt,
-            (long) pShm->scl_set.SpanBias[s], (long) baseline, adjusted ? 1 : 0, flag);
+            "AutoCal\tscl\t%d\tref\t%ld\tknown\t%ld\terr_ppt\t%ld\tthresh_ppt\t%d\tflag\t%d\n",
+            s, (long) final_ref, (long) known, (long) err_ppt, drift_ppt, flag);
         strcat((char*) &trc_buf[MAINBUFID], (char*) &tmp_trc_buf[MAINBUFID]);
     }
 }
