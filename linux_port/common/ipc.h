@@ -164,11 +164,11 @@ enum {
     //     IDs do not shift; EPM-19's rtx_source ipc.h is never edited and never sees these. ---
     SET_SYNC_CAPTURE,			//	332 host->ctrl: start/stop raw-input pulse capture {mode,triggerSync,pre,post}
     SYNC_CAPTURE_INFO,			//	333 ctrl->host: window of per-scan input bytes + detector event flags
-    // --- Auto-Calibration (SandCat/Linux only, host arch-gated). ctrl->host reading record
+    // --- Auto Calculate Span (SandCat/Linux only, host arch-gated). ctrl->host reading record
     //     emitted once per reference-shackle crossing. Flat __int64[9] payload (no struct
     //     packing ambiguity): line, scale, measured, known, span_error_ppt, span_bias,
     //     zero_bias, adjusted, flag. ---
-    AUTO_CAL_REC,				//	334 ctrl->host: one reference reading (auto_cal_log feed)
+    AUTO_SPAN_REC,				//	334 ctrl->host: one reference reading (auto_span_log feed)
     LAST_APP_MSG
 };
 

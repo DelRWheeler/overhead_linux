@@ -507,15 +507,15 @@ enum {
 // Spare host-push slots above MAXIDS (do NOT add save groups; > MAXIDS so not
 // iterated/saved): the 5 from MAX_GROUPS = ids 94-98 (power-loss 94/95,
 // single-sensor 96/97/98), then +1 = id 99 (ScaleSyncOffset), then +4 more =
-// ids 100/101/102/103 for Auto-Calibration (enable / known-weight / clamp / ref-shackle).
+// ids 100/101/102/103 for Auto Calculate Span (enable / known-weight / clamp / ref-shackle).
 #define ALL_SHM_IDS         (MAXIDS + MAX_GROUPS + 5)
 
-// Auto-Calibration host-pushed settings (spare shmIDs, SandCat only)
-#define AUTOCAL_ENABLE      100   // int  AutoCalEnable (0/1, per line)
-#define AUTOCAL_KNOWN_WT    101   // __int64 AutoCalKnownWeight (internal weight units)
-#define AUTOCAL_CLAMP       102   // int  AutoCalClampPpt (ppt, default 20 = 2%)
-#define AUTOCAL_REFSHK_ID   103   // int  AutoCalRefShackle (reference shackle no, host-pushed)
-#define AUTOCAL_REF_SHACKLE 2     // default reference shackle = trolley 1 = shackleno 2 (pinned by observation)
+// Auto Calculate Span host-pushed settings (spare shmIDs, SandCat only)
+#define AUTOSPAN_ENABLE      100   // int  AutoSpanEnable (0/1, per line)
+#define AUTOSPAN_KNOWN_WT    101   // __int64 AutoSpanKnownWeight (internal weight units)
+#define AUTOSPAN_CLAMP       102   // int  AutoSpanClampPpt (ppt, default 20 = 2%)
+#define AUTOSPAN_REFSHK_ID   103   // int  AutoSpanRefShackle (reference shackle no, host-pushed)
+#define AUTOSPAN_REF_SHACKLE 2     // default reference shackle = trolley 1 = shackleno 2 (pinned by observation)
 
 enum {
     _int,

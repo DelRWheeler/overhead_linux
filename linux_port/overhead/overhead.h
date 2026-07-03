@@ -126,10 +126,10 @@ public:
     int                 bpm_qrtr;
     UINT                slave_batch[MAXBCHLABELS];
     int                 bpm_act_count[MAXSCALES];
-    // Auto-Calibration (Part 1 AutoTare averaging accumulator + count; Part 2 slow integral)
-    __int64             autocal_ref_accum[MAXSCALES];    // sum of reference (raw-AutoBias) readings during AutoTare
-    int                 autocal_ref_cnt  [MAXSCALES];    // passes accumulated for the reference shackle
-    double              autocal_integral [MAXSCALES];    // per-scale slow integral toward target SpanBias
+    // Auto Calculate Span (Part 1 AutoTare averaging accumulator + count; Part 2 slow integral)
+    __int64             autospan_ref_accum[MAXSCALES];    // sum of reference (raw-AutoBias) readings during AutoTare
+    int                 autospan_ref_cnt  [MAXSCALES];    // passes accumulated for the reference shackle
+    double              autospan_integral [MAXSCALES];    // per-scale slow integral toward target SpanBias
     bool                trickle_active;
     bool                trickle_flag;
     int                 target_trickle_count[MAXDROPS];
@@ -223,7 +223,7 @@ private:
 	void	AnalyzeConfig(bool Initialize);
     bool    AssignDrop(int scale, int drop, TShackleStatus* pShk );
     void    AutoTare(int s);
-    void    AutoCalMonitor(int s, __int64 final_ref);   // per-rev span verify vs known weight (Auto-Cal Part 2)
+    void    AutoSpanMonitor(int s, __int64 final_ref);   // per-rev span verify vs known weight (Auto-Span Part 2)
     void    AutoZero(int s);
     void    AverageWeight(int scale);
     void    BpmStats();
