@@ -154,7 +154,7 @@ typedef struct
 typedef struct 
 {
      byte   GradeIndex    [MAXSCALES];
-	 byte   spare         [2];
+	 byte   OmitFromDrop;   byte   spare [1];   /* SandCat: OmitFromDrop=1 => dead-zone/Auto-Span reference trolley, never distributed or recorded as a bird (repurposed from spare[0]; struct size unchanged, interface parity preserved) */
      int    dropped       [MAXSCALES];
      int    drop          [MAXSCALES];
      __int64 weight       [MAXSCALES];

@@ -6226,6 +6226,29 @@ void overhead::ProcessWeight()
             int  acRefShk = pShm->AutoSpanRefShackle > 0 ? pShm->AutoSpanRefShackle : AUTOSPAN_REF_SHACKLE;
             bool acIsRef  = pShm->AutoSpanEnable && (pShm->WeighShackle[i] == acRefShk);
 
+            // SandCat dead-zone / reference omission. Tag the shackle HERE (WeighShackle is
+            // authoritative) so BOTH FindDrops and AddDropRecord skip it. Covers the zero
+            // trolley, the flag dead-zone (trolleys 1..N+1 for scale offset -N), and the
+            // Auto-Span reference shackle. Without this the welded known weight leaks out of
+            // AddDropRecord as a phantom drop==0 "unassigned" bird. See docs/DEAD_ZONE_AND_
+            // REFERENCE_TROLLEY.md. EPM/RTSS run different firmware and are unaffected.
+            {
+                int ws  = pShm->WeighShackle[i];          // WeighShackle 1 == trolley 0 (zero)
+                int off = pShm->ScaleSyncOffset;           // signed, e.g. -2 (0 == legacy)
+                int n   = off < 0 ? -off : off;            // magnitude
+                // Dead-zone depth is mode-gated (N = |scale offset|):
+                //   Auto-Span ON  => omit trolleys 0..N    (first bird trolley N+1) => ws <= N+1
+                //   Auto-Span OFF => omit trolleys 0..N+1  (first bird trolley N+2) => ws <= N+2
+                // The extra dead trolley in standard mode is the rubber zero-flag trolley,
+                // which is freed for a bird when Auto-Span is running. The known-weight
+                // reference (acIsRef) is always omitted wherever it rides.
+                int bound = pShm->AutoSpanEnable ? (n + 1) : (n + 2);   // WeighShackle upper bound
+                bool omitTrolley = (ws == 1)                              // trolley 0 (zero)
+                                || (off != 0 && ws >= 2 && ws <= bound)   // flag dead-zone
+                                || acIsRef;                               // known-weight reference
+                WEIGH_SHACKLE(i, pShm).OmitFromDrop = omitTrolley ? 1 : 0;
+            }
+
             switch(pShm->OpMode)
             {
               case ModeATare1:
@@ -6308,9 +6331,10 @@ void overhead::ProcessWeight()
                        config_Ok )
                   {
                         cfg_err_sent = false;
-                        // Auto-Span: the reference shackle carries a permanent known
-                        // weight, not a bird — never assign it to a drop or count it.
-                        if (!acIsRef)
+                        // SandCat: skip the zero trolley, flag dead-zone, and Auto-Span
+                        // reference shackle (all tagged above) — none carry a distributable
+                        // bird, so none may be assigned a drop.
+                        if (!WEIGH_SHACKLE(i, pShm).OmitFromDrop)
                             FindDrops(i+1);
                   }
                   else
@@ -10048,6 +10072,12 @@ void overhead::AddDropRecord(int shackle)
     time_t  long_time;
     struct tm *ptime;
 //	char    tmpGrade;
+
+    // SandCat: dead-zone / Auto-Span reference trolleys are not birds — never emit a host
+    // record for them (else the welded known weight surfaces as a phantom "unassigned" bird).
+    // Tagged at weigh time; see docs/DEAD_ZONE_AND_REFERENCE_TROLLEY.md.
+    if (pshk->OmitFromDrop)
+        return;
 
     // bail out if BOTH scales recorded less-than-min bird-weight
     if ( (pshk->weight[0] < pShm->sys_set.MinBird) &&
