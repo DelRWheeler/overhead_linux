@@ -6312,11 +6312,13 @@ void overhead::ProcessWeight()
                    }
 
                    // Auto Calculate Span: the reference shackle (default trolley 1 ==
-                   // WeighShackle 2) is still OMITTED from FindDrops below so its known
-                   // weight is never dropped as a phantom bird. The old per-rev drift
-                   // MONITOR (AutoSpanMonitor) is intentionally REMOVED — span is set
-                   // ONLY during Calibrate Shackle Tares, nothing runs in production.
-                   // (was: if (acIsRef) AutoSpanMonitor(i, WEIGH_SHACKLE(i,pShm).weight[i]);)
+                   // WeighShackle 2) is OMITTED from FindDrops below so its known weight is
+                   // never dropped as a phantom bird. Span itself is set ONLY during
+                   // Calibrate Shackle Tares and is never trimmed here. The per-rev MONITOR
+                   // is READ-ONLY: it records the reference reading every crossing
+                   // (auto_span_log feed) and raises a drift alarm past threshold so the
+                   // operator can watch how the system is weighing — it NEVER touches span.
+                   if (acIsRef) AutoSpanMonitor(i, WEIGH_SHACKLE(i, pShm).weight[i]);
 
 //----- Find a drop
 
