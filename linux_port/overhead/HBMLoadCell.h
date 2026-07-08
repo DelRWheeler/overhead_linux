@@ -85,6 +85,10 @@ public:
 	__int64	SampleLCReadQ[MAX_MEAS_SAMPLES];
 	int		WriteLCReadsQ();
 	bool	FirstTimeThru;
+	// Manual load-cell re-init (LC_REINIT): request set from the mailbox thread
+	// (host command), polled + cleared by this cell's worker thread which then
+	// re-runs init_adc(). Public setter so the host-command handler can request it.
+	void	RequestReinit() { ReinitRequest = true; }
 
 private:
 
@@ -149,6 +153,10 @@ private:
 
     // Set continuous meas output flag, meas mode
 	bool ContMeasOut;
+	// Manual load-cell re-init: set by the LC_REINIT host command (mailbox thread),
+	// polled + cleared by this cell's worker thread which then re-runs init_adc()
+	// to recover a frozen/power-lost HBM without a controller restart. Preserves zero.
+	volatile bool ReinitRequest;
 	bool blnOutputStopped;
     bool blnMeas;
     bool blnCmdSent;

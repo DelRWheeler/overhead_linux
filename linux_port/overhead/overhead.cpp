@@ -4867,6 +4867,26 @@ void overhead::ProcessMbxMsg()
             }
             break;
 
+        case LC_REINIT:                  // Manual HBM re-init: recover a frozen load cell w/o restart
+            {
+                // Payload: int32 scale (1-based; 0 = all configured scales). Only allowed
+                // when the line is STOPPED (OpMode != ModeRun) so serial comms are never
+                // re-initialized mid-production. Preserves zero (init_adc touches only ADC
+                // comms, never the shackle zero/AutoBias). Runs on the LC worker thread.
+                int scale = *((int*) &MbMsg->gen.data);
+                if (pShm->OpMode == ModeRun)
+                {
+                    GenError(warning, (char*)"Load Cell re-init ignored - stop the line first.\n");
+                }
+                else
+                {
+                    if ((scale == 0 || scale == 1) && HBMLc)  HBMLc->RequestReinit();
+                    if ((scale == 0 || scale == 2) && HBMLc2) HBMLc2->RequestReinit();
+                    RtPrintf("LC_REINIT requested (scale=%d) - worker thread will re-run init_adc.\n", scale);
+                }
+            }
+            break;
+
 //----- These cases below are for testing without a host. The messages can be redirected
 //      to self and responses will be generated here.
 

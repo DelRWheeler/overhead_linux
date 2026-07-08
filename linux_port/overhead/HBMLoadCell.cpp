@@ -34,6 +34,7 @@ HBMLoadCell::HBMLoadCell()
 
     //Set continuous meas output flag, meas mode
 	this->ContMeasOut =	false;
+	this->ReinitRequest = false;   // manual LC_REINIT request (host->ctrl), polled by worker thread
 	this->blnMeas     =	false;
 	this->bFirstCheck = true;
 	this->num_adc_reads[0]    = 5;
@@ -298,6 +299,15 @@ int RTFCNDCL HBMLoadCell::HBMLoadCellThread1(PVOID pHBMInit)
 
 	for(;;)
     {
+		// Manual load-cell re-init (LC_REINIT): recover a frozen/power-lost HBM
+		// without a controller restart or losing zero. Runs the blocking init_adc
+		// here on the worker thread (not the mailbox handler). Line-stopped gated.
+		if (pHBMcObj->ReinitRequest)
+		{
+			pHBMcObj->ReinitRequest = false;
+			RtPrintf("HBM Load Cell: manual re-init requested - re-running init_adc...\n");
+			pHBMcObj->init_adc(AVG, 2);
+		}
 		if (LoopCnt%2500 == 0)
 		{
 			pHBMcObj->HBMCheckSettings(); //GLC
@@ -397,6 +407,15 @@ int RTFCNDCL HBMLoadCell::HBMLoadCellThread2(PVOID pHBMInit)
 
     for(;;)
     {   
+		// Manual load-cell re-init (LC_REINIT): recover a frozen/power-lost HBM
+		// without a controller restart or losing zero. Runs the blocking init_adc
+		// here on the worker thread (not the mailbox handler). Line-stopped gated.
+		if (pHBMcObj->ReinitRequest)
+		{
+			pHBMcObj->ReinitRequest = false;
+			RtPrintf("HBM Load Cell: manual re-init requested - re-running init_adc...\n");
+			pHBMcObj->init_adc(AVG, 2);
+		}
 		if (LoopCnt%2500 == 0)
 		{
 			pHBMcObj->HBMCheckSettings(); //GLC
@@ -490,6 +509,15 @@ int RTFCNDCL HBMLoadCell::HBMLoadCellThread3(PVOID pHBMInit)
 
     for(;;)
     {   
+		// Manual load-cell re-init (LC_REINIT): recover a frozen/power-lost HBM
+		// without a controller restart or losing zero. Runs the blocking init_adc
+		// here on the worker thread (not the mailbox handler). Line-stopped gated.
+		if (pHBMcObj->ReinitRequest)
+		{
+			pHBMcObj->ReinitRequest = false;
+			RtPrintf("HBM Load Cell: manual re-init requested - re-running init_adc...\n");
+			pHBMcObj->init_adc(AVG, 2);
+		}
 		if (LoopCnt%2500 == 0)
 		{
 			pHBMcObj->HBMCheckSettings(); //GLC
@@ -583,6 +611,15 @@ int RTFCNDCL HBMLoadCell::HBMLoadCellThread4(PVOID pHBMInit)
 
     for(;;)
     {   
+		// Manual load-cell re-init (LC_REINIT): recover a frozen/power-lost HBM
+		// without a controller restart or losing zero. Runs the blocking init_adc
+		// here on the worker thread (not the mailbox handler). Line-stopped gated.
+		if (pHBMcObj->ReinitRequest)
+		{
+			pHBMcObj->ReinitRequest = false;
+			RtPrintf("HBM Load Cell: manual re-init requested - re-running init_adc...\n");
+			pHBMcObj->init_adc(AVG, 2);
+		}
 		if (LoopCnt%2500 == 0)
 		{
 			pHBMcObj->HBMCheckSettings(); //GLC
