@@ -4152,18 +4152,15 @@ void overhead::AverageWeight(int scale)
                     if ( (capt_wt.mode  == prod_capt) && (capt_wt.scale == scale + 1) )
                     {
                         w_avg[scale].capt_hold = true;
-                        // Subsample the plateau capture to the SAME 1-per-CAPTURE_SPEED
-                        // cadence the timer path uses for the lead-in/lead-out, so the
-                        // whole buffer is uniformly sampled (buffer index == linear time
-                        // and the red marks line up with the green plateau). The real
-                        // weight average (w_avg above) is untouched -- this only thins
-                        // the display capture.
-                        if ( --capt_avg_slowdown <= 0 )
-                        {
-                            capt_avg_slowdown = CAPTURE_SPEED;
-                            CAPTURE_WT = wt;
-                            capt_wt.curr_index++;
-                        }
+                        // Capture EVERY averaging sample on the plateau (matches the RTSS
+                        // reference).  The previous 1-per-CAPTURE_SPEED subsampling via
+                        // capt_avg_slowdown collapsed the plateau to ~3 held steps on the
+                        // HBM lines, so the timing waveform showed a staircase instead of
+                        // the analog trace and could not be used to set the weighment
+                        // position.  The weighment average (w_avg) is unaffected by this;
+                        // it only restores display resolution to match lines 2-4 / RTSS.
+                        CAPTURE_WT = wt;
+                        capt_wt.curr_index++;
                     }
 
                     // Just started, apply first mark
