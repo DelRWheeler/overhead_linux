@@ -6933,12 +6933,20 @@ void overhead::AutoSpanMonitor(int s, __int64 final_ref)
     int     flag = 0;    // 0 ok / 2 zero-off / 3 weight-missing / 5 drift-over-threshold
 
     // Sanity gates first, then the drift check. Span is NEVER touched here.
+    // Not zeroed yet (e.g. right after a restart): the reference check is
+    // meaningless, and nagging "zero bias off" every revolution before the line
+    // has ever zeroed is just noise. Only monitor the known weight AFTER the
+    // scale has zeroed; then a missing/drifted reference is a real alarm.
+    // (Del 2026-07-15 — flag 2 "zero bias off" removed.)
     if (!pShm->WeighZero[s])
-        flag = 2;                                        // zero bias not active
-    else if (final_ref < (known * AUTOSPAN_MISSING_PCT) / 100)
-        flag = 3;                                        // reference weight gone
+    {
+        pShm->AutoSpanAlarm[s] = 0;                       // clear any prior alarm; do NOT raise one
+        return;
+    }
+    if (final_ref < (known * AUTOSPAN_MISSING_PCT) / 100)
+        flag = 3;                                        // zeroed but known reference weight not seen
     else if (abs_err * 1000 > known * (__int64) drift_ppt)   // |err|/known > threshold
-        flag = 5;                                        // drift past the operator threshold
+        flag = 5;                                        // zeroed but reference drifted past threshold
 
     // Alarm state + host warning on a NEW alarm (rides ERROR_MSG channel; host pops the red box,
     // once per revolution while still out -- the reference crosses the scale only once/rev).

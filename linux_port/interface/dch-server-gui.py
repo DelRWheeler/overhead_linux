@@ -531,12 +531,20 @@ class DCHServerWindow(Gtk.Window):
         screen = Gdk.Screen.get_default()
         self._scr_w = screen.get_width() if screen else 1920
         self._scr_h = screen.get_height() if screen else 1200
+        # Explicit window size for panels whose EDID over-reports the usable area
+        # (e.g. the 10" kiosk). DCH_GUI_WIDTH / DCH_GUI_HEIGHT nudge the window
+        # narrower/shorter without editing this file. Unset => full screen.
+        self._scr_w = int(os.environ.get("DCH_GUI_WIDTH",  self._scr_w))
+        self._scr_h = int(os.environ.get("DCH_GUI_HEIGHT", self._scr_h))
+        self._explicit_size = bool(os.environ.get("DCH_GUI_WIDTH") or
+                                   os.environ.get("DCH_GUI_HEIGHT"))
         if os.environ.get("DCH_GUI_NO_FULLSCREEN", "") == "1":
             self.set_default_size(900, 550)
         else:
             self.set_default_size(self._scr_w, self._scr_h)
             self.set_decorated(False)
-            self.fullscreen()  # honored if a WM is ever present
+            if not self._explicit_size:
+                self.fullscreen()  # honored if a WM is ever present
             self.connect("realize",
                          lambda w: (w.move(0, 0), w.resize(self._scr_w, self._scr_h)))
         self.child_pid = -1
@@ -548,6 +556,17 @@ class DCHServerWindow(Gtk.Window):
         # Menu bar
         menubar = self._build_menubar()
         vbox.pack_start(menubar, False, False, 0)
+
+        # Menu font — the GTK theme default is small on kiosk panels. Enlarge it
+        # INDEPENDENTLY of the message/terminal font (DCH_GUI_MENU_FONT_SIZE, pt).
+        menu_pt = os.environ.get("DCH_GUI_MENU_FONT_SIZE", "20")
+        menu_css = Gtk.CssProvider()
+        menu_css.load_from_data(
+            (f"menubar, menubar > menuitem, menu, menu menuitem, menuitem label "
+             f"{{ font-size: {menu_pt}pt; }}").encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), menu_css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         # VTE terminal widget
         self.terminal = Vte.Terminal()
