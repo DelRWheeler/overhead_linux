@@ -6814,7 +6814,15 @@ void overhead::AutoTare ( int s )
 						// avg_ref * (1 + span/1000) == known => span = 1000*(known/avg_ref - 1)
 						__int64 avg_ref = autospan_ref_cnt[s] > 0 ? autospan_ref_accum[s] / autospan_ref_cnt[s] : 0;
 						__int64 known   = pShm->AutoSpanKnownWeight;
-						if (avg_ref > 0 && known > 0)
+						// Sanity band: a genuine gain drift is small, so the averaged reference
+						// reading must land within a sane fraction of known (0.5x..2x). If the ref
+						// shackle is misaligned / not seeing the known weight, avg_ref is a tiny
+						// fraction of known and span = 1000*(known/avg_ref - 1) EXPLODES into a garbage
+						// SpanBias that then amplifies every weight (2026-07-16: avg_ref=43 counts,
+						// known=346500 -> SpanBias 8,057,140, weights bounced, persisted to scale.bin).
+						// Out of band => leave SpanBias untouched (AutoSpanMonitor still flags the bad
+						// reference). Was `avg_ref > 0` alone, which was far too weak.
+						if (avg_ref > 0 && known > 0 && avg_ref >= known / 2 && avg_ref <= known * 2)
 						{
 							double  spd  = 1000.0 * ((double) known / (double) avg_ref - 1.0);
 							__int64 span = (__int64)(spd + (spd >= 0 ? 0.5 : -0.5));
