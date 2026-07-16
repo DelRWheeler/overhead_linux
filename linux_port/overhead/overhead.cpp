@@ -4,6 +4,10 @@
 
 #include "types.h"
 #include "telnetsrv.h"
+#include <sys/socket.h>   // controller derives its line id from its own IP
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
 #ifdef _LC_SIM_
 #include "hbm_sim.h"
 #include "ispd_sim.h"
@@ -13,6 +17,36 @@
 
 #undef  _FILE_
 #define _FILE_      "overhead.cpp"
+
+// ControllerLineIdFromIP returns the line id implied by THIS box's controller-subnet
+// address on 192.168.100.0/24: .11->1, .12->2, .13->3, .14->4, and the spare parking
+// IP .15->5. Returns 0 when no 192.168.100.11-.15 address is present, so the caller
+// falls back to the stored this_line_id. This makes a controller's identity follow the
+// physical slot it is plugged into rather than whatever was baked into a cloned SSD:
+// a freshly-cloned spare on the parking IP .15 comes up as line 5 -- a line the host
+// does not route (host path already special-cases srcLineId==5) -- so it can never
+// collide with a running line on power-up. Re-IP restarts the controller, which
+// re-derives.
+static int ControllerLineIdFromIP()
+{
+    struct ifaddrs* ifs = NULL;
+    if (getifaddrs(&ifs) != 0)
+        return 0;
+    int lineid = 0;
+    for (struct ifaddrs* p = ifs; p != NULL; p = p->ifa_next)
+    {
+        if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET)
+            continue;
+        unsigned long a = ntohl(((struct sockaddr_in*) p->ifa_addr)->sin_addr.s_addr);
+        if ((a & 0xFFFFFF00UL) == 0xC0A86400UL)          // 192.168.100.0/24
+        {
+            int last = (int)(a & 0xFF);
+            if (last >= 11 && last <= 15) { lineid = last - 10; break; }
+        }
+    }
+    freeifaddrs(ifs);
+    return lineid;
+}
 
 //////////////////////////////////////////////////////////////////////
 // Global object pointers/handles
@@ -3218,7 +3252,13 @@ void __stdcall overhead::Gp_Timer_Main(PVOID addr)
             sec30_OK  = (((app->pShm->sys_stat.PPMTimer % 30 ) == 0 ) ? true  : false);
         }
 
-        app->this_lineid  =    app->pShm->sys_set.IsysLineSettings.this_line_id;
+        // Identity follows the physical slot: derive this line id from the box's own
+        // controller-subnet IP (.11-.14 -> line 1-4, spare parking .15 -> line 5) so a
+        // cloned spare can never announce a running line's number. Computed once (re-IP
+        // restarts the controller). Falls back to the stored setting off the .11-.15 range.
+        static int ip_lineid = ControllerLineIdFromIP();
+        app->this_lineid  =    (ip_lineid > 0) ? ip_lineid
+                                               : app->pShm->sys_set.IsysLineSettings.this_line_id;
         app->dual_scale   = (((app->pShm->scl_set.NumScales )      == 2 ) ? true  : false);
 
 //----- Show any change in host comm status
