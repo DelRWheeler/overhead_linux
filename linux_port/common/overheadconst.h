@@ -82,8 +82,8 @@
 // Change before a label is applied in SS
 
 #define APP_VER1         15 // Major
-#define APP_VER2         6  // Minor
-#define APP_VER3         27	// Local
+#define APP_VER2         7  // Minor
+#define APP_VER3         0	// Local
 
 #define CREATE_VER_STRING(string) \
     sprintf((char *)string, "GS-1000 RTOS Version %d.%d.%d %s ", \
