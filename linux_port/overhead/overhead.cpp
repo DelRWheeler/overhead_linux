@@ -4378,9 +4378,23 @@ void overhead::CaptureLcData()
 
 //----- Reading weights, slow down because the load cell card can't convert as
 //      fast as the app timer.
+//
+//      ANALOG (1510) ONLY. That hardware limit is real for the analog card, so it
+//      keeps the RTSS-exact 1-per-CAPTURE_SPEED behaviour.
+//
+//      HBM (digital, SandCat-only -- no RTSS equivalent) must NOT be thinned. The
+//      plateau is already captured at full rate in the AvgWt path (every averaging
+//      sample, see CAPTURE_WT there), so thinning only the lead-in/lead-out ramps
+//      built the rising and falling edges out of 1/3 of the points and rendered
+//      them as near-vertical steps -- the "square" waveform. The waveform must be
+//      the FULL weighment stream end to end, not a dense plateau bolted onto
+//      coarse ramps.
 
-    if (--cap_slowdown > 0) return;
-    else  cap_slowdown = CAPTURE_SPEED;
+    if (app->pShm->scl_set.LoadCellType == LOADCELL_TYPE_1510)
+    {
+        if (--cap_slowdown > 0) return;
+        else  cap_slowdown = CAPTURE_SPEED;
+    }
 
 
     switch (capt_wt.mode)
