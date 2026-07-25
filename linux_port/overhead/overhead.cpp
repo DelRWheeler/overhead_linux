@@ -556,13 +556,15 @@ overhead::overhead()
 //
 //  Called when the power-loss countdown expires. On the SandCat
 //  (Linux) the controller runs as root, so trigger a graceful OS
-//  shutdown directly. TEST RIG: reboot (-r) so the box self-recovers.
-//  PRODUCTION: change -r to -h to power the box off before the UPS dies.
+//  shutdown directly. PRODUCTION: -h (poweroff) so the box parks
+//  safely before the UPS battery dies; it stays off until mains
+//  returns and someone powers it back on.
+//  (A test rig may use -r instead so the box self-recovers.)
 //--------------------------------------------------------
 void overhead::PostShutdownMessage()
 {
     RtPrintf("PostShutdownMessage: triggering graceful shutdown (power lost).\n");
-    int rc = system("/sbin/shutdown -r now");   // PRODUCTION: -h (poweroff)
+    int rc = system("/sbin/shutdown -h now");   // PRODUCTION: -h (poweroff)
     if (rc != 0)
         RtPrintf("PostShutdownMessage: shutdown command returned %d\n", rc);
 }
