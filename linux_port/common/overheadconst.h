@@ -83,7 +83,7 @@
 
 #define APP_VER1         15 // Major
 #define APP_VER2         7  // Minor
-#define APP_VER3         11	// Local
+#define APP_VER3         12	// Local
 
 #define CREATE_VER_STRING(string) \
     sprintf((char *)string, "GS-1000 RTOS Version %d.%d.%d %s ", \
@@ -261,6 +261,17 @@
 // comes once per chain revolution (hundreds of trolleys); anything closer means the learned
 // trolley interval T has gone stale and ordinary trolleys are being misread as tabs.
 #define SS_MIN_TROLLEYS_BETWEEN_TABS  10
+// Single-sensor zero flag: consecutive UNDERSIZED gaps required before the learned
+// trolley interval T is re-seeded DOWNWARD. This is the exact mirror of the existing
+// oversized-gap stall re-seed (4 consecutive gaps > 3*T). Without it T can only ever
+// GROW: the EMA folds a gap only when it is >= 0.7*T, the stall path only fires above
+// 3*T, so once T is latched stale-large NOTHING can bring it back down and the sync
+// stops zeroing permanently until the controller is restarted (Pitman 2026-07-26,
+// both drop syncs dead for 4+ hours after a line stop/start ramp). A run of 4 is far
+// above any isolated short gap (the tab itself is ONE short gap per revolution, and
+// noise blips are isolated) and far below any real speed change, which produces
+// hundreds of consecutive shorter gaps.
+#define SS_SHRINK_RUN                 4
 
 #define CAPTURE_SPEED       3
 #define SAMPLE_WEIGHTS      1000

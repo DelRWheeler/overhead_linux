@@ -1818,6 +1818,7 @@ void overhead::InitLocals()
         ss_trolley_interval[i]  = 0;
         ss_trolley_stall[i]     = 0;
         ss_tab_run[i]           = SS_MIN_TROLLEYS_BETWEEN_TABS;  // allow the FIRST tab through
+        ss_trolley_shrink[i]    = 0;
     }
     for (i = 0; i < MAXGRADESYNCS; i++)
     {
@@ -1825,6 +1826,7 @@ void overhead::InitLocals()
         ss_grade_trolley_interval[i]  = 0;
         ss_grade_trolley_stall[i]     = 0;
         ss_grade_tab_run[i]           = SS_MIN_TROLLEYS_BETWEEN_TABS;
+        ss_grade_trolley_shrink[i]    = 0;
     }
 
     for (i = 0; i < MAXGRADESYNCS; i++)
@@ -5746,7 +5748,7 @@ void overhead::DecCntrlCtrs()
 // measures a full T. Returns true = this edge is the zero tab, false = trolley.
 //--------------------------------------------------------
 
-bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval, int &stall, int &tabRun)
+bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval, int &stall, int &tabRun, int &shrink)
 {
     // App_Timer_Main (and thus ss_scan_tick) runs every 5 ms; convert the
     // host-configured ms tab window to scan ticks. Defaults apply until the host
@@ -5791,6 +5793,7 @@ bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval
             interval = delta;            // adopt the real trolley gap as the new T
             stall = 0;
         }
+        shrink = 0;                      // 15.7.12: oversized run breaks any undersized run
         lastTrolleyTick = now;
         return false;                    // -> trolley (do not pollute the EMA)
     }
@@ -5837,12 +5840,24 @@ bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval
         // runaway, so it can never reject a genuine flag.
         if (tabRun < SS_MIN_TROLLEYS_BETWEEN_TABS)
         {
-            interval        = delta;     // adopt the real trolley gap as the new T
+            // 15.7.12: this used to do `interval = delta` outright, letting ONE short
+            // gap redefine T. A single tab edge or noise blip could therefore throw the
+            // timebase to ~0.4*T and force a multi-edge recovery. Require the same
+            // consecutive run the trolley path below now requires: if trolleys really
+            // are landing in the tab window (the stale-LARGE case this guard exists
+            // for), they arrive in a continuous run and T is adopted after SS_SHRINK_RUN
+            // of them -- same recovery, but no single observation can move T.
+            if (++shrink >= SS_SHRINK_RUN)
+            {
+                interval = delta;        // sustained run: adopt the real trolley gap
+                shrink   = 0;
+            }
             tabRun          = 0;
             lastTrolleyTick = now;
             return false;                // -> trolley
         }
         tabRun = 0;                      // accepted: restart the trolley run
+        shrink = 0;
         return true;                     // ZERO; keep timebase (don't advance)
     }
 
@@ -5853,7 +5868,38 @@ bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval
     // misclassified tab (short gap) or noise from corrupting T and death-spiralling
     // the window check. Outliers advance the timebase without polluting the EMA.
     if (delta * 10 >= interval * 7)
+    {
         interval = (interval * 3 + delta) / 4;
+        shrink   = 0;                    // a full-size gap breaks the undersized run
+    }
+    else
+    {
+        // --- 15.7.12: SYMMETRIC DOWNWARD SELF-HEAL -------------------------------
+        // The EMA above folds a gap ONLY when it is >= 0.7*T, and the stall re-seed
+        // above fires ONLY above 3*T. So before this, T could GROW but never SHRINK:
+        // once T was latched stale-large every real trolley gap was simultaneously
+        // too small to fold (< 0.7*T) and too small to stall (< 3*T), and the real
+        // tab then fell BELOW relMin (0.18*T) and was counted as a trolley forever.
+        // That is a PERMANENT lockout -- the sync never zeroes again until the
+        // controller restarts. Measured at Pitman 2026-07-26: both drop syncs dead
+        // for 4+ hours ("Zero Flag NOT Detected ... shackle 306 expected 304" every
+        // revolution) while Scale 1, whose T happened not to latch, ran clean. The
+        // trigger is a line stop/start ramp: the stall re-seed above adopts a
+        // crawl-speed gap, and nothing could ever bring T back down.
+        //
+        // This is the exact mirror of that stall re-seed. SS_SHRINK_RUN consecutive
+        // undersized gaps -- a real speed-up gives hundreds -- adopt the new T. An
+        // ISOLATED short gap cannot: the zero tab is one short gap per revolution
+        // and noise blips are isolated, and any full-size gap resets the run above.
+        // Recovery is bounded at SS_SHRINK_RUN trolleys (~1.7 s at 70 SPM) no matter
+        // how badly T was latched -- verified in simulation against the real captured
+        // edge streams from all three Pitman heads at 2.35x .. 14x stale.
+        if (++shrink >= SS_SHRINK_RUN)
+        {
+            interval = delta;
+            shrink   = 0;
+        }
+    }
     lastTrolleyTick = now;
     return false;
 }
@@ -6026,7 +6072,7 @@ void overhead::GradeSyncs()
 			// Standard mode reads the grade zero bit; single-sensor mode derives
 			// the grade zero from the double-pulse timing on the grade count bit.
 			bool grade_zero_detected = (pShm->ZeroFlagMode == 1)
-				? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex], ss_grade_tab_run[GradeSyncIndex])
+				? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex], ss_grade_tab_run[GradeSyncIndex], ss_grade_trolley_shrink[GradeSyncIndex])
 				: BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]);
 
 			if ( grade_zero_detected )
@@ -6170,7 +6216,7 @@ void overhead::GradeSyncs()
 				// Standard mode reads the grade zero bit; single-sensor mode derives
 				// the grade zero from the double-pulse timing on the grade count bit.
 				bool grade_zero_detected = (pShm->ZeroFlagMode == 1)
-					? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex], ss_grade_tab_run[GradeSyncIndex])
+					? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex], ss_grade_tab_run[GradeSyncIndex], ss_grade_trolley_shrink[GradeSyncIndex])
 					: BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]);
 
 				if ( grade_zero_detected )
@@ -10833,7 +10879,7 @@ void overhead::ProcessSyncs()
 				 // (ZeroFlagMode==1) ignores the zero bit and derives zero from the
 				 // double-pulse timing on this even count bit (self-calibrating).
                  bool zero_detected = (pShm->ZeroFlagMode == 1)
-                     ? SingleSensorIsZeroTab(ss_last_trolley_tick[i], ss_trolley_interval[i], ss_trolley_stall[i], ss_tab_run[i])
+                     ? SingleSensorIsZeroTab(ss_last_trolley_tick[i], ss_trolley_interval[i], ss_trolley_stall[i], ss_tab_run[i], ss_trolley_shrink[i])
                      : BITSET(sync_zero[byte], i);
 
  				 // Only zero the sync if the grade syncs have already zeroed. This is to prevent misgrading
