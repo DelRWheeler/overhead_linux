@@ -83,7 +83,7 @@
 
 #define APP_VER1         15 // Major
 #define APP_VER2         7  // Minor
-#define APP_VER3         2	// Local
+#define APP_VER3         9	// Local
 
 #define CREATE_VER_STRING(string) \
     sprintf((char *)string, "GS-1000 RTOS Version %d.%d.%d %s ", \
@@ -257,6 +257,11 @@
 #define DRECRECOVERY        1       // sending a large chunk of drop records
 #define MAXBCHLBLNUM        1000    // max label number (999999)
 #define MAXCAPTUREBUFFS     2
+// Single-sensor zero flag: minimum trolleys between two accepted zero tabs. The real flag
+// comes once per chain revolution (hundreds of trolleys); anything closer means the learned
+// trolley interval T has gone stale and ordinary trolleys are being misread as tabs.
+#define SS_MIN_TROLLEYS_BETWEEN_TABS  10
+
 #define CAPTURE_SPEED       3
 #define SAMPLE_WEIGHTS      1000
 #define AVG_WEIGHTS         1000

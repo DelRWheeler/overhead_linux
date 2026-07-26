@@ -22,6 +22,7 @@ extern	int	TakeLoadCellReadsFlag;
 extern	int ReadsToSample;
 extern	int WriteLCReadsToFile;
 
+
 //////////////////////////////////////////////////////////////////////
 // Construction/Destruction
 //////////////////////////////////////////////////////////////////////
@@ -1719,7 +1720,11 @@ void HBMLoadCell::SerialRead( Serial* serial)
 					{
 						break;
 					}
-				    rc = this->serialObj->RtReadComPort((BYTE*) &this->rxmsg[0], (unsigned short)(meas_mode.Bytes), &bytes_read);
+				    // RTSS-EXACT: read each frame to an ADVANCING offset rxmsg[ReadCnt].
+				    // The linux port had been reading every frame to rxmsg[0]. Restored to
+				    // match the RTSS authority (overhead_github/HBMLoadCell.cpp SerialRead)
+				    // per Del 2026-07-25: replicate, do not reinterpret.
+				    rc = this->serialObj->RtReadComPort((BYTE*) &this->rxmsg[ReadCnt], (unsigned short)(meas_mode.Bytes), &bytes_read);
 				    
 	                if (bytes_read == meas_mode.Bytes)
 	                {
@@ -1761,21 +1766,27 @@ void HBMLoadCell::SerialRead( Serial* serial)
 						// by one byte so the 4-byte packet stream re-syncs.  An occasional
 						// skipped sample is harmless (many samples per shackle at 600 Hz);
 						// a polluted sample is not.
+						// RTSS-EXACT bad-frame handling: on a checksum mismatch RTSS sets
+						// tmpMeas = 0, nudges alignment by one byte, and STILL enqueues.
+						// The linux port had been skipping the sample entirely (continue).
+						// Restored to match the authority per Del 2026-07-25. Note this path
+						// is currently dormant on Pitman -- cksum_err has been 0 across
+						// 660k+ frames -- so it is faithfulness, not a behaviour change.
 						CheckSum = (unsigned char)(this->rxmsg[0] ^ this->rxmsg[1] ^ this->rxmsg[2]);
 						if (CheckSum != this->rxmsg[3])
 						{
 							this->CheckSumError++;
+							tmpMeas = 0x0;			//we have a problem
 							this->serialObj->RtGetComBufferCount(&NumBytes);
 							if (NumBytes > 0)
 							{
-								// Re-align by one byte; the next frame is retried.
+								// Try to change our allignment by one byte
 								this->serialObj->RtReadComPort((BYTE*) &tmpBuffer, 1, &rc);
 								this->ExtraReadCnt++;
 							}
-							continue;
 						}
-						
-						// Good frame - enqueue the weight sample.
+
+						//Write to the measurement queue
 						this->MeasureQ(&tmpMeas, 0);
 						if (TakeLoadCellReadsFlag > 0)
 						{

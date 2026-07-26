@@ -1817,12 +1817,14 @@ void overhead::InitLocals()
         ss_last_trolley_tick[i] = 0;
         ss_trolley_interval[i]  = 0;
         ss_trolley_stall[i]     = 0;
+        ss_tab_run[i]           = SS_MIN_TROLLEYS_BETWEEN_TABS;  // allow the FIRST tab through
     }
     for (i = 0; i < MAXGRADESYNCS; i++)
     {
         ss_grade_last_trolley_tick[i] = 0;
         ss_grade_trolley_interval[i]  = 0;
         ss_grade_trolley_stall[i]     = 0;
+        ss_grade_tab_run[i]           = SS_MIN_TROLLEYS_BETWEEN_TABS;
     }
 
     for (i = 0; i < MAXGRADESYNCS; i++)
@@ -4379,22 +4381,14 @@ void overhead::CaptureLcData()
 //----- Reading weights, slow down because the load cell card can't convert as
 //      fast as the app timer.
 //
-//      ANALOG (1510) ONLY. That hardware limit is real for the analog card, so it
-//      keeps the RTSS-exact 1-per-CAPTURE_SPEED behaviour.
-//
-//      HBM (digital, SandCat-only -- no RTSS equivalent) must NOT be thinned. The
-//      plateau is already captured at full rate in the AvgWt path (every averaging
-//      sample, see CAPTURE_WT there), so thinning only the lead-in/lead-out ramps
-//      built the rising and falling edges out of 1/3 of the points and rendered
-//      them as near-vertical steps -- the "square" waveform. The waveform must be
-//      the FULL weighment stream end to end, not a dense plateau bolted onto
-//      coarse ramps.
+//      RTSS-EXACT: unconditional, both load-cell types. An earlier change here
+//      gated this to LOADCELL_TYPE_1510 only, on the theory that the HBM had no
+//      such limit. That was a deviation from the authority and it did NOT cure the
+//      stair-stepping (RTSS runs this thinning and its waveform is correct), so it
+//      has been reverted per Del 2026-07-25: replicate RTSS, do not reinterpret.
 
-    if (app->pShm->scl_set.LoadCellType == LOADCELL_TYPE_1510)
-    {
-        if (--cap_slowdown > 0) return;
-        else  cap_slowdown = CAPTURE_SPEED;
-    }
+    if (--cap_slowdown > 0) return;
+    else  cap_slowdown = CAPTURE_SPEED;
 
 
     switch (capt_wt.mode)
@@ -5752,14 +5746,18 @@ void overhead::DecCntrlCtrs()
 // measures a full T. Returns true = this edge is the zero tab, false = trolley.
 //--------------------------------------------------------
 
-bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval, int &stall)
+bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval, int &stall, int &tabRun)
 {
     // App_Timer_Main (and thus ss_scan_tick) runs every 5 ms; convert the
     // host-configured ms tab window to scan ticks. Defaults apply until the host
     // pushes values (0) so the feature still works on first connect.
     const __int64 SCAN_MS = 5;
-    int minMs = (pShm->ZeroTabWindowMinMs > 0) ? pShm->ZeroTabWindowMinMs : 30;
-    int maxMs = (pShm->ZeroTabWindowMaxMs > 0) ? pShm->ZeroTabWindowMaxMs : 250;
+    // Defaults are deliberately WIDE: since the geometric 0.18-0.40*T test below is
+    // now the real discriminator, these are only coarse rails. A tight default max
+    // (was 250 ms) silently blocks every zero on a slow-running line -- at 14 SPM
+    // the genuine tab gap is ~580 ms, so 250 ms threw away a perfectly good flag.
+    int minMs = (pShm->ZeroTabWindowMinMs > 0) ? pShm->ZeroTabWindowMinMs : 20;
+    int maxMs = (pShm->ZeroTabWindowMaxMs > 0) ? pShm->ZeroTabWindowMaxMs : 3000;
     __int64 minTicks = minMs / SCAN_MS;
     __int64 maxTicks = maxMs / SCAN_MS;
 
@@ -5798,11 +5796,57 @@ bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval
     }
     stall = 0;                           // a normally-spaced edge arrived: not stalled
 
-    // TAB if the gap is inside the configured ms window AND is a sane fraction of
-    // the learned trolley interval (must be well under one trolley — the learned T
-    // is the backup sanity bound so the window can't misfire on a real trolley).
-    if (delta >= minTicks && delta <= maxTicks && delta * 2 < interval)
+    // TAB if the gap is a sane FRACTION of the learned trolley interval, and also
+    // inside the configured ms rails.
+    //
+    // The fraction test is the one that decides, because the tab's position is
+    // GEOMETRY and therefore speed-independent: the flag is a fixed distance of
+    // travel (Pitman = 5/8" block + 1" notch = 1.625") against fixed 6" trolley
+    // centers, i.e. always ~0.27*T no matter how fast the chain runs.
+    //
+    // An absolute ms window CANNOT do this job. Measured at Pitman: at 14 SPM the
+    // trolley interval T is ~2140 ms and the real tab gap ~580 ms; at 50 SPM the
+    // same flag gives T ~600 ms and a tab gap of ~162 ms. Any fixed ms bracket wide
+    // enough to catch the tab at production speed is, at crawl speed, wider than
+    // half a trolley -- so it stops constraining anything and ordinary gaps start
+    // reading as zeros (observed: a false zero at shackle 11 of 1189). Conversely a
+    // bracket tight enough for crawl speed misses the tab entirely once the line
+    // speeds up. The ms values stay as coarse outer rails only.
+    __int64 relMin = interval * 18 / 100;   // 0.18*T
+    __int64 relMax = interval * 50 / 100;   // 0.50*T -- the SPEC puts the tab at ~0.40*T
+                                            // (2.5" after the trolley on 6" centers), so an
+                                            // 0.40 ceiling sat exactly on a correct flag and
+                                            // would reject it. Pitman's flag is ~0.27*T.
+
+    if (delta >= relMin  && delta <= relMax  &&
+        delta >= minTicks && delta <= maxTicks &&
+        delta * 2 < interval)
+    {
+        // PHYSICAL INVARIANT: the zero tab occurs ONCE PER CHAIN REVOLUTION -- hundreds of
+        // trolleys apart (Pitman: 304 shackles x2 trolleys = ~608). So a "tab" arriving only
+        // a few trolleys after the last one CANNOT be the flag: it means the learned T is
+        // STALE-LARGE (the line sped up, or T was seeded while crawling) and ordinary
+        // trolleys are now landing inside the window. Left unguarded this latches and every
+        // trolley reads as a zero; the EMA below cannot rescue it because it only folds in
+        // gaps >= 0.7*T, so T can grow but never shrink.
+        //
+        // NOTE a "two in a row" test is NOT enough -- it just rejects every second edge and
+        // you still get a false zero on every shackle (observed at Pitman 2026-07-25).
+        // Require a real run of trolleys since the last tab. SS_MIN_TROLLEYS_BETWEEN_TABS is
+        // far below any real chain (shortest plausible is ~100 trolleys) and far above the
+        // runaway, so it can never reject a genuine flag.
+        if (tabRun < SS_MIN_TROLLEYS_BETWEEN_TABS)
+        {
+            interval        = delta;     // adopt the real trolley gap as the new T
+            tabRun          = 0;
+            lastTrolleyTick = now;
+            return false;                // -> trolley
+        }
+        tabRun = 0;                      // accepted: restart the trolley run
         return true;                     // ZERO; keep timebase (don't advance)
+    }
+
+    if (tabRun < 1000000) tabRun++;      // count trolleys since the last accepted tab
 
     // Normal trolley. Advance the timebase, but only fold delta into the running
     // interval if it is a PLAUSIBLE full-trolley gap (>= 0.7*T). This stops a
@@ -5982,7 +6026,7 @@ void overhead::GradeSyncs()
 			// Standard mode reads the grade zero bit; single-sensor mode derives
 			// the grade zero from the double-pulse timing on the grade count bit.
 			bool grade_zero_detected = (pShm->ZeroFlagMode == 1)
-				? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex])
+				? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex], ss_grade_tab_run[GradeSyncIndex])
 				: BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]);
 
 			if ( grade_zero_detected )
@@ -6126,7 +6170,7 @@ void overhead::GradeSyncs()
 				// Standard mode reads the grade zero bit; single-sensor mode derives
 				// the grade zero from the double-pulse timing on the grade count bit.
 				bool grade_zero_detected = (pShm->ZeroFlagMode == 1)
-					? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex])
+					? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex], ss_grade_tab_run[GradeSyncIndex])
 					: BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]);
 
 				if ( grade_zero_detected )
@@ -10789,7 +10833,7 @@ void overhead::ProcessSyncs()
 				 // (ZeroFlagMode==1) ignores the zero bit and derives zero from the
 				 // double-pulse timing on this even count bit (self-calibrating).
                  bool zero_detected = (pShm->ZeroFlagMode == 1)
-                     ? SingleSensorIsZeroTab(ss_last_trolley_tick[i], ss_trolley_interval[i], ss_trolley_stall[i])
+                     ? SingleSensorIsZeroTab(ss_last_trolley_tick[i], ss_trolley_interval[i], ss_trolley_stall[i], ss_tab_run[i])
                      : BITSET(sync_zero[byte], i);
 
  				 // Only zero the sync if the grade syncs have already zeroed. This is to prevent misgrading

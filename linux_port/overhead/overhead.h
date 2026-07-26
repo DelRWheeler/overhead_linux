@@ -96,9 +96,11 @@ public:
     __int64             ss_last_trolley_tick[MAXSYNCS];      // tick of last confirmed TROLLEY edge (not tab) per count sync
     __int64             ss_trolley_interval[MAXSYNCS];       // running EMA of trolley-to-trolley interval T (ticks)
     int                 ss_trolley_stall[MAXSYNCS];          // consecutive oversized gaps -> re-seed a corrupt-small T
+    int                 ss_tab_run[MAXSYNCS];                // consecutive TAB classifications -> stale-large T, re-seed DOWN
     __int64             ss_grade_last_trolley_tick[MAXGRADESYNCS];
     __int64             ss_grade_trolley_interval[MAXGRADESYNCS];
     int                 ss_grade_trolley_stall[MAXGRADESYNCS];
+    int                 ss_grade_tab_run[MAXGRADESYNCS];
     __int64             ss_last_warn_tick; // single-sensor: throttle "Zero Flag NOT Detected" sends to the host
 
     // --- Sensor Scope: raw-input pulse capture (SandCat only; host arch-gated) ---
@@ -261,7 +263,7 @@ private:
     void    ProcessSyncs();
     // Single-sensor zero-flag detector: classify one confirmed count edge as the
     // zero TAB (true) or a normal trolley (false), updating the per-sync timebase.
-    bool    SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval, int &stall);
+    bool    SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval, int &stall, int &tabRun);
     // Rate-limit "Zero Flag NOT Detected" sends in single-sensor mode (anti-flood).
     bool    SingleSensorWarnOk();
     // Sensor Scope capture (SandCat only): append a scan sample + drive streaming.
