@@ -130,6 +130,10 @@ private:
 	void		SerialRead(Serial* serial);
 	int			SerialWrite(char * txdata);
 	int			SendCommand(char * cmd, DWORD response_time);
+	// 15.7.11 - serial query robustness (SandCat/Linux only, see HBMLoadCell.cpp)
+	int			DrainUntilSettled(DWORD settle_ms, DWORD max_ms);
+	bool		ReplyPlausible(char * reply, int lo, int hi);
+	int			SendQueryChecked(char * cmd, DWORD response_time, int lo, int hi);
 	bool		CheckConfigValue(char * cmd, char * value, DWORD response_time);
 	int			MeasureQ(__int64 * measArr, int items);
 	int			SampleLCReadMeasureQ(__int64 * measArr);

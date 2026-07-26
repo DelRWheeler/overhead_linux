@@ -18,6 +18,13 @@ extern char app_err_buf[];
 #define LOOP_CNT_MAX		0xFFFFFFFF
 #define RETRY_CNT_MAX		0x000003E8
 
+// 15.7.11 - settle-drain window used after the measurement stream is stopped
+// and before a query is transmitted (see DrainUntilSettled).
+#define HBM_SETTLE_QUIET_MS	100		// port must read empty this long
+#define HBM_SETTLE_MAX_MS	500		// hard cap on the drain
+#define HBM_SETTLE_POLL_MS	10		// poll granularity
+#define HBM_FIRST_RX_KEEP	128		// bytes of a first reply kept for fallback
+
 extern	int	TakeLoadCellReadsFlag;
 extern	int ReadsToSample;
 extern	int WriteLCReadsToFile;
@@ -1106,6 +1113,10 @@ int HBMLoadCell::init_adc(int mode, int num_reads)
 	this->blnResponseReceived = false;
 	memset(this->rxmsg, 0, sizeof(this->rxmsg));
 	Sleep(500);
+	// 15.7.11 - frames still in flight when the drain above ran land during that
+	// Sleep and are then read back as the IDN? echo below (the "p??p??HBM,FIT"
+	// garbage seen in the log). Wait for the port to actually go quiet first.
+	this->DrainUntilSettled(HBM_SETTLE_QUIET_MS, HBM_SETTLE_MAX_MS);
 	RtPrintf("HBM Load Cell: Flush complete.\n");
 
 	// First verify load cell is responding with IDN? command
@@ -1469,6 +1480,10 @@ int HBMLoadCell::SendCommand(char *cmd, DWORD response_time)
     if (this->ContMeasOut)
     {
         this->StopContinuousOutput();
+        // 15.7.11 - STP; only sleeps 10 ms before flushing. At 614 frames/s the
+        // bytes already in flight land after that flush and would be read back
+        // as this command's reply. Wait for the port to go quiet first.
+        this->DrainUntilSettled(HBM_SETTLE_QUIET_MS, HBM_SETTLE_MAX_MS);
     }
 
 	if (strcmp(cmd, "STP;") == 0) return(0); //GLC exit on stop command
@@ -1542,6 +1557,174 @@ int HBMLoadCell::SendCommand(char *cmd, DWORD response_time)
 	}
 
     return rc;
+}
+
+
+//---------------------------------------------------------------------------
+// HBMPrintable - Copy a reply into buf with every non-printable byte replaced
+// by '.', so a reply polluted with measurement-frame bytes cannot corrupt the
+// log when it is traced.
+//---------------------------------------------------------------------------
+static char * HBMPrintable(const BYTE * src, char * buf, int size)
+{
+	int  i;
+	char c;
+
+	for (i = 0; i < (size - 1); i++)
+	{
+		c = (char)src[i];
+		if (c == 0) break;
+		buf[i] = ((c >= 32) && (c < 127)) ? c : '.';
+	}
+	buf[i] = 0;
+	return buf;
+}
+
+
+//---------------------------------------------------------------------------
+// HBMLoadCell::DrainUntilSettled - Discard inbound serial bytes until the port
+// has stayed empty for settle_ms, bounded by max_ms.
+//
+// 15.7.11 (Del-directed, SandCat/Linux only). StopContinuousOutput() writes
+// "STP;", sleeps 10 ms, then flushes once. The HBM FIT cell streams at
+// 614 frames/s, so frames already in flight arrive AFTER that single flush and
+// end up being read as the reply to the next query - atoi() then yields a
+// phantom value (e.g. "ASF 0" while the cell EEPROM genuinely holds 5), and
+// the controller "repairs" a setting that was never wrong. Draining to quiet
+// before transmitting removes the pollution source.
+//
+// Deviation note: there is no RTSS/Delphi equivalent of this scenario - the
+// RTX build talks to the slow analog cell and never has a 614 f/s stream to
+// drain - so this is host-side serial robustness, not a parity change.
+//---------------------------------------------------------------------------
+int HBMLoadCell::DrainUntilSettled(DWORD settle_ms, DWORD max_ms)
+{
+	WORD	buf_bytes = 0;
+	DWORD	elapsed   = 0;
+	DWORD	quiet     = 0;
+	DWORD	drained   = 0;
+
+	while (elapsed < max_ms)
+	{
+		buf_bytes = 0;
+		this->serialObj->RtGetComBufferCount(&buf_bytes);
+
+		if (buf_bytes > 0)
+		{
+			drained += buf_bytes;
+			this->FlushComInBuffer();
+			quiet = 0;
+		}
+
+		Sleep(HBM_SETTLE_POLL_MS);
+		elapsed += HBM_SETTLE_POLL_MS;
+
+		if (buf_bytes == 0)
+		{
+			quiet += HBM_SETTLE_POLL_MS;
+			if (quiet >= settle_ms) break;
+		}
+	}
+
+	if (drained > 0)
+	{
+		DebugTrace(_HBMLDCELL_, "DrainUntilSettled: discarded %d late bytes in %d ms \n",
+			(int)drained, (int)elapsed);
+	}
+
+	return NO_ERRORS;
+}
+
+
+//---------------------------------------------------------------------------
+// HBMLoadCell::ReplyPlausible - Sanity check a settings-query reply before it
+// is handed to atoi(). A polluted reply begins with leftover measurement-frame
+// bytes, so it does not begin with a decimal number.
+//   lo/hi : inclusive range the leading integer must fall in. Pass lo > hi to
+//           skip the range test - multi-value replies (LIC, TRC, CWT ...) only
+//           have to start with a number.
+//---------------------------------------------------------------------------
+bool HBMLoadCell::ReplyPlausible(char * reply, int lo, int hi)
+{
+	char *	p = reply;
+	int		val;
+
+	if ((p == NULL) || (*p == 0))
+		return false;					// empty reply is never usable
+
+	while ((*p == ' ') || (*p == '\t'))	// tolerate leading whitespace
+		p++;
+
+	if ((*p == '+') || (*p == '-'))		// signed values (LDW, LIC ...)
+		p++;
+
+	if ((*p < '0') || (*p > '9'))		// must start with a number
+		return false;
+
+	if (lo > hi)						// no range test requested
+		return true;
+
+	val = atoi(reply);
+
+	return ((val >= lo) && (val <= hi));
+}
+
+
+//---------------------------------------------------------------------------
+// HBMLoadCell::SendQueryChecked - Send a settings query, sanity check the
+// reply, and re-read ONCE if it is not plausible.
+//
+// 15.7.11 (Del-directed, SandCat/Linux only). Belt-and-braces companion to the
+// settle-drain, used only for the one-shot bFirstCheck interview at boot. If
+// the second read is no better, the first read's result is restored and used,
+// so this path can never behave worse than 15.7.10. It never loops and never
+// blocks the boot.
+//---------------------------------------------------------------------------
+int HBMLoadCell::SendQueryChecked(char * cmd, DWORD response_time, int lo, int hi)
+{
+	// A settings reply is a few characters ("05\r\n" .. "0,0, 0000000,00,00\r\n"),
+	// so a short prefix is enough to hold the first read verbatim. Deliberately
+	// NOT a full HBM_BUFFER_SIZE (8K) frame on a worker-thread stack.
+	BYTE	first_rx[HBM_FIRST_RX_KEEP];
+	char	shown[32];
+	int		first_rc;
+	int		rc;
+
+	first_rc = this->SendCommand(cmd, response_time);
+
+	if ((first_rc == NO_ERRORS) &&
+		(this->ReplyPlausible((char *)&this->rxmsg[0], lo, hi)))
+	{
+		return first_rc;
+	}
+
+	// Keep the 15.7.10 result so the re-read can only ever improve on it
+	memcpy((char *)&first_rx[0], (char *)&this->rxmsg[0], HBM_FIRST_RX_KEEP);
+	first_rx[HBM_FIRST_RX_KEEP - 1] = 0;
+
+	RtPrintf("HBM Load Cell %d: unusable reply to %s ->%s<- re-reading once\n",
+		this->LoadCellNum + 1, cmd, HBMPrintable(&first_rx[0], shown, sizeof(shown)));
+
+	// Clear the polluted reply, let the port go quiet, then ask again
+	this->FlushComInBuffer();
+	this->DrainUntilSettled(HBM_SETTLE_QUIET_MS, HBM_SETTLE_MAX_MS);
+
+	rc = this->SendCommand(cmd, response_time);
+
+	if ((rc == NO_ERRORS) &&
+		(this->ReplyPlausible((char *)&this->rxmsg[0], lo, hi)))
+	{
+		RtPrintf("HBM Load Cell %d: re-read of %s returned ->%s<-\n",
+			this->LoadCellNum + 1, cmd,
+			HBMPrintable(&this->rxmsg[0], shown, sizeof(shown)));
+		return rc;
+	}
+
+	// Still unusable - use what the first read gave us (15.7.10 behaviour)
+	memset((char *)&this->rxmsg[0], 0, HBM_BUFFER_SIZE);
+	memcpy((char *)&this->rxmsg[0], (char *)&first_rx[0], HBM_FIRST_RX_KEEP);
+
+	return first_rc;
 }
 
 
@@ -1867,35 +2050,40 @@ int HBMLoadCell::HBMCheckSettings()
         {
             this->StopContinuousOutput();
         }
-        
+
+        // 15.7.11 - the stream was stopped here, not inside SendCommand, so the
+        // first query below would otherwise be the one that eats the in-flight
+        // frames. Wait for the port to go quiet before the interview starts.
+        this->DrainUntilSettled(HBM_SETTLE_QUIET_MS, HBM_SETTLE_MAX_MS);
+
 		// Read all settings from load cell the first time through
 		RtPrintf("--------------------------------\n");
 		RtPrintf("HBM Load Cell %d Initial Settings\n", this->LoadCellNum + 1);
 		RtPrintf("--------------------------------\n");
 
         // ASF - Read lowpass filter setting
-        if (this->SendCommand("ASF?;", 3000) == NO_ERRORS)
+        if (this->SendQueryChecked("ASF?;", 3000, 0, 9) == NO_ERRORS)
         {
             app->LastDigLCSet[this->LoadCellNum].ASF = atoi((char *)&this->rxmsg[0]);
             RtPrintf("ASF %d\n", app->LastDigLCSet[this->LoadCellNum].ASF); // Response: 05
         }
         
         // FMD - Read filter mode
-        if (this->SendCommand("FMD?;", 3000) == NO_ERRORS)
+        if (this->SendQueryChecked("FMD?;", 3000, 0, 2) == NO_ERRORS)
         {
     	    app->LastDigLCSet[this->LoadCellNum].FMD = atoi((char *)&this->rxmsg[0]);
             RtPrintf("FMD %d\n", app->LastDigLCSet[this->LoadCellNum].FMD); // Response: 1
         }
         
         // ICR - Read internal conversion rate
-        if (this->SendCommand("ICR?;", 3000) == NO_ERRORS)
+        if (this->SendQueryChecked("ICR?;", 3000, 0, 7) == NO_ERRORS)
         {
     	    app->LastDigLCSet[this->LoadCellNum].ICR = atoi((char *)&this->rxmsg[0]);
             RtPrintf("ICR %d\n", app->LastDigLCSet[this->LoadCellNum].ICR); // Response: 04
         }
         
         // CWT - Read calibration weight
-        if (this->SendCommand("CWT?;", 3000) == NO_ERRORS)
+        if (this->SendQueryChecked("CWT?;", 3000, 1, 0) == NO_ERRORS)
         {
 
 	        pSegment = strtok((char*)&this->rxmsg[0],",");
@@ -1907,42 +2095,42 @@ int HBMLoadCell::HBMCheckSettings()
         }
 
         // LDW - Read load cell dead load weight
-        if (this->SendCommand("LDW?;", 3000) == NO_ERRORS)
+        if (this->SendQueryChecked("LDW?;", 3000, 1, 0) == NO_ERRORS)
         {
     	    app->LastDigLCSet[this->LoadCellNum].LDW = atoi((char *)&this->rxmsg[0]);
             RtPrintf("LDW %d\n", app->LastDigLCSet[this->LoadCellNum].LDW); // Response: 0000000
         }
         
         // LWT - Read load cell live weight
-        if (this->SendCommand("LWT?;", 3000) == NO_ERRORS)
+        if (this->SendQueryChecked("LWT?;", 3000, 1, 0) == NO_ERRORS)
         {
     	    app->LastDigLCSet[this->LoadCellNum].LWT = atoi((char *)&this->rxmsg[0]);
             RtPrintf("LWT %d\n", app->LastDigLCSet[this->LoadCellNum].LWT); // Response: 1000000
         }
         
         // NOV - Read load cell nominal value
-        if (this->SendCommand("NOV?;", 3000) == NO_ERRORS)
+        if (this->SendQueryChecked("NOV?;", 3000, 1, 0) == NO_ERRORS)
         {
     	    app->LastDigLCSet[this->LoadCellNum].NOV = atoi((char *)&this->rxmsg[0]);
             RtPrintf("NOV %d\n", app->LastDigLCSet[this->LoadCellNum].NOV); // Response: 0000000
         }
         
         // RSN - Read load cell resolution
-        if (this->SendCommand("RSN?;", 3000) == NO_ERRORS)
+        if (this->SendQueryChecked("RSN?;", 3000, 1, 0) == NO_ERRORS)
         {
     	    app->LastDigLCSet[this->LoadCellNum].RSN = atoi((char *)&this->rxmsg[0]);
             RtPrintf("RSN %d\n", app->LastDigLCSet[this->LoadCellNum].RSN); // Response: 001
         }
         
         // MTD - Read load cell motion detection setting
-        if (this->SendCommand("MTD?;", 3000) == NO_ERRORS)
+        if (this->SendQueryChecked("MTD?;", 3000, 1, 0) == NO_ERRORS)
         {
     	    app->LastDigLCSet[this->LoadCellNum].MTD = atoi((char *)&this->rxmsg[0]);
             RtPrintf("MTD %d\n", app->LastDigLCSet[this->LoadCellNum].MTD); // Response: 00
         }
         
         // Read load cell linearization coefficients
-        if (this->SendCommand("LIC?;", 3000) == NO_ERRORS) // Response: 0000000, 1000000, 0000000, 0000000
+        if (this->SendQueryChecked("LIC?;", 3000, 1, 0) == NO_ERRORS) // Response: 0000000, 1000000, 0000000, 0000000
         {
 	        pSegment = strtok((char*)&this->rxmsg[0],",");
 	        if (pSegment != NULL)
@@ -1966,7 +2154,7 @@ int HBMLoadCell::HBMCheckSettings()
         }
         
         // ZTR - Read load cell zero tracking setting
-        if (this->SendCommand("ZTR?;", 3000) == NO_ERRORS)
+        if (this->SendQueryChecked("ZTR?;", 3000, 1, 0) == NO_ERRORS)
         {
 	        pSegment = strtok((char*)&this->rxmsg[0],",");
 	        if (pSegment != NULL)
@@ -1977,14 +2165,14 @@ int HBMLoadCell::HBMCheckSettings()
         }
         
         // ZSE - Read load cell zero setting
-        if (this->SendCommand("ZSE?;", 3000) == NO_ERRORS)
+        if (this->SendQueryChecked("ZSE?;", 3000, 1, 0) == NO_ERRORS)
         {
     	    app->LastDigLCSet[this->LoadCellNum].ZSE = atoi((char *)&this->rxmsg[0]);
             RtPrintf("ZSE %d\n", app->LastDigLCSet[this->LoadCellNum].ZSE); // Response: 00
         }
 
         // TRC - Read load cell trigger settings
-        if (this->SendCommand("TRC?;", 3000) == NO_ERRORS)
+        if (this->SendQueryChecked("TRC?;", 3000, 1, 0) == NO_ERRORS)
         {
 	        pSegment = strtok((char*)&this->rxmsg[0],",");
 	        if (pSegment != NULL)
