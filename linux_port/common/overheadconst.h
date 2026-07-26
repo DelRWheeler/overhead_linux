@@ -83,7 +83,7 @@
 
 #define APP_VER1         15 // Major
 #define APP_VER2         7  // Minor
-#define APP_VER3         9	// Local
+#define APP_VER3         10	// Local
 
 #define CREATE_VER_STRING(string) \
     sprintf((char *)string, "GS-1000 RTOS Version %d.%d.%d %s ", \

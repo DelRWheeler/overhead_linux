@@ -2042,16 +2042,20 @@ int HBMLoadCell::HBMCheckSettings()
 		}
 	}
 
+    // SandCat-only deliberate deviation from RTSS, approved by Del 2026-07-26:
+    // FIT-family cells decimate the continuous output by the ASF factor when FMD=1
+    // (measured rate law = 600 / 2^ICR / ASF), so FMD and ICR are host-controlled
+    // here just like ASF already is. RTSS-era cells ignore this distinction.
     // FMD
     this->HBMChangeIntSetting("FMD", &app->LastDigLCSet[this->LoadCellNum].FMD,
-						&app->DefaultDigLCSet[this->LoadCellNum].FMD,                
-						//&app->pShm->scl_set.DigLCSet[this->LoadCellNum].FMD, 
+						&app->pShm->scl_set.DigLCSet[this->LoadCellNum].FMD,
+						//&app->DefaultDigLCSet[this->LoadCellNum].FMD,
                         0, false, true, 3000);
 	
     // ICR
     this->HBMChangeIntSetting("ICR", &app->LastDigLCSet[this->LoadCellNum].ICR,
-                        &app->DefaultDigLCSet[this->LoadCellNum].ICR, 
-                        //&app->pShm->scl_set.DigLCSet[this->LoadCellNum].ICR, 
+                        &app->pShm->scl_set.DigLCSet[this->LoadCellNum].ICR,
+                        //&app->DefaultDigLCSet[this->LoadCellNum].ICR,
                         0, false, true, 3000);
 
     // CWT
