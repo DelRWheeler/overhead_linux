@@ -94,6 +94,94 @@ HANDLE          hFstTimer = NULL;
 HANDLE          hShutdown = NULL;
 HANDLE          hInterfaceThreadsOk = NULL;
 
+// 15.7.13 - universal outputs-disabled interlock. See overheadext.h for the
+// rationale. Set on every shutdown/clear path, never cleared: once we have
+// decided to bring the outputs down, nothing may bring them back up.
+volatile sig_atomic_t g_outputs_disabled = 0;
+
+// 15.7.13 - serializes the read-modify-write of output_byte[] in SetOutput().
+//
+// output_byte[] is a shared bitmap touched from two different timer threads:
+// App_Timer_Main (5 ms - production drops via ProcessSyncs, DecCntrlCtrs
+// turn-off, test fire) and Gp_Timer_Main (500 ms - BatchResetStation's batched
+// station lamps). SETBIT/CLRBIT is a read-modify-write and the port write that
+// follows publishes the whole byte, so an interleave between the two threads
+// could lose a bit - including losing a turn-OFF, i.e. an output stuck on.
+//
+// On RTX this could not happen: RTSS serialized these callbacks by construction
+// (single timer dispatch, priority-ordered, non-preemptible against each other).
+// The Linux port runs them as genuinely concurrent SCHED_RR pthreads, so the
+// serialization has to be explicit. Locked ONLY inside SetOutput() so that
+// ClearOutputs() - which is called from signal-handler context and writes the
+// ports directly, never through SetOutput() - can never block on it.
+static pthread_mutex_t output_byte_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+//--------------------------------------------------------
+// 15.7.13 - logical drop number -> physical output pin map ("pin shift")
+//
+// WHY: an output driver on the card can die. Pitman Farms channel 11 is proven
+// dead at the latch - the controller's command lands correctly in the output
+// byte, but the signal never leaves the card. Rather than rewire the station or
+// renumber the schedule, re-point drop 11 at a spare physical pin.
+//
+// WHERE: applied inside SetOutput(), which is the ONE place a logical drop
+// number becomes a physical byte+bit. Every caller inherits it automatically -
+// production fire from ProcessSyncs(), the DecCntrlCtrs() turn-off pass, the
+// manual test fire, test-fire-at-zero, and BatchResetStation()'s station lamps.
+// There is no second path to the pins, so there is no way to end up with an
+// output that turns on through one route and cannot be turned off through
+// another.
+//
+// SWAP SEMANTICS: an entry "11=23" means 11 -> 23 AND 23 -> 11. Keeping the map
+// a bijection over pin space matters: a plain one-way redirect would let two
+// logical drops land on one physical pin, and then one of them could never be
+// shut off. The swap partner should be a number that can never be scheduled -
+// at Pitman NumDrops is 12, so pin 23 is unreachable by FindDrops() and the
+// fact that "drop 23" now points at the dead pin 11 is inert.
+//
+// DEFAULT IS IDENTITY. No file, empty file, or unreadable file leaves
+// OutputMap[i] == i for every i, which is bit-for-bit the pre-15.7.13
+// behaviour. No box changes behaviour unless someone deliberately places a file
+// on that box.
+//
+// Range is 1..24: the three PCM-3724 primary output ports (A1/B1/C1 at
+// 0x304/0x305/0x306). The VSBC6 secondary bytes are a different card with a
+// different write path and are deliberately out of scope.
+//--------------------------------------------------------
+
+#define OUTMAP_MIN_PIN   1
+#define OUTMAP_MAX_PIN   24
+
+static unsigned char OutputMap[OUTMAP_MAX_PIN + 1];   // 1-based; [0] unused
+static bool          OutputMapActive = false;         // true = a file changed something
+
+//--------------------------------------------------------
+//  InitOutputMap - reset the map to identity (no remapping)
+//--------------------------------------------------------
+
+static void InitOutputMap()
+{
+    for (int i = 0; i <= OUTMAP_MAX_PIN; i++)
+        OutputMap[i] = (unsigned char) i;
+
+    OutputMapActive = false;
+}
+
+//--------------------------------------------------------
+//  MapOutputPin - logical drop number -> physical output pin
+//
+// Hot path: called on every output transition. One compare and out unless a
+// valid map file was loaded at startup.
+//--------------------------------------------------------
+
+static inline int MapOutputPin(int num)
+{
+    if (!OutputMapActive)                              return num;
+    if (num < OUTMAP_MIN_PIN || num > OUTMAP_MAX_PIN)  return num;
+
+    return (int) OutputMap[num];
+}
+
 ser_typ::UCB   ucbList[COM_MAX_PORTS] = {
 
 #ifdef _SIMULATION_MODE_
@@ -727,6 +815,14 @@ void overhead::initialize()
     RtPrintf("  Calling ReadConfiguration()...\n");
     ReadConfiguration();
     RtPrintf("  ReadConfiguration complete\n");
+
+//----- 15.7.13: optional logical drop -> physical output pin map.
+//      Must be loaded before InitIO()/the timers so the very first output
+//      transition already goes to the right pin. Absent file = identity.
+
+    RtPrintf("  Calling LoadOutputMap()...\n");
+    LoadOutputMap();
+    RtPrintf("  LoadOutputMap complete\n");
 
 //----- Set initial InterSystem fastest indices for each drop
 
@@ -3976,9 +4072,28 @@ void __stdcall overhead::App_Timer_Main(PVOID addr)
     if (app->pShm->dbg_set.dbg_output)
     {
         int testDrop = app->pShm->dbg_set.dbg_output;
-        app->SetOutput(testDrop, true);
-        if (testDrop >= 1 && testDrop <= MAXOUTPUTBYTS * 8)
-            app->output_timer[testDrop - 1] = 1000;   // ~5 s hold (1000 * 5 ms)
+
+        // 15.7.13: enforce the rule the comment above already states. A 5 s open
+        // paddle during production catches the next bird and bends the cylinder,
+        // so refuse the request outright when the line is running rather than
+        // relying on the operator. "Running" is decided exactly the way the
+        // existing LC_REINIT guard decides it (see the LC_REINIT case in
+        // Mbx_Server): OpMode == ModeRun means the line is up; every other mode
+        // (ModeStart, the tare/span modes, ModeRaw) means it is stopped.
+        if (app->pShm->OpMode == ModeRun)
+        {
+            app->GenError(warning,
+                (char*)"Test Fire ignored - stop the line first.\n");
+            RtPrintf("Test Fire drop %d REFUSED: line is running (OpMode=%d).\n",
+                     testDrop, app->pShm->OpMode);
+        }
+        else
+        {
+            app->SetOutput(testDrop, true);
+            if (testDrop >= 1 && testDrop <= MAXOUTPUTBYTS * 8)
+                app->output_timer[testDrop - 1] = 1000;   // ~5 s hold (1000 * 5 ms)
+        }
+
         app->pShm->dbg_set.dbg_output = 0;
     }
 
@@ -5250,6 +5365,205 @@ int __stdcall overhead::MbxEventHandler(PVOID unused)
 }
 
 //--------------------------------------------------------
+//  LoadOutputMap - read the optional logical->physical output pin map
+//
+// File (absent on every box unless deliberately placed):
+//     <dchservices>/data/settings/output_map.cfg
+//
+// Format - one mapping per line, '#' starts a comment, blank lines ignored:
+//     11=23          # drop 11 fires physical pin 23 (and pin 23 <- drop 23 -> 11)
+//
+// Each line is a SWAP, so pin space always stays one-to-one. See the OutputMap
+// block at the top of this file for why.
+//
+// Validation is strict and ALL-OR-NOTHING: any bad line rejects the whole file
+// and leaves the map at identity. A half-applied map would be far more
+// dangerous than no map - a drop could fire on one pin and clear on another.
+//--------------------------------------------------------
+
+void overhead::LoadOutputMap()
+{
+    int i;
+
+    InitOutputMap();                       // identity unless a good file says otherwise
+
+    FILE* fp = fopen(OUTMAP_FILE_PATH, "r");
+
+    if (fp == NULL)
+    {
+        // The normal case for the whole fleet. Not an error, but say so out loud
+        // so the log always states which regime this box is in.
+        RtPrintf("OUTPUT MAP: no %s - outputs are 1:1 (drop N fires pin N).\n",
+                 OUTMAP_FILE_PATH);
+        return;
+    }
+
+    unsigned char tmp     [OUTMAP_MAX_PIN + 1];
+    bool          assigned[OUTMAP_MAX_PIN + 1];
+
+    for (i = 0; i <= OUTMAP_MAX_PIN; i++)
+    {
+        tmp[i]      = (unsigned char) i;
+        assigned[i] = false;
+    }
+
+    char line[256];
+    int  lineno  = 0;
+    int  entries = 0;
+    bool bad     = false;
+
+    while (fgets(line, sizeof(line), fp) != NULL)
+    {
+        lineno++;
+
+        // strip comment
+        char* hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+
+        // skip blank / whitespace-only
+        char* p = line;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p == '\0') continue;
+
+        int  logical = 0, physical = 0;
+        char trailing = 0;
+
+        // Exactly two numbers and nothing else. The leading space before %c
+        // eats the newline, so a clean line returns 2 and any trailing junk
+        // returns 3.
+        if (sscanf(p, " %d = %d %c", &logical, &physical, &trailing) != 2)
+        {
+            RtPrintf("OUTPUT MAP ERROR: %s line %d: expected 'logical=physical', got: %s\n",
+                     OUTMAP_FILE_PATH, lineno, p);
+            bad = true;
+            break;
+        }
+
+        if (logical  < OUTMAP_MIN_PIN || logical  > OUTMAP_MAX_PIN ||
+            physical < OUTMAP_MIN_PIN || physical > OUTMAP_MAX_PIN)
+        {
+            RtPrintf("OUTPUT MAP ERROR: %s line %d: '%d=%d' - both numbers must be %d..%d "
+                     "(the three PCM-3724 primary output ports).\n",
+                     OUTMAP_FILE_PATH, lineno, logical, physical,
+                     OUTMAP_MIN_PIN, OUTMAP_MAX_PIN);
+            bad = true;
+            break;
+        }
+
+        if (assigned[logical] || assigned[physical])
+        {
+            RtPrintf("OUTPUT MAP ERROR: %s line %d: '%d=%d' - output %d is already used by an "
+                     "earlier line. Each output number may appear only once, on either side.\n",
+                     OUTMAP_FILE_PATH, lineno, logical, physical,
+                     assigned[logical] ? logical : physical);
+            bad = true;
+            break;
+        }
+
+        // Swap - keeps the map a bijection over pin space.
+        tmp[logical]  = (unsigned char) physical;
+        tmp[physical] = (unsigned char) logical;
+
+        assigned[logical]  = true;
+        assigned[physical] = true;
+
+        if (logical != physical) entries++;
+    }
+
+    fclose(fp);
+
+    // Belt and braces: prove the result really is one-to-one before we trust it
+    // with the outputs. Cheap, and it can only ever fire on a logic error above.
+    if (!bad)
+    {
+        bool seen[OUTMAP_MAX_PIN + 1];
+
+        for (i = 0; i <= OUTMAP_MAX_PIN; i++) seen[i] = false;
+
+        for (i = OUTMAP_MIN_PIN; i <= OUTMAP_MAX_PIN; i++)
+        {
+            int v = tmp[i];
+
+            if (v < OUTMAP_MIN_PIN || v > OUTMAP_MAX_PIN || seen[v])
+            {
+                RtPrintf("OUTPUT MAP ERROR: %s does not produce a one-to-one map "
+                         "(output %d is reached more than once).\n", OUTMAP_FILE_PATH, v);
+                bad = true;
+                break;
+            }
+            seen[v] = true;
+        }
+    }
+
+    if (bad)
+    {
+        InitOutputMap();                   // back to identity - reject the WHOLE file
+
+        RtPrintf("***************************************************************\n");
+        RtPrintf("*** OUTPUT MAP REJECTED - %s ignored.\n", OUTMAP_FILE_PATH);
+        RtPrintf("*** Outputs are 1:1 (drop N fires pin N). Fix the file and restart.\n");
+        RtPrintf("***************************************************************\n");
+
+        sprintf(app_err_buf,
+                "Output map file invalid - ignored, outputs are 1:1\n");
+        GenError(warning, app_err_buf);
+        return;
+    }
+
+    if (entries == 0)
+    {
+        RtPrintf("OUTPUT MAP: %s present but contains no mappings - outputs are 1:1.\n",
+                 OUTMAP_FILE_PATH);
+        return;
+    }
+
+    memcpy(OutputMap, tmp, sizeof(OutputMap));
+    OutputMapActive = true;
+
+    // Loud on purpose. This is the answer for the next technician who meters a
+    // pin, finds nothing, and has no idea the box is remapped.
+    RtPrintf("***************************************************************\n");
+    RtPrintf("*** OUTPUT MAP ACTIVE - physical pins do NOT match drop numbers\n");
+    RtPrintf("*** Source: %s\n", OUTMAP_FILE_PATH);
+
+    for (i = OUTMAP_MIN_PIN; i <= OUTMAP_MAX_PIN; i++)
+    {
+        // print each swapped pair once, from the lower number
+        if ((int) OutputMap[i] > i)
+            RtPrintf("*** OUTPUT MAP: drop %d -> pin %d (and %d -> %d)\n",
+                     i, (int) OutputMap[i], (int) OutputMap[i], i);
+    }
+
+    RtPrintf("*** All other outputs are 1:1.\n");
+
+    // Boaz mode drives logical outputs 13..16 as the per-station "batched"
+    // lamps (BatchResetStation). Those are real consumers of pin space, so a
+    // map that touches 13..16 while Boaz is enabled will send a lamp to the
+    // swapped pin and put a drop on the lamp's wiring. Warn loudly rather than
+    // reject: the map may still be exactly what the site wants, but nobody
+    // should discover this by watching a lamp stop working.
+    if (pShm->sys_set.MiscFeatures.EnableBoazMode)
+    {
+        for (i = 13; i <= 16; i++)
+        {
+            if ((int) OutputMap[i] != i)
+            {
+                RtPrintf("*** WARNING: Boaz mode is ENABLED and output %d is remapped.\n", i);
+                RtPrintf("***          Outputs 13-16 are the Boaz batched-station lamps;\n");
+                RtPrintf("***          station %d's lamp now drives pin %d. Verify the wiring.\n",
+                         i - 12, (int) OutputMap[i]);
+
+                sprintf(app_err_buf,
+                        "Output map remaps output %d while Boaz mode is on - check station wiring\n", i);
+                GenError(warning, app_err_buf);
+            }
+        }
+    }
+
+    RtPrintf("***************************************************************\n");
+}
+
+//--------------------------------------------------------
 //  ClearOutputs
 //--------------------------------------------------------
 
@@ -5257,6 +5571,22 @@ void overhead::ClearOutputs()
 {
     const PUCHAR out_port[MAXOUTPUTBYTS-2] = {PCM_3724_1_PORT_A1,PCM_3724_1_PORT_B1,
                                               PCM_3724_1_PORT_C1};
+
+//----- 15.7.13: arm the interlock BEFORE the first port write.
+//
+//      Every caller of ClearOutputs() is a shutdown path, and every one of them
+//      previously had the same hole: the clear happened, then the still-running
+//      scan put outputs straight back up. Setting the flag here makes that
+//      impossible for every caller at once, including the EXCEPTION_SHUTDOWN
+//      macro paths in DropManager.cpp / InterSystems.cpp.
+//
+//      Deliberately NOT taking output_byte_mutex: this function runs from
+//      signal-handler context (ShutdownHandler) and must never be able to block
+//      on a lock held by a thread we are about to stop. The interlock above plus
+//      the settle delay the callers apply after cancelling the timers is what
+//      closes the race, not the mutex.
+
+    g_outputs_disabled = 1;
 
 //----- primary i/o
 
@@ -6563,11 +6893,43 @@ void overhead::SetOutput(int num, DBOOL active)
 
     if (simulation_mode) return;
 
-    byte = ((num - 1) / 8);
-    bit  = num - 1;
+//----- 15.7.13: universal outputs-disabled interlock.
+//
+//      Once any shutdown or clear-outputs path has run, NOTHING may drive an
+//      output again. This is the single choke point that guarantees it: the
+//      production scan, the batch-station lamps, a test fire in mid-hold and
+//      DecCntrlCtrs all funnel through here. One branch, no configuration
+//      dependence - it behaves identically for 1 line or 4, 8 drops or 32,
+//      grading on or off, EPM15/EPM19/VSBC.
+
+    if (g_outputs_disabled) return;
+
+//----- 15.7.13: logical drop number -> physical output pin.
+//
+//      This is the single choke point where a drop number becomes a byte+bit,
+//      so mapping here covers every caller at once: production fire, the
+//      DecCntrlCtrs() turn-off pass, manual test fire, test-fire-at-zero and
+//      BatchResetStation()'s station lamps. Identity unless a validated
+//      output_map.cfg was loaded at startup (see LoadOutputMap).
+//
+//      NOTE the asymmetry below and keep it: byte/bit - the HARDWARE - use the
+//      mapped pin, while output_timer[] stays indexed by the LOGICAL drop
+//      number, because that is how every other piece of code indexes it
+//      (DecCntrlCtrs walks output_timer[i] and calls SetOutput(i+1,...), the
+//      test fire writes output_timer[testDrop-1]). Mapping the timer index too
+//      would double-apply the map and a remapped drop would never turn off.
+
+    int phys = MapOutputPin(num);
+
+    byte = ((phys - 1) / 8);
+    bit  = phys - 1;
 
     if (byte < MAXOUTPUTBYTS)
     {
+        // 15.7.13: the read-modify-write below plus the port write that
+        // publishes it must be atomic against the other timer thread. See
+        // output_byte_mutex at the top of this file.
+        pthread_mutex_lock(&output_byte_mutex);
 
 //----- set/clear the output_byte bits
 
@@ -6658,6 +7020,7 @@ void overhead::SetOutput(int num, DBOOL active)
                 break;
 		} // end switch (byte)
 
+        pthread_mutex_unlock(&output_byte_mutex);   // 15.7.13
     }
     else
         RtPrintf("Error file %s, line %d \n", _FILE_, __LINE__);

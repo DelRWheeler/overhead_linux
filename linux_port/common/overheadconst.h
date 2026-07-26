@@ -83,7 +83,7 @@
 
 #define APP_VER1         15 // Major
 #define APP_VER2         7  // Minor
-#define APP_VER3         12	// Local
+#define APP_VER3         13	// Local
 
 #define CREATE_VER_STRING(string) \
     sprintf((char *)string, "GS-1000 RTOS Version %d.%d.%d %s ", \
@@ -618,6 +618,8 @@ enum {
 #define SCL_FILE_PATH  DCHSERVICES_BASE "/data/settings/scale.bin"
 #define TARE_FILE_PATH DCHSERVICES_BASE "/data/settings/tares.bin"
 #define SCH_FILE_PATH  DCHSERVICES_BASE "/data/settings/schedule.bin"
+// 15.7.13 - optional logical-drop -> physical-output-pin map. Absent = identity.
+#define OUTMAP_FILE_PATH DCHSERVICES_BASE "/data/settings/output_map.cfg"
 
 #elif !defined(_SIM_LAPTOP_)
 
@@ -629,6 +631,7 @@ enum {
 #define SCL_FILE_PATH  "d:\\dchservices\\settings\\scale.bin"
 #define TARE_FILE_PATH "d:\\dchservices\\settings\\tares.bin"
 #define SCH_FILE_PATH  "d:\\dchservices\\settings\\schedule.bin"
+#define OUTMAP_FILE_PATH "d:\\dchservices\\settings\\output_map.cfg"
 
 #else
 
@@ -640,6 +643,7 @@ enum {
 #define SCL_FILE_PATH  "c:\\dchservices\\settings\\scale.bin"
 #define TARE_FILE_PATH "c:\\dchservices\\settings\\tares.bin"
 #define SCH_FILE_PATH  "c:\\dchservices\\settings\\schedule.bin"
+#define OUTMAP_FILE_PATH "c:\\dchservices\\settings\\output_map.cfg"
 
 #endif
 

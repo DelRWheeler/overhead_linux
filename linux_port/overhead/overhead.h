@@ -312,6 +312,7 @@ public:
     virtual ~overhead();
 
     void    ClearOutputs();
+    void    LoadOutputMap();                    // 15.7.13 - optional logical drop -> physical pin map
     void    GenError(int sev, char* txt);
     void    PostShutdownMessage();              // power-loss graceful shutdown (Linux)
     void    initialize();

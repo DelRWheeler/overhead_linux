@@ -45,6 +45,23 @@ volatile int g_gptimer_last_tick  = 0;
 
 static void overhead_crash_handler(int sig, siginfo_t *info, void *ctx)
 {
+    //--------------------------------------------------------
+    // 15.7.13 - DROP THE OUTPUTS FIRST.
+    //
+    // Everything below this point is diagnostics, and every path out of this
+    // handler ends in _exit(). The PCM-3724 output ports are latches: if we die
+    // here with a drop paddle energized, that paddle stays open on the ribbon
+    // until the application comes back and clears it. Clear the latches before
+    // we touch a single thing that could itself fault, block, or run long.
+    //
+    // Raw port writes, not app->ClearOutputs(): we are in a crash handler, so
+    // `app` and `app->pShm` are exactly the things that may be corrupt - the
+    // sentinel diagnostics below exist because that has actually happened.
+    // See EmergencyClearOutputs() in platform.h.
+    //--------------------------------------------------------
+    EmergencyClearOutputs();
+    g_outputs_disabled = 1;
+
     // Write to BOTH stdout and stderr and a file - ensure something gets captured
     const char marker[] = "\n!!! OVERHEAD CRASH HANDLER ENTERED !!!\n";
     write(STDOUT_FILENO, marker, sizeof(marker) - 1);
@@ -384,6 +401,35 @@ int main(int argc, char* argv[])
     GetDateStr(date_dt_str);
     RtPrintf("Overhead RTOS Shutdown %s\n\n", date_dt_str );
 
+    //--------------------------------------------------------
+    // 15.7.13 - STOP THE SCAN, THEN CLEAR. (RTX ordering, restored.)
+    //
+    // RTX Main.cpp:135-155 cancels hAppTimer and hGpTimer and closes the
+    // DropManager/Debug threads BEFORE calling ClearOutputs(). This port had
+    // ClearOutputs() with no cancels at all, so the 5 ms App scan and the 500 ms
+    // Gp scan were still running while - and after - the outputs were cleared.
+    // Both of them drive outputs: ProcessSyncs()/test fire from App_Timer_Main,
+    // and BatchResetStation()'s batched-station lamps from Gp_Timer_Main, which
+    // re-asserts SetOutput(i+13, true) with output_timer = 0xFFFF on every tick.
+    // So the clear was routinely undone within milliseconds, and whatever the
+    // scan last wrote is what the PCM-3724 latches kept holding after we exit.
+    //
+    // Cancel first, let the scan drain, then clear - and the interlock inside
+    // ClearOutputs() makes sure nothing that is still winding down can put an
+    // output back up behind us.
+    //--------------------------------------------------------
+    if (hAppTimer != NULL) RtCancelTimer(hAppTimer, NULL);
+    if (hFstTimer != NULL) RtCancelTimer(hFstTimer, NULL);
+    if (hGpTimer  != NULL) RtCancelTimer(hGpTimer,  NULL);
+
+    // RtCancelTimer() on Linux only sets active=0 (platform.h RtCancelTimer);
+    // each timer thread notices at its next wake and exits. App_Timer_Main -
+    // the only callback in the 5 ms class, and the one that fires drops - has a
+    // 5 ms period, so 20 ms is four full periods of margin. The 200 ms Fst and
+    // 500 ms Gp threads may still be winding down after this delay; that is
+    // fine, because SetOutput() is already interlocked off for them.
+    Sleep(20);
+
     // Clear outputs before exiting
     app->ClearOutputs();
 
@@ -507,10 +553,71 @@ void ShutdownHandler(PVOID unused, LONG reason)
         snprintf(shutdown_reason, sizeof(shutdown_reason), "ShutdownHandler: %s", s);
         logAppFlagsChange(shutdown_reason);
     }
-    // don't lose any records
-    app->saveDrpRecs = true;
-    Sleep(500);
+    //--------------------------------------------------------
+    // 15.7.13 - this is the path a GUI restart actually takes, and it is the
+    // one that left drops energized at Pitman Farms on 2026-07-26.
+    //
+    // What the old sequence did:
+    //
+    //     saveDrpRecs = true;  Sleep(500);  ClearOutputs();
+    //     AppFlags = 0;        Sleep(3000);
+    //
+    // That is a verbatim copy of the RTX handler, and under RTX it was correct:
+    // RTSS let the handler run to completion. On Linux the GUI's restart path
+    // (dch-server-gui.py kill_existing_instance) is
+    //
+    //     killall interface overhead   ->  1 second  ->  killall -9
+    //
+    // so we own the process for about one second, no more. The old sequence
+    // burned half of that budget sleeping BEFORE the clear, and - worse - it
+    // never stopped the scan. Gp_Timer_Main kept ticking every 500 ms calling
+    // BatchResetStation(), which re-asserts SetOutput(i+13, true) for every
+    // batched station; App_Timer_Main kept ticking every 5 ms firing drops and
+    // holding a test fire's 5 s output_timer up. So the clear at t=500 ms was
+    // promptly undone, and the SIGKILL at t=1000 ms froze whatever the scan had
+    // last written into the PCM-3724 output latches - which hold their last byte
+    // with the process gone. A drop could sit energized until the next start.
+    //
+    // The new sequence puts the safety work first and finishes it inside ~20 ms:
+    //   1. arm the interlock             - no code path can drive an output again
+    //   2. cancel the scan timers        - RTX ordering (RTX Main.cpp:135-155)
+    //   3. settle 20 ms                  - four App-scan periods
+    //   4. clear the outputs             - and it stays cleared
+    // and only then does the bookkeeping that is allowed to lose a race.
+    //--------------------------------------------------------
+
+    // (1) Interlock first. ClearOutputs() sets this too, but set it here as
+    //     well so it is armed for the whole cancel/settle window below.
+    g_outputs_disabled = 1;
+
+    // (2) Stop the scans that drive outputs. RTX cancelled the timers before
+    //     clearing; this port did not cancel them at all.
+    if (hAppTimer != NULL) RtCancelTimer(hAppTimer, NULL);
+    if (hFstTimer != NULL) RtCancelTimer(hFstTimer, NULL);
+    if (hGpTimer  != NULL) RtCancelTimer(hGpTimer,  NULL);
+
+    // (3) RtCancelTimer() only sets active=0; the timer thread exits at its next
+    //     wake. App_Timer_Main runs every 5 ms, so 20 ms is four periods.
+    Sleep(20);
+
+    // (4) Outputs down, and the interlock keeps them down.
     app->ClearOutputs();
+
+    // ---- from here on nothing can energize an output, so the remaining work
+    //      is free to be interrupted by the GUI's SIGKILL ----
+
     app->pShm->AppFlags = 0;
-    Sleep(3000);
+
+    // Don't lose any records. saveDrpRecs is normally serviced by Gp_Timer_Main,
+    // which we just cancelled, so save synchronously here instead - this mirrors
+    // what the RTX main-exit path does (RTX Main.cpp:118, SaveDropRecords(true)
+    // ahead of the timer cancels). The flag is still set as well so the main-exit
+    // path below picks it up if this call is cut short.
+    app->saveDrpRecs = true;
+    if (isPShmValid())
+        app->SaveDropRecords(true);
+
+    // Trailing sleep kept SHORT. The old Sleep(3000) could not complete anyway -
+    // SIGKILL lands at ~1 s - and there is nothing left to wait for.
+    Sleep(200);
 }

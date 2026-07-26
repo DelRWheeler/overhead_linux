@@ -1,10 +1,17 @@
 #pragma once
 
 // save drop records, clear outputs and shutdown
+//
+// 15.7.13: clear the outputs FIRST, then do the record bookkeeping. The old
+// order slept 500 ms with the scan still running and outputs still up before
+// clearing them, which is the same hole that left drops energized on the
+// ShutdownHandler path. ClearOutputs() arms the outputs-disabled interlock, so
+// once the first line below has run nothing can re-energize an output while the
+// rest of this shutdown completes.
 #define EXCEPTION_SHUTDOWN \
+app->ClearOutputs(); \
 app->saveDrpRecs = true; \
 Sleep(500); \
-app->ClearOutputs(); \
 if (isPShmValid()) { logAppFlagsChange("EXCEPTION_SHUTDOWN macro"); app->pShm->AppFlags = 0; }
 
 #define SYNC_OK     (pSyncStat->zeroed) && (trolly_counters[i] == syncOffset) //jdc

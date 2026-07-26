@@ -894,9 +894,58 @@ static void _signal_handler(int sig)
     }
 }
 
+//------------------------------------------------------------------------
+// 15.7.13 - Emergency output clear, safe to call from a signal handler
+//
+// The PCM-3724 output ports are LATCHES. Whatever byte was written last stays
+// driven on the ribbon after the process dies - nothing in the hardware resets
+// them. So if we _exit() out of a crash handler with a drop paddle energized,
+// that paddle stays OPEN until the application is restarted and clears it.
+// Field-proven at Pitman Farms 2026-07-26.
+//
+// Port map (linux_port/overhead/3724_io.h): PCM_3724_1_BASE_ADDR = 0x300, and
+// the three output ports A1/B1/C1 are base+4/+5/+6 = 0x304/0x305/0x306.
+// Polarity is ACTIVE LOW: overhead::ClearOutputs() writes ~0 == 0xFF to turn
+// everything off, so 0xFF here means "all outputs off".
+//
+// Deliberately RAW outb() rather than overhead::ClearOutputs(): in a crash
+// context `app` and `app->pShm` may be garbage - that is usually WHY we are
+// here - so the class method cannot be trusted. outb() is one instruction with
+// no libc state behind it, so it is safe from a signal handler.
+//
+// iopl() is PER-THREAD on Linux and is NOT inherited (see _timer_thread_func,
+// which has to raise it again for exactly this reason). A crash on a thread
+// that never raised it - GpSend, DropManager, the load cell worker - would
+// fault on outb, so raise it here first. iopl() is a bare syscall wrapper: no
+// locks, no allocation, no libc state, so it is async-signal-safe in practice.
+// If it FAILS we must not attempt the writes: an unprivileged outb raises
+// SIGSEGV, and taking a fault inside a signal handler would turn a clean exit
+// into a fault loop. This also keeps the helper harmless in the `interface`
+// process, which shares platform.h but does not own the I/O ports.
+//------------------------------------------------------------------------
+
+#define EMERGENCY_OUT_PORT_A1   0x304   // PCM_3724_1_PORT_A1  (drops  1-8)
+#define EMERGENCY_OUT_PORT_B1   0x305   // PCM_3724_1_PORT_B1  (drops  9-16)
+#define EMERGENCY_OUT_PORT_C1   0x306   // PCM_3724_1_PORT_C1  (drops 17-24)
+
+static inline void EmergencyClearOutputs(void)
+{
+    if (iopl(3) != 0)
+        return;                         // no port privilege - do NOT outb()
+
+    outb(0xFF, EMERGENCY_OUT_PORT_A1);
+    outb(0xFF, EMERGENCY_OUT_PORT_B1);
+    outb(0xFF, EMERGENCY_OUT_PORT_C1);
+}
+
 // Catch-all handler for unexpected signals that would kill the process
 static void _unexpected_signal_handler(int sig, siginfo_t* info, void* context)
 {
+    // 15.7.13 - FIRST, before anything that can itself fault or block: drop
+    // every output latch. This handler ends in _exit(), so this is the last
+    // chance to de-energize a paddle before the hardware is left holding it.
+    EmergencyClearOutputs();
+
     char buf[256];
     int len = snprintf(buf, sizeof(buf),
         "\n*** UNEXPECTED SIGNAL: %d at address %p (pid=%d) ***\n",
