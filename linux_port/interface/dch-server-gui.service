@@ -1,0 +1,31 @@
+[Unit]
+Description=DCH Server GUI (Kiosk Mode)
+After=multi-user.target systemd-user-sessions.service
+Conflicts=getty@tty1.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Run as root - interface/overhead need iopl(3) for hardware I/O
+User=root
+Environment=HOME=/home/dchservice
+Environment=TERM=linux
+
+# Restore kernel console messages before starting X
+ExecStartPre=/bin/dmesg -n 7
+# Clean stale IPC shared memory and semaphores from previous crashed processes
+ExecStartPre=-/bin/sh -c 'rm -f /dev/shm/Tx_Shm /dev/shm/Rx_Shm /dev/shm/HstTx_Shm /dev/shm/App_Msg_Shm /dev/shm/DM_Msg_Shm /dev/shm/Isys_Msg_Shm /dev/shm/SharedMemory /dev/shm/TelnetTermSMem /dev/shm/TraceMemory /dev/shm/sem.*'
+
+# Start X server on vt1 with the kiosk script as the client
+ExecStart=/usr/bin/xinit /home/dchservice/dchservices/bin/start-kiosk.sh -- :0 vt1 -keeptty -nolisten tcp
+
+# When stopped, suppress kernel spam and restore login prompt on tty1
+ExecStopPost=-/home/dchservice/dchservices/bin/show-stopped.sh
+
+WorkingDirectory=/home/dchservice/dchservices
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
