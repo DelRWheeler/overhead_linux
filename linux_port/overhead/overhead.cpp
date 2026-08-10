@@ -4073,26 +4073,34 @@ void __stdcall overhead::App_Timer_Main(PVOID addr)
     {
         int testDrop = app->pShm->dbg_set.dbg_output;
 
-        // 15.7.13: enforce the rule the comment above already states. A 5 s open
-        // paddle during production catches the next bird and bends the cylinder,
-        // so refuse the request outright when the line is running rather than
-        // relying on the operator. "Running" is decided exactly the way the
-        // existing LC_REINIT guard decides it (see the LC_REINIT case in
-        // Mbx_Server): OpMode == ModeRun means the line is up; every other mode
-        // (ModeStart, the tare/span modes, ModeRaw) means it is stopped.
+        // 15.7.13: WARNING ONLY - always perform the fire.
+        //
+        // An earlier cut of this change refused the request while
+        // OpMode == ModeRun, borrowing the LC_REINIT guard's idiom. That is
+        // WRONG here and was caught before it shipped: OpMode sits at ModeRun
+        // during normal operation whether or not the chain is turning. Pitman
+        // ran ModeRun all afternoon on 2026-07-26 with the chain physically
+        // stopped while dozens of manual test fires were performed - that is
+        // the standard commissioning workflow and has been for 25 years. A
+        // refusal on ModeRun would block every legitimate test fire.
+        //
+        // So: log it and fire it. The pre-15.7.13 behaviour is preserved
+        // exactly; the only addition is a breadcrumb in the log.
+        //
+        // A real "the chain is actually moving" guard needs sync/SPM activity,
+        // not OpMode. Deferred to 15.7.14 as a daylight item - it is the guard
+        // the hazard comment above actually wants, and getting it wrong in
+        // either direction is costly.
         if (app->pShm->OpMode == ModeRun)
         {
-            app->GenError(warning,
-                (char*)"Test Fire ignored - stop the line first.\n");
-            RtPrintf("Test Fire drop %d REFUSED: line is running (OpMode=%d).\n",
-                     testDrop, app->pShm->OpMode);
+            RtPrintf("Test Fire drop %d: 5 s hold while OpMode=ModeRun. "
+                     "Confirm the chain is stopped - a 5 s open paddle will "
+                     "catch a bird and bend the cylinder.\n", testDrop);
         }
-        else
-        {
-            app->SetOutput(testDrop, true);
-            if (testDrop >= 1 && testDrop <= MAXOUTPUTBYTS * 8)
-                app->output_timer[testDrop - 1] = 1000;   // ~5 s hold (1000 * 5 ms)
-        }
+
+        app->SetOutput(testDrop, true);
+        if (testDrop >= 1 && testDrop <= MAXOUTPUTBYTS * 8)
+            app->output_timer[testDrop - 1] = 1000;   // ~5 s hold (1000 * 5 ms)
 
         app->pShm->dbg_set.dbg_output = 0;
     }
