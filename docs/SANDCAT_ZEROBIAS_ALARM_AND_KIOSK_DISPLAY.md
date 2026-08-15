@@ -108,3 +108,57 @@ Deployed on `.11` at **1600×880 / 20pt menu** (panel reports 1680×945).
   and the load cell re-inits. Fine on a test line; coordinate on a live plant.
 - Backups from this change: `overhead.bak-20260715-171955`,
   `dch-server-gui.py.bak-20260715-171402`, `start-kiosk.sh.bak-20260715-171402`.
+
+---
+
+## 10" kiosk window position — `DCH_GUI_X` / `DCH_GUI_Y` offsets (2026-08-15, Holmes Foods)
+
+**Problem (overscan).** The 10" touch panels over-report their usable area in EDID, so a
+full-frame kiosk window placed at origin `0,0` spilled off the **left and top** edges — the
+menu bar and part of the left column were pushed past the visible glass. Section 3 above already
+added `DCH_GUI_WIDTH` / `DCH_GUI_HEIGHT` to shrink the window, but shrinking alone leaves the
+window pinned at the top-left, so the clipped-off area stayed clipped. What was missing was a way
+to **move the window's origin** down and to the right into the visible region.
+
+**New offset env vars.** `dch-server-gui.py` now also reads two position variables alongside the
+existing size ones:
+
+| Env var | Default | Effect |
+|---|---|---|
+| `DCH_GUI_X` | `0` | window origin X — pushes the window **right** off the left edge |
+| `DCH_GUI_Y` | `0` | window origin Y — pushes the window **down** off the top edge |
+
+Default `0,0` is unchanged (top-left) behavior, so boxes that don't set them are unaffected. On
+realize the GUI now does `move(DCH_GUI_X, DCH_GUI_Y)` then `resize(DCH_GUI_WIDTH, DCH_GUI_HEIGHT)`.
+
+**Approved standard values (10" panel).** Tuned live on both Holmes Foods controllers (`.11` and
+`.12`) and approved:
+
+```
+DCH_GUI_X=300
+DCH_GUI_Y=50
+DCH_GUI_WIDTH=1600
+DCH_GUI_HEIGHT=1100
+```
+
+**Now version-controlled.** These four exports previously lived only in the hand-edited
+`~/dchservices/bin/start-kiosk.sh` on each box — there was no copy in the repo, and this is the
+**third time** we've hand-fixed this same panel geometry. The canonical launcher carrying the
+approved values now lives in the repo at **`linux_port/interface/start-kiosk.sh`** (mode 0755), so
+it is the source of truth going forward rather than tribal knowledge on the boxes.
+
+**Overriding per-panel.** If a future screen has different overscan, edit the four `export` lines
+(`DCH_GUI_X` / `DCH_GUI_Y` / `DCH_GUI_WIDTH` / `DCH_GUI_HEIGHT`) at the top of `start-kiosk.sh` on
+that box and restart `dch-server-gui`. Note that restarting the GUI **bounces the controller too**
+(same service) — weighing stops and the load cell re-inits — so only do this when the line is
+**not weighing**.
+
+### ⚠️ Open action item — update the CLONE-MASTER image
+
+New SandCat controllers are produced by **cloning an existing controller image**, *not* by
+deploying from this repo. So committing `start-kiosk.sh` and the `dch-server-gui.py` change here
+does **not**, by itself, make future controllers inherit the fix. For that to happen automatically,
+the **clone-master image must be updated** with the new `start-kiosk.sh` (the approved geometry) and
+the updated `dch-server-gui.py` (the `DCH_GUI_X`/`DCH_GUI_Y` support). Until the master image is
+refreshed, freshly cloned boxes will still ship with the old, clipped geometry and need the manual
+fix. **The repo now holds the source of truth; the master image still needs it applied.**

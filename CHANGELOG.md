@@ -37,6 +37,22 @@ If you forget this and deploy the `0xFF` stub to real hardware, the `inb()` read
 
 Applies to both VM and real hardware. The capability is stored on the file and gets wiped by every rebuild/copy.
 
+## Aug 15, 2026 - 10" Kiosk Window Position (`DCH_GUI_X` / `DCH_GUI_Y`)
+
+Added `DCH_GUI_X` / `DCH_GUI_Y` origin-offset env vars to `linux_port/interface/dch-server-gui.py`
+so the kiosk window can be nudged right/down off the top-left, compensating for 10" panels whose
+EDID over-reports the usable area (a full-frame window at `0,0` clipped off the left/top). Default
+`0,0` = unchanged. Approved standard values for the 10" panel, tuned live on both Holmes Foods
+controllers (`.11`, `.12`): `X=300 Y=50 WIDTH=1600 HEIGHT=1100`.
+
+These values (and the pre-existing `DCH_GUI_WIDTH`/`HEIGHT`) now ship in a **version-controlled**
+launcher at `linux_port/interface/start-kiosk.sh` (0755) — previously hand-edited on each box only,
+and fixed by hand three times. See `docs/SANDCAT_ZEROBIAS_ALARM_AND_KIOSK_DISPLAY.md`.
+
+**Open item:** new SandCats are produced by **cloning** an existing image, not deployed from this
+repo — so the clone-master image must be updated with the new `start-kiosk.sh` and `dch-server-gui.py`
+for future controllers to inherit this automatically.
+
 ## Feb 23, 2026 - CPU Starvation Crash Fix & Diagnostics
 
 ### Critical Bug: Controller crashed every 3-6 minutes

@@ -533,9 +533,16 @@ class DCHServerWindow(Gtk.Window):
         self._scr_h = screen.get_height() if screen else 1200
         # Explicit window size for panels whose EDID over-reports the usable area
         # (e.g. the 10" kiosk). DCH_GUI_WIDTH / DCH_GUI_HEIGHT nudge the window
-        # narrower/shorter without editing this file. Unset => full screen.
+        # narrower/shorter, and DCH_GUI_X / DCH_GUI_Y nudge its origin right/down,
+        # without editing this file. Unset => full screen at top-left.
         self._scr_w = int(os.environ.get("DCH_GUI_WIDTH",  self._scr_w))
         self._scr_h = int(os.environ.get("DCH_GUI_HEIGHT", self._scr_h))
+        # Position offset for panels whose EDID over-reports the usable area
+        # (e.g. the 10" kiosk) and shift the window off the top-left of the
+        # visible screen. DCH_GUI_X / DCH_GUI_Y push it right/down to compensate;
+        # unset => 0,0 (top-left, unchanged).
+        self._pos_x = int(os.environ.get("DCH_GUI_X", "0"))
+        self._pos_y = int(os.environ.get("DCH_GUI_Y", "0"))
         self._explicit_size = bool(os.environ.get("DCH_GUI_WIDTH") or
                                    os.environ.get("DCH_GUI_HEIGHT"))
         if os.environ.get("DCH_GUI_NO_FULLSCREEN", "") == "1":
@@ -546,7 +553,7 @@ class DCHServerWindow(Gtk.Window):
             if not self._explicit_size:
                 self.fullscreen()  # honored if a WM is ever present
             self.connect("realize",
-                         lambda w: (w.move(0, 0), w.resize(self._scr_w, self._scr_h)))
+                         lambda w: (w.move(self._pos_x, self._pos_y), w.resize(self._scr_w, self._scr_h)))
         self.child_pid = -1
 
         # Main vertical box
