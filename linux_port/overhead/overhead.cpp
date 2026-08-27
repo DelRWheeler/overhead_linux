@@ -7244,6 +7244,53 @@ void overhead::AddBird(int grade_idx, int drop_no, __int64 wt)
 }
 
 //--------------------------------------------------------
+//  Auto-Span Part 1 result codes
+//
+// AutoSpanMonitor (Part 2) already owns the low numbers: AutoSpanAlarm[] uses
+// 0=ok 1=held(legacy clamp) 2=zero-bias-off 3=weight-missing 5=drift-past-
+// threshold, and the AUTO_SPAN_REC flag field carries 0/2/3/5. The Part 1 codes
+// below therefore start at 6, so neither the host's Calibration Log nor the
+// alarm banner can confuse a calibration-pass rejection with a run-time drift
+// alarm (the host renders an unrecognised code as "unknown flag (n)").
+//--------------------------------------------------------
+
+#define AUTOSPAN_FLAG_CHECKWT_REJECT  6   // AUTO_SPAN_REC flag: pass failed CheckWeight, not used in cal
+#define AUTOSPAN_ALARM_PASSES_SHORT   7   // AutoSpanAlarm:      fewer accepted passes than TareTimes, span untouched
+
+//--------------------------------------------------------
+//  AutoSpanCheckWeight
+//
+// Verbatim port of the RTSS/Delphi authority,
+// references/source_extracted/OverheadADOSource/AutoSpan.pas,
+// TfrmAutoSpan.CheckWeight (~line 150):
+//
+//     CheckUnderWeight := FTestWeight - (FTestWeight div 4);
+//     CheckOverWeight  := FTestWeight + (FTestWeight div 4);
+//     if (ScaleWeight > CheckUnderWeight) and
+//        (ScaleWeight < CheckOverWeight) then
+//       Result := True else Result := False;
+//
+// +/-25% of the known (test) weight. Two details are replicated deliberately
+// and must not be "cleaned up": the band edges are built with INTEGER division
+// (Pascal `div`, truncating -- not 0.25 * weight), and both comparisons are
+// STRICTLY greater / strictly less, i.e. the band is EXCLUSIVE at both ends.
+// RTSS is the authority; do not widen this, do not make it inclusive, and do
+// not turn it into a floating-point tolerance.
+//--------------------------------------------------------
+
+static inline bool AutoSpanCheckWeight(__int64 scale_weight, __int64 test_weight)
+{
+    __int64 check_under_weight = test_weight - (test_weight / 4);
+    __int64 check_over_weight  = test_weight + (test_weight / 4);
+
+    if ((scale_weight > check_under_weight) &&
+        (scale_weight <  check_over_weight))
+        return true;
+    else
+        return false;
+}
+
+//--------------------------------------------------------
 //   AutoTare
 //
 // This routine handles storing all shackle tares during
@@ -7297,17 +7344,46 @@ void overhead::AutoTare ( int s )
 			if (pShm->AutoSpanEnable && pShm->WeighShackle[s] == (pShm->AutoSpanRefShackle > 0 ? pShm->AutoSpanRefShackle : AUTOSPAN_REF_SHACKLE))
 			{
 				TARE_SHACKLE(s, pShm) = 0;
-				if (pShm->AutoTareStep == 1) { autospan_ref_accum[s] = wt; autospan_ref_cnt[s] = 1; }
-				else                         { autospan_ref_accum[s] += wt; autospan_ref_cnt[s]++; }
-				// Log each calibration reading (used-in-cal = 1, flag 0) so the
-				// Calibration Log shows exactly which readings built the span bias.
+
+				// Per-pass CheckWeight gate. RTSS applies CheckWeight to EVERY pass in
+				// TfrmAutoSpan.DoSpan (CyclePhase 1 and 2,3,4) BEFORE the reading is added
+				// to SpanWeight, and a failing pass does not advance the cycle -- so RTSS
+				// can only ever reach its completion arm with a full set of good readings.
+				// We were accumulating every reading unconditionally and only sanity-checking
+				// the AVERAGE at the end. That deviation from the authority is what let
+				// Holmes 2026-08-26 through: the load-cell zero was bad, the reference read
+				// 0.63x-0.71x of known, every pass was swallowed by the old 0.5x..2x average
+				// check, and span was inflated 121 -> 592 (line 1) and 69 -> 417 (line 2).
+				// Every bird then weighed ~1.5-1.8 lb heavy. A reading outside +/-25% of the
+				// known weight is now NOT accumulated and NOT counted -- but it is still
+				// reported to the host, so the Calibration Log shows the operator exactly
+				// which readings were thrown away and why.
+				__int64 kn     = pShm->AutoSpanKnownWeight;
+				bool    accept = (kn > 0) && AutoSpanCheckWeight(wt, kn);
+
+				if (pShm->AutoTareStep == 1)
+				{
+					// 1st pass: reset the accumulators whether or not this reading is good
+					autospan_ref_accum[s] = 0;
+					autospan_ref_cnt  [s] = 0;
+					autospan_ref_rej  [s] = 0;
+				}
+
+				if (accept) { autospan_ref_accum[s] += wt; autospan_ref_cnt[s]++; }
+				else        {                              autospan_ref_rej[s]++; }
+
+				// Log each calibration reading so the Calibration Log shows exactly which
+				// readings built the span bias: used-in-cal = 1 / flag 0 for an accepted
+				// pass, used-in-cal = 0 / flag AUTOSPAN_FLAG_CHECKWT_REJECT for one the
+				// CheckWeight gate rejected.
 				if (HOST_OK)
 				{
-					__int64 kn = pShm->AutoSpanKnownWeight, crec[9];
+					__int64 crec[9];
 					crec[0] = this_lineid; crec[1] = s; crec[2] = wt; crec[3] = kn;
 					crec[4] = kn > 0 ? (wt - kn) * 1000 / kn : 0;
 					crec[5] = pShm->scl_set.SpanBias[s]; crec[6] = pShm->AutoBias[s];
-					crec[7] = 1; crec[8] = 0;
+					crec[7] = accept ? 1 : 0;
+					crec[8] = accept ? 0 : AUTOSPAN_FLAG_CHECKWT_REJECT;
 					SendHostMsg(AUTO_SPAN_REC, 0, (BYTE*) crec, sizeof(crec));
 				}
 			}
@@ -7329,27 +7405,70 @@ void overhead::AutoTare ( int s )
 					{
 						// Set SpanBias from the averaged reference reading vs known:
 						// avg_ref * (1 + span/1000) == known => span = 1000*(known/avg_ref - 1)
-						__int64 avg_ref = autospan_ref_cnt[s] > 0 ? autospan_ref_accum[s] / autospan_ref_cnt[s] : 0;
 						__int64 known   = pShm->AutoSpanKnownWeight;
-						// Sanity band: a genuine gain drift is small, so the averaged reference
-						// reading must land within a sane fraction of known (0.5x..2x). If the ref
+						int     want    = pShm->sys_set.TareTimes;
+						__int64 avg_ref = autospan_ref_cnt[s] > 0 ? autospan_ref_accum[s] / autospan_ref_cnt[s] : 0;
+
+						// A COMPLETE set of valid passes is required. RTSS never advances
+						// CyclePhase on a pass that fails CheckWeight, so its completion arm
+						// (`SpanWeight div 4`) is only ever reached with four good readings.
+						// The equivalent here is that the number of ACCEPTED passes must equal
+						// the configured pass count. Short of that we simply do not know the
+						// reference: leave SpanBias completely untouched, raise the alarm, and
+						// make the operator re-run the calibration. Never derive a span from a
+						// partial set -- averaging one good pass with three rejected ones is how
+						// a bad zero becomes a permanent gain error (Holmes 2026-08-26).
+						if (want <= 0 || autospan_ref_cnt[s] != want)
+						{
+							pShm->AutoSpanAlarm[s] = AUTOSPAN_ALARM_PASSES_SHORT;
+							sprintf(app_err_buf, "Auto-Span scale %d: only %d of %d calibration passes were within +/-25%% of the known weight (%d rejected) -- span NOT changed, re-run the tare calibration\n",
+							        s + 1, autospan_ref_cnt[s], want, autospan_ref_rej[s]);
+							GenError(warning, app_err_buf);
+							RtPrintf("Auto-Span: scale %d ref WeighShackle %d INCOMPLETE passes accepted=%d rejected=%d required=%d known=%lld -> SpanBias UNCHANGED (%lld)\n", s, pShm->WeighShackle[s], autospan_ref_cnt[s], autospan_ref_rej[s], want, (long long)known, (long long)pShm->scl_set.SpanBias[s]);
+						}
+						// Sanity band, belt and braces -- the per-pass gate above should already
+						// guarantee this. A genuine gain drift is small, so the averaged reference
+						// reading must land inside the same +/-25% CheckWeight band the authority
+						// uses per pass (RTSS AutoSpan.pas, TfrmAutoSpan.CheckWeight). If the ref
 						// shackle is misaligned / not seeing the known weight, avg_ref is a tiny
 						// fraction of known and span = 1000*(known/avg_ref - 1) EXPLODES into a garbage
 						// SpanBias that then amplifies every weight (2026-07-16: avg_ref=43 counts,
 						// known=346500 -> SpanBias 8,057,140, weights bounced, persisted to scale.bin).
+						// The band used to be 0.5x..2x, which is far too loose -- a 0.63x-0.71x
+						// reference sailed straight through it at Holmes on 2026-08-26 and inflated
+						// span ~5x on both lines. It is now the authority's +/-25%, exclusive.
 						// Out of band => leave SpanBias untouched (AutoSpanMonitor still flags the bad
 						// reference). Was `avg_ref > 0` alone, which was far too weak.
-						if (avg_ref > 0 && known > 0 && avg_ref >= known / 2 && avg_ref <= known * 2)
+						else if (avg_ref > 0 && known > 0 && AutoSpanCheckWeight(avg_ref, known))
 						{
 							double  spd  = 1000.0 * ((double) known / (double) avg_ref - 1.0);
 							__int64 span = (__int64)(spd + (spd >= 0 ? 0.5 : -0.5));
 							pShm->scl_set.SpanBias[s]    = span;
 							pShm->AutoSpanSpanBaseline[s] = span;   // clamp anchor for Part 2
 							pShm->AutoSpanAlarm[s]        = 0;
-							RtPrintf("Auto-Span: scale %d ref WeighShackle %d avg=%lld known=%lld -> SpanBias %lld (ref_setting=%d enable=%d)\n", s, pShm->WeighShackle[s], (long long)avg_ref, (long long)known, (long long)span, pShm->AutoSpanRefShackle, pShm->AutoSpanEnable);
+							RtPrintf("Auto-Span: scale %d ref WeighShackle %d avg=%lld known=%lld -> SpanBias %lld (passes accepted=%d rejected=%d required=%d ref_setting=%d enable=%d)\n", s, pShm->WeighShackle[s], (long long)avg_ref, (long long)known, (long long)span, autospan_ref_cnt[s], autospan_ref_rej[s], want, pShm->AutoSpanRefShackle, pShm->AutoSpanEnable);
 							fsave_grp_tbl[shm_tbl[SCL_SET-1].group].changed = true;
 							fsave_grp_tbl[shm_tbl[SCL_SET-1].group].loaded  = true;
 							shm_updates[32-1] = true;
+
+							// Bias-too-high warning, mirroring RTSS AutoSpan.pas (~line 251, Jim W.
+							// 12/14/2004): "the generated AutoSpan bias value ... appears to be
+							// relatively high (greater than 1% of your currently-selected test
+							// weight ...). You should consider re-running this AutoSpan." SpanBias is
+							// in parts-per-thousand, so 1% == 10 ppt. RTSS warned and carried on; so
+							// do we -- this does NOT block the calibration.
+							if (span > 10 || span < -10)
+							{
+								sprintf(app_err_buf, "Auto-Span scale %d: the generated AutoSpan bias value of %.3f appears to be relatively high (greater than 1%% of the known weight). You should consider re-running this AutoSpan.\n",
+								        s + 1, (double) span / 1000.0);
+								GenError(warning, app_err_buf);
+							}
+						}
+						else
+						{
+							// Unreachable in practice now that every pass is gated, but keep the
+							// diagnostic: span stays untouched exactly as before, no state change.
+							RtPrintf("Auto-Span: scale %d ref WeighShackle %d avg=%lld known=%lld OUT OF BAND (+/-25%%) -> SpanBias UNCHANGED (%lld)\n", s, pShm->WeighShackle[s], (long long)avg_ref, (long long)known, (long long)pShm->scl_set.SpanBias[s]);
 						}
 					}
 					else

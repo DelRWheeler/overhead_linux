@@ -132,7 +132,8 @@ public:
     int                 bpm_act_count[MAXSCALES];
     // Auto Calculate Span (Part 1 AutoTare averaging accumulator + count; Part 2 slow integral)
     __int64             autospan_ref_accum[MAXSCALES];    // sum of reference (raw-AutoBias) readings during AutoTare
-    int                 autospan_ref_cnt  [MAXSCALES];    // passes accumulated for the reference shackle
+    int                 autospan_ref_cnt  [MAXSCALES];    // passes ACCEPTED by CheckWeight for the reference shackle
+    int                 autospan_ref_rej  [MAXSCALES];    // passes REJECTED by CheckWeight (+/-25% of known) during AutoTare
     double              autospan_integral [MAXSCALES];    // per-scale slow integral toward target SpanBias
     bool                trickle_active;
     bool                trickle_flag;
