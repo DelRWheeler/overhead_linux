@@ -9440,9 +9440,27 @@ void overhead::FindDrops(int Scale, int StartAt, int Shackle)
 							trickle_short_cnt[drp_chk] = 0;
 							break;
 						case bpm_trickle:
-							if (target_trickle_count[drp_chk] == 0)
-								pShm->sys_stat.DropStatus[drp_chk].Suspended = true;
-							trickle_active = true;
+							//----- Trickle only has meaning under the rate modes (4-7).
+							//      target_trickle_count[] is written ONLY by TrickleCounts(),
+							//      which itself runs only for those modes, so under any other
+							//      mode the count stays 0 for the life of the process and the
+							//      test below would be true on every pass -- re-suspending the
+							//      drop forever, with no path that ever clears it. Bypass the
+							//      whole trickle path instead, so a stale Trickle flag left on
+							//      a weight/grade/batch drop cannot stop it taking birds.
+							switch (pShm->Schedule[drp_chk].DistMode)
+							{
+								case mode_4_rate:
+								case mode_5_batch_rate:
+								case mode_6_batch_alt_rate:
+								case mode_7_batch_alt_rate:
+									if (target_trickle_count[drp_chk] == 0)
+										pShm->sys_stat.DropStatus[drp_chk].Suspended = true;
+									trickle_active = true;
+									break;
+								default:
+								   break;
+							}
 							break;
 						default:
 						   break;
