@@ -255,9 +255,15 @@ fi
 # snapd is the second update path and ignores every apt setting. It is inactive on
 # SandCat, so only complain when it is actually running.
 if [ "$(systemctl is-active snapd 2>&1)" = active ]; then
-  [ "$(snap get system refresh.hold 2>/dev/null)" = forever ] \
+  # `snap get` is root-only: unprivileged it returns "error: access denied (try
+  # with sudo)", which compares unequal to "forever" and reports a correctly-held
+  # snapd as broken. Read it through SUDO, and take the LAST line because the
+  # piped-password sudo prints its prompt on the first.
+  HOLD=$(SUDO snap get system refresh.hold 2>/dev/null | tail -1)
+  HOLD=${HOLD##*: }
+  [ "$HOLD" = forever ] \
     && say "snapd" "refresh.hold=forever — correct" \
-    || bad "snapd" "active without refresh.hold=forever"
+    || bad "snapd" "active with refresh.hold='${HOLD:-unset}', want forever"
 else
   say "snapd" "inactive — nothing to hold"
 fi

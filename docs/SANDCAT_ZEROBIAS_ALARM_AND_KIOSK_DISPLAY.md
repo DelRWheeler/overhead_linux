@@ -268,22 +268,35 @@ Both were in the hostname handling, and both are fixed:
    the hostname-change branch means a box with the right hostname is never examined — exactly what
    happened to line 2, which kept `127.0.1.1 dchserver1` through the first pass.
 
-## The new-stack procedure — run this on every CPU stack before it ships
+## The new-stack procedure — ONE command, run on every CPU stack up front
 
-`commission-stack.sh --check` is the gate. It changes nothing, prints a verdict per item, and
-**exits non-zero if anything needs attention**, so it can gate a build rather than rely on someone
-reading the output.
+**`provision-new-stack.sh` is the whole procedure.** Run it from the dev VM on every new board
+stack before it ships or goes into a line, and again after pushing new binaries. It is idempotent,
+so re-running a good box changes nothing and exits 0.
 
 ```bash
-scp linux_port/interface/commission-stack.sh dchservice@<ip>:/tmp/
-
-# 1. GATE — report only, exit 1 if anything is wrong
-ssh dchservice@<ip> 'bash /tmp/commission-stack.sh --check \
+cd overhead_controller/linux_port/interface
+./provision-new-stack.sh --ip 192.168.100.13 \
     --ntp 192.168.100.102 --timezone America/New_York \
-    --expect-overhead <md5> --expect-interface <md5>'
+    --expect-overhead <md5> --expect-interface <md5>     # add --restart only with the line down
+```
 
-# 2. APPLY (same arguments, no --check). Add --restart ONLY with the line down.
-ssh dchservice@<ip> 'bash /tmp/commission-stack.sh --ntp 192.168.100.102 --timezone America/New_York'
+It runs three stages and **its exit status is the verification's**, so a stack that does not
+verify cannot quietly ship:
+
+1. **Automatic updates** — drives `remediate-appliance.sh --apt-only` from the *overhead* repo
+   (found as a sibling checkout, or `--overhead-repo DIR`). This goes **first**, before anything
+   restarts: `apt-daily` has restarted the whole stack unattended at 07:00 and was implicated in a
+   controller being watchdog-killed mid-run, and its timers are `Persistent=yes`, so a missed job
+   fires *at boot*. Never reboot a stack with apt still armed.
+2. **Commissioning** — `commission-stack.sh` (geometry, NTP, hostname, `/etc/hosts`, restart
+   policy, timezone).
+3. **Verification** — `commission-stack.sh --check`, whose non-zero exit becomes the script's.
+
+`commission-stack.sh` remains usable on its own for a spot check:
+
+```bash
+ssh dchservice@<ip> 'bash /tmp/commission-stack.sh --check --ntp 192.168.100.102'
 ```
 
 | check | fixed by the script? | known issue behind it |
@@ -309,6 +322,20 @@ path — this script only tells you the md5 is not what you expected.
 running `push_controller_time: true` needs a **fixed no-DST zone** instead — setting it to the real
 local zone puts its clock an hour out. That choice comes from `push_controller_time` in
 `apps/api/api.yaml`, not from habit.
+
+### Three more bugs the live Claxton run corrected
+
+- **Masking the apt SERVICE leaves its TIMER failed** — `Unit to trigger vanished` →
+  `Failed with result 'resources'` — which leaves the box `systemctl is-system-running` =
+  **degraded**. Nothing is broken (a timer with nothing to trigger is the point), but `degraded`
+  is the post-change gate in CLAUDE.md, so leaving it set hides real faults. `remediate-appliance.sh`
+  now `reset-failed`s the timers after masking, the same way it already did for `overhead-logo`.
+- **`snap get system refresh.hold` is root-only.** Unprivileged it returns
+  `error: access denied (try with sudo)`, which compares unequal to `forever` and reports a
+  *correctly held* snapd as broken. It must be read through sudo, taking the last line because the
+  piped-password sudo prints its prompt on the first.
+- **`snap set system refresh.hold` STARTS snapd.** A board that reported `snapd inactive` before
+  remediation reports `active` afterwards. That is expected, not a regression.
 
 ### Two things the live Claxton run corrected
 
