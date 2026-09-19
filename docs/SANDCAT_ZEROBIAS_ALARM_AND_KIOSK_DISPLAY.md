@@ -158,7 +158,97 @@ that box and restart `dch-server-gui`. Note that restarting the GUI **bounces th
 New SandCat controllers are produced by **cloning an existing controller image**, *not* by
 deploying from this repo. So committing `start-kiosk.sh` and the `dch-server-gui.py` change here
 does **not**, by itself, make future controllers inherit the fix. For that to happen automatically,
-the **clone-master image must be updated** with the new `start-kiosk.sh` (the approved geometry) and
-the updated `dch-server-gui.py` (the `DCH_GUI_X`/`DCH_GUI_Y` support). Until the master image is
-refreshed, freshly cloned boxes will still ship with the old, clipped geometry and need the manual
-fix. **The repo now holds the source of truth; the master image still needs it applied.**
+the **clone-master image must be updated** with the new `start-kiosk.sh`.
+
+> **Status 2026-09-19:** still open, and it bit again — see the next section, which supersedes the
+> geometry values above and adds tooling so a stale clone is caught in one command.
+
+---
+
+## 2026-09-19, Claxton — the fourth hand-fix, and what finally closes it
+
+Claxton lines 2–4 were changed over to SandCat stacks. All three came up on **1920x1200**,
+overscanning off the glass — the same hand-fix for the **fourth** time. Root cause confirmed: the
+stacks were cloned from a `dchserver2` image that predates the fix (they arrived named
+`dchserver2` with `NTP=192.168.100.103`, the office rig's Pi), so the clone master is still stale.
+
+### The geometry that is now standard: force the panel's true mode
+
+Two rival fixes existed for this same panel, and **the repo was carrying the one that cannot work
+on any box in the field**:
+
+| | approach | works on fleet boxes? |
+|---|---|---|
+| Holmes / old repo | keep 1920x1200, move a 1600x1100 window to `+300+50` | ❌ **No** — needs `DCH_GUI_X`/`DCH_GUI_Y`, and every Claxton box runs `dch-server-gui.py` md5 `e0b10f18`, which has **zero** X/Y support. The exports are silently ignored and the window lands at `0,0`. |
+| Claxton line 1 | `xrandr` the panel down to its true **1280x800**, window 1280x800 | ✅ **Yes** — needs only `DCH_GUI_WIDTH`/`HEIGHT`, which `e0b10f18` does support. Proven on Claxton line 1 for 9 weeks. |
+
+Forcing the mode is also the better fix on the merits: it makes the *screen* honest instead of
+positioning a window inside a frame that lies, so the window is an exact fit with nothing clipped
+and no per-panel offsets to re-tune. **`linux_port/interface/start-kiosk.sh` now carries it**, and
+the repo copy is byte-identical (md5 `0cb1d96a`) to what runs on Claxton lines 2–4.
+
+```bash
+DCH_PANEL_MODE="${DCH_PANEL_MODE-1280x800}"      # "" skips xrandr entirely
+for out in $(xrandr | awk '/ connected/ {print $1}'); do
+    xrandr --output "$out" --mode "$DCH_PANEL_MODE" 2>/dev/null && break
+done
+export DCH_GUI_WIDTH="${DCH_PANEL_MODE%x*}"
+export DCH_GUI_HEIGHT="${DCH_PANEL_MODE#*x}"
+```
+
+It applies to whichever output is **actually connected** rather than a hardcoded `DP-1`, so a panel
+moved to `VGA-1` still comes up right. If a panel does not offer the mode, `xrandr` fails quietly
+and X keeps what it picked — the window is then merely small, never clipped. Retune by editing the
+one `DCH_PANEL_MODE` line.
+
+⚠️ `DCH_GUI_X`/`DCH_GUI_Y` are **not** used by this launcher. Do not reintroduce them without first
+checking `grep -c DCH_GUI_X dch-server-gui.py` on the target box.
+
+### `commission-stack.sh` — the actual answer to "every single time"
+
+The geometry was never the whole problem; it was one of **four** defects a new or cloned stack
+arrives with, each previously carried as tribal knowledge. They are now one idempotent, re-runnable
+script, `linux_port/interface/commission-stack.sh`:
+
+| # | defect on a fresh/cloned stack | why it matters |
+|---|---|---|
+| 1 | stock `start-kiosk.sh` | GUI overscans off the glass |
+| 2 | `NTP=192.168.100.103` | that is the Pi on the **office rig** but the **STANDBY PC** at every HA plant (PC1=`.104`, PC2=`.103`, VIP=`.102`) — a clone aims its clock at the standby and never follows failover |
+| 3 | hostname inherited from the clone source | three boxes all answering `dchserver2` makes every later diagnostic ambiguous |
+| 4 | `Restart=on-failure` | never catches a **clean** GUI exit, leaving the box pingable with the controller dead |
+
+```bash
+scp commission-stack.sh dchservice@<ip>:/tmp/
+ssh dchservice@<ip> 'bash /tmp/commission-stack.sh --check --ntp 192.168.100.102'   # report only
+ssh dchservice@<ip> 'bash /tmp/commission-stack.sh --ntp 192.168.100.102'           # apply
+```
+
+- `--ntp` is **required** and has no default: it is the **VIP `192.168.100.102`** at an HA plant,
+  but the Pi `192.168.100.103` on the office rig. Getting it wrong is defect #2 again.
+- Hostname is derived from the last octet (`.11` → `dchserver1`); override with `--hostname`.
+- The launcher body is **spliced from `start-kiosk.sh` at build time**, so the two cannot drift.
+- It writes `start-kiosk.sh` **in place**, because that path is hardlinked to
+  `/home/del/dchservices/bin/` — `mv`/`install` would break the link and leave one path stale.
+- It **reports** `overhead`/`interface` md5s rather than deploying them; compare against the fleet.
+- The `daemon-reload` for defect #4 is **gated on `NRestarts`** and refuses above 100,000 — a reload
+  on a box with a huge accumulated count has segfaulted systemd and frozen PID 1. Reboot first.
+- It does **not** restart the GUI unless given `--restart`. Restarting `dch-server-gui` **bounces
+  the controller** — weighing stops and the load cell re-inits — so it is never implicit.
+
+### Claxton state after this work
+
+Lines 2, 3, 4 had the launcher applied and the GUI restarted (lines idle, Del approved); all four
+lines now read `screen=1280x800  window=1280x800+0+0` and were confirmed on the glass. All four
+controllers reconnected, `NRestarts=0`. All four run byte-identical binaries — `overhead`
+`e1bf768c`, `interface` `6990c930`, `15.7.13 Sep 6 2026` — so **line 1 needed no software update**
+despite being in place longest.
+
+Still owed at Claxton (found by the scan, not yet applied — each needs a word from Del):
+- lines 2–4: `NTP` → `.102`, hostnames → `dchserver3`/`dchserver4` (neither bounces the controller)
+- **line 1 only**: `Restart=on-failure` → `always` (the one box still carrying defect #4)
+
+### 🔴 Still open: the clone master
+
+`commission-stack.sh` makes a stale clone a **one-command, verifiable** fix instead of four
+remembered ones, but it is still a manual step. The loop only truly closes when the **clone-master
+image** is rebuilt with this `start-kiosk.sh`. Until then, run `--check` on every new stack.

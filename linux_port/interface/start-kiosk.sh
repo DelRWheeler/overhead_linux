@@ -14,14 +14,27 @@ xset s noblank
 # Hide the mouse cursor after 3 seconds of inactivity (if unclutter is installed)
 command -v unclutter >/dev/null 2>&1 && unclutter -idle 3 &
 
-# --- 10" touch-panel geometry (this panel's EDID over-reports the usable area,
-# so a full-frame window at 0,0 spills off the left and top). Nudge the window
-# right/down and shrink it to sit inside the visible area. Tune these four to
-# fit the panel; the GUI reads them as DCH_GUI_X/Y/WIDTH/HEIGHT.
-export DCH_GUI_X=300
-export DCH_GUI_Y=50
-export DCH_GUI_WIDTH=1600
-export DCH_GUI_HEIGHT=1100
+# --- 10" kiosk panel geometry -------------------------------------------------
+# The 10" Lilliput panel is truly 1280x800, but its EDID over-reports 1920x1200.
+# Left alone, X picks 1920x1200 and the GUI overscans off the glass. Force the
+# panel to its real mode and size the window to match it exactly.
+#
+# To retune for a different panel, change DCH_PANEL_MODE below. Setting it to
+# an empty string skips the xrandr call and leaves X on whatever it picked.
+DCH_PANEL_MODE="${DCH_PANEL_MODE-1280x800}"
+
+if [ -n "$DCH_PANEL_MODE" ]; then
+    # Apply to whichever output is actually connected rather than hardcoding
+    # DP-1, so a panel moved to VGA-1 still comes up right.
+    for out in $(xrandr | awk '/ connected/ {print $1}'); do
+        xrandr --output "$out" --mode "$DCH_PANEL_MODE" 2>/dev/null && break
+    done
+fi
+
+export DCH_GUI_WIDTH="${DCH_PANEL_MODE%x*}"
+export DCH_GUI_HEIGHT="${DCH_PANEL_MODE#*x}"
+export DCH_GUI_MENU_FONT_SIZE=20
+# export DCH_GUI_FONT_SIZE=24     # message/terminal font (default 24; leave as-is)
 
 # Launch the DCH Server GUI
 exec /usr/bin/python3 /home/dchservice/dchservices/bin/dch-server-gui.py
