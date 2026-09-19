@@ -268,6 +268,56 @@ Both were in the hostname handling, and both are fixed:
    the hostname-change branch means a box with the right hostname is never examined — exactly what
    happened to line 2, which kept `127.0.1.1 dchserver1` through the first pass.
 
+## The new-stack procedure — run this on every CPU stack before it ships
+
+`commission-stack.sh --check` is the gate. It changes nothing, prints a verdict per item, and
+**exits non-zero if anything needs attention**, so it can gate a build rather than rely on someone
+reading the output.
+
+```bash
+scp linux_port/interface/commission-stack.sh dchservice@<ip>:/tmp/
+
+# 1. GATE — report only, exit 1 if anything is wrong
+ssh dchservice@<ip> 'bash /tmp/commission-stack.sh --check \
+    --ntp 192.168.100.102 --timezone America/New_York \
+    --expect-overhead <md5> --expect-interface <md5>'
+
+# 2. APPLY (same arguments, no --check). Add --restart ONLY with the line down.
+ssh dchservice@<ip> 'bash /tmp/commission-stack.sh --ntp 192.168.100.102 --timezone America/New_York'
+```
+
+| check | fixed by the script? | known issue behind it |
+|---|---|---|
+| kiosk geometry | ✅ | 10" panel EDID over-reports; GUI overscans off the glass |
+| NTP source | ✅ | `.103` is the office rig's Pi but the **standby PC** at an HA plant |
+| hostname | ✅ | clones inherit the source's name |
+| `/etc/hosts` 127.0.1.1 | ✅ | checked **separately** — a clone's hosts entry can already disagree with its own hostname |
+| `Restart=always` + `StartLimitIntervalSec=0` | ✅ | `on-failure` never catches a clean GUI exit → box pings, controller dead |
+| timezone | ✅ with `--timezone` | a box on `Etc/UTC` misstamps `shift_nbr` for hours a day |
+| apt auto-updates | ❌ **reports only** | restarted the stack unattended at 07:00; watchdog-killed a controller mid-run |
+| snapd hold | ❌ reports only | second update path, ignores all apt settings (inactive on SandCat) |
+| `overhead` / `interface` md5 | ❌ reports only | a stock stack arrives **stale**; the version *string* is compiled in and still looks plausible |
+| `ttyS0` rx rate | ❌ informational | catches BIOS COM ports not set to RS422 on **digital/HBM** sites only |
+
+**Why some items only report.** Automatic updates are owned by
+`provisioning/scripts/remediate-appliance.sh --apt-only` in the *overhead* repo, whose header
+documents exactly why the timers are masked rather than disabled and why the drop-in is `99-`.
+Duplicating that policy here would let the two drift. Binaries are likewise deployed by their own
+path — this script only tells you the md5 is not what you expected.
+
+⚠️ `--timezone` is right for a SandCat because every SandCat is **NTP mode**. A legacy RTX/EPM-19
+running `push_controller_time: true` needs a **fixed no-DST zone** instead — setting it to the real
+local zone puts its clock an hour out. That choice comes from `push_controller_time` in
+`apps/api/api.yaml`, not from habit.
+
+### Two things the live Claxton run corrected
+
+- **`/proc/tty/driver/serial` is root-only.** Read unprivileged it returns nothing and the
+  arithmetic yields a confident `0 B/s` — which reads as "no load-cell traffic" when it actually
+  means "the check never ran". It must go through sudo.
+- **That rx counter is a signed 32-bit int and wraps negative.** Claxton line 1 read
+  `rx:-1397593793` after nine weeks up. A wrapped counter is reported as unreliable, never as 0.
+
 ### 🔴 Still open: the clone master
 
 `commission-stack.sh` makes a stale clone a **one-command, verifiable** fix instead of four

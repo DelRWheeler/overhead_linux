@@ -15,13 +15,25 @@
 #                   so NTP follows failover. On the office rig it is the Pi
 #                   (192.168.100.103). REQUIRED — there is no safe default.
 #     --hostname <name>   override the auto-derived dchserverN
+#     --timezone <zone>   set the timezone (e.g. America/New_York). Report-only if
+#                   omitted. ⚠️ Correct ONLY for an NTP-mode controller, which is
+#                   every SandCat. A legacy RTX/EPM-19 on push_controller_time
+#                   needs a fixed no-DST zone instead — see the kiosk-display doc.
+#     --expect-overhead <md5>   fail the check unless the binary matches
+#     --expect-interface <md5>  (first 8 chars, as this script prints them)
 #     --restart     restart dch-server-gui to apply the display change.
 #                   ⚠️ THIS BOUNCES THE CONTROLLER — weighing stops and the load
 #                   cell re-inits. Only with the line down and permission given.
 #     --check       report only, change nothing.
 #
-# What it does NOT do: deploy binaries. Check the reported versions against the
-# fleet and deploy separately if they are stale.
+# What it does NOT do: deploy binaries, or change apt/snapd policy. It REPORTS on
+# both. Binaries are deployed separately; automatic updates are owned by
+# provisioning/scripts/remediate-appliance.sh --apt-only in the overhead repo, and
+# this script points at it rather than duplicating that policy.
+#
+# Exit status: 0 = box is at fleet standard (or was brought to it).
+#              1 = something still needs attention. --check never changes anything,
+#                  so `--check` + exit status gates a stack before it ships.
 
 set -u
 KIOSK=/home/dchservice/dchservices/bin/start-kiosk.sh
@@ -29,19 +41,24 @@ UNIT=/etc/systemd/system/dch-server-gui.service
 SUDO() { echo dchservice | sudo -S "$@" 2>/dev/null; }   # these boards want a piped password
 
 NTP=""; HOSTNAME_OVERRIDE=""; DO_RESTART=0; CHECK_ONLY=0
+TZWANT=""; EXPECT_OVERHEAD=""; EXPECT_INTERFACE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --ntp) NTP="$2"; shift 2;;
     --hostname) HOSTNAME_OVERRIDE="$2"; shift 2;;
+    --timezone) TZWANT="$2"; shift 2;;
+    --expect-overhead) EXPECT_OVERHEAD="$2"; shift 2;;
+    --expect-interface) EXPECT_INTERFACE="$2"; shift 2;;
     --restart) DO_RESTART=1; shift;;
     --check) CHECK_ONLY=1; shift;;
     *) echo "unknown option: $1" >&2; exit 2;;
   esac
 done
 
-CHANGED=0; NEEDS_RESTART=0
+CHANGED=0; NEEDS_RESTART=0; BAD=0
 say() { printf '  %-22s %s\n' "$1" "$2"; }
 changed() { CHANGED=1; printf '  \033[1m%-22s %s\033[0m\n' "$1" "$2"; }
+bad()     { BAD=1; CHANGED=1; printf '  \033[1m%-22s %s\033[0m\n' "$1" "$2"; }
 
 MYIP=$(ip -4 -o addr show | awk '$2!="lo"{split($4,a,"/"); if (a[1] ~ /^192\.168\.100\./) print a[1]}' | head -1)
 echo "=== commission-stack.sh on $(hostname) (${MYIP:-unknown ip}) ==="
@@ -203,16 +220,97 @@ else
   fi
 fi
 
-# --- 5. report binary versions (deploy separately if stale) -------------------
+# --- 5. timezone --------------------------------------------------------------
+# A clone carries its source's zone, and a box left on Etc/UTC misstamps shift_nbr
+# for hours every day. Every SandCat is NTP mode, so it wants the REAL local zone.
+CUR_TZ=$(timedatectl show -p Timezone --value)
+if [ -z "$TZWANT" ]; then
+  say "timezone" "$CUR_TZ (no --timezone given, left alone)"
+  [ "$CUR_TZ" = "Etc/UTC" ] && bad "timezone" "Etc/UTC — almost certainly wrong, pass --timezone"
+elif [ "$CUR_TZ" = "$TZWANT" ]; then
+  say "timezone" "$CUR_TZ already correct"
+elif [ "$CHECK_ONLY" = 1 ]; then
+  bad "timezone" "NEEDS FIX — $CUR_TZ should be $TZWANT"
+else
+  SUDO timedatectl set-timezone "$TZWANT"
+  changed "timezone" "$CUR_TZ -> $TZWANT"
+fi
+
+# --- 6. automatic updates (REPORT ONLY — owned by remediate-appliance.sh) -----
+# apt's update machinery restarted the whole stack unattended at 07:00 one night,
+# and on another a controller was watchdog-killed while apt-daily hammered the
+# disk. A real-time controller must not share a disk with an apt run.
+APT_BAD=""
+for u in apt-daily.timer apt-daily-upgrade.timer apt-daily.service \
+         apt-daily-upgrade.service unattended-upgrades.service; do
+  [ "$(systemctl is-enabled "$u" 2>&1)" = masked ] || APT_BAD="$APT_BAD $u"
+done
+[ -f /etc/apt/apt.conf.d/99-overhead-no-auto-upgrades ] || APT_BAD="$APT_BAD 99-overhead-no-auto-upgrades"
+if [ -z "$APT_BAD" ]; then
+  say "auto-updates" "apt fully masked — correct"
+else
+  bad "auto-updates" "NOT masked:$APT_BAD"
+  say "" "fix: remediate-appliance.sh --apt-only  (overhead repo, provisioning/scripts)"
+fi
+# snapd is the second update path and ignores every apt setting. It is inactive on
+# SandCat, so only complain when it is actually running.
+if [ "$(systemctl is-active snapd 2>&1)" = active ]; then
+  [ "$(snap get system refresh.hold 2>/dev/null)" = forever ] \
+    && say "snapd" "refresh.hold=forever — correct" \
+    || bad "snapd" "active without refresh.hold=forever"
+else
+  say "snapd" "inactive — nothing to hold"
+fi
+
+# --- 7. binaries --------------------------------------------------------------
+# Reported, never deployed. A stock stack arrives STALE (15.6.27 has shipped on
+# new hardware), and the md5 is the only honest check: the version STRING is
+# compiled in and a stale binary still prints a plausible one.
 for b in overhead interface; do
   f=/home/dchservice/dchservices/bin/$b
-  [ -f "$f" ] && say "$b" "md5=$(md5sum "$f" | cut -c1-8) size=$(stat -c%s "$f")"
+  if [ ! -f "$f" ]; then bad "$b" "MISSING at $f"; continue; fi
+  got=$(md5sum "$f" | cut -c1-8)
+  case "$b" in
+    overhead)  want="$EXPECT_OVERHEAD";;
+    interface) want="$EXPECT_INTERFACE";;
+  esac
+  if [ -z "$want" ]; then
+    say "$b" "md5=$got size=$(stat -c%s "$f")  (no --expect-$b given)"
+  elif [ "$got" = "${want:0:8}" ]; then
+    say "$b" "md5=$got matches expected"
+  else
+    bad "$b" "STALE? md5=$got expected ${want:0:8} — deploy before shipping"
+  fi
 done
+
+# --- 8. load-cell serial (informational) --------------------------------------
+# Only meaningful where the load cell is DIGITAL (HBM over RS-485): a new board
+# whose BIOS COM ports are not set to RS422 reads zero. Analog sites read zero
+# too and are perfectly healthy, so this is never a verdict.
+# /proc/tty/driver/serial is root-only, so this must go through SUDO or it
+# silently skips and the check never runs at all.
+r1=$(SUDO grep "^0:" /proc/tty/driver/serial | grep -oP "rx:-?[0-9]+" | cut -d: -f2)
+if [ -n "$r1" ]; then
+  sleep 3
+  r2=$(SUDO grep "^0:" /proc/tty/driver/serial | grep -oP "rx:-?[0-9]+" | cut -d: -f2)
+  r1=${r1#rx:}
+  # The kernel prints this counter as a signed 32-bit int and it WRAPS NEGATIVE on
+  # a long-lived box (Claxton line 1 read -1397593793 after 9 weeks), which makes
+  # the delta meaningless rather than zero. Do not report a wrapped counter as 0.
+  if [ "${r1#-}" != "$r1" ] || [ "${r2#-}" != "$r2" ] || [ "${r2:-0}" -lt "$r1" ]; then
+    say "ttyS0 rx" "counter wrapped — delta unreliable (uptime too long to sample)"
+  else
+    say "ttyS0 rx" "$(( (${r2:-0} - r1) / 3 )) B/s  (digital/HBM load cells only; 0 is normal on analog)"
+  fi
+else
+  say "ttyS0 rx" "unreadable — skipped"
+fi
 
 # --- 6. apply the display change ---------------------------------------------
 echo
 if [ "$CHECK_ONLY" = 1 ]; then
-  [ "$CHANGED" = 1 ] && echo "  => items need fixing (re-run without --check)" || echo "  => box is at fleet standard"
+  if [ "$CHANGED" = 1 ]; then echo "  => items need fixing (re-run without --check)"; exit 1
+  else echo "  => box is at fleet standard"; exit 0; fi
 elif [ "$NEEDS_RESTART" = 1 ] && [ "$DO_RESTART" = 1 ]; then
   echo "  restarting dch-server-gui (controller bounces)..."
   SUDO systemctl --no-block restart dch-server-gui   # a blocking start hangs the SSH session
@@ -223,3 +321,5 @@ elif [ "$NEEDS_RESTART" = 1 ]; then
 else
   [ "$CHANGED" = 1 ] && echo "  => done" || echo "  => box already at fleet standard, nothing changed"
 fi
+
+[ "$BAD" = 1 ] && exit 1 || exit 0
