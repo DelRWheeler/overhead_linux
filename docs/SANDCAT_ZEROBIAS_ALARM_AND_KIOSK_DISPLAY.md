@@ -243,9 +243,30 @@ controllers reconnected, `NRestarts=0`. All four run byte-identical binaries —
 `e1bf768c`, `interface` `6990c930`, `15.7.13 Sep 6 2026` — so **line 1 needed no software update**
 despite being in place longest.
 
-Still owed at Claxton (found by the scan, not yet applied — each needs a word from Del):
-- lines 2–4: `NTP` → `.102`, hostnames → `dchserver3`/`dchserver4` (neither bounces the controller)
-- **line 1 only**: `Restart=on-failure` → `always` (the one box still carrying defect #4)
+**All four boxes then run to fleet standard** (applied without `--restart`, so nothing bounced):
+
+| | line 1 | line 2 | line 3 | line 4 |
+|---|---|---|---|---|
+| hostname | `dchserver1` | `dchserver2` | `dchserver3` | `dchserver4` |
+| `/etc/hosts` 127.0.1.1 | `dchserver1` | `dchserver2` | `dchserver3` | `dchserver4` |
+| NTP source | `.102` | `.102` | `.102` | `.102` |
+| `Restart=` | `always` | `always` | `always` | `always` |
+| screen | 1280x800 | 1280x800 | 1280x800 | 1280x800 |
+
+Line 1's launcher was normalised to the canonical script on disk; it already displays 1280x800 from
+the original hand-edit, so the file takes effect at its next GUI restart with an identical result.
+
+### Two bugs the live run found in `commission-stack.sh`
+
+Both were in the hostname handling, and both are fixed:
+
+1. **`/etc/hosts` must be keyed off the mapping, not the old hostname.** All three new stacks
+   answered `dchserver2` while `/etc/hosts` still said `dchserver1` — a clone's hosts entry can
+   already disagree with its running hostname, so `sed "s/\b$(hostname)\b/…/"` matches nothing and
+   silently leaves the stale name. Rewrite the `127.0.1.1` line itself.
+2. **The hostname and the hosts entry must be checked SEPARATELY.** Folding the hosts fix inside
+   the hostname-change branch means a box with the right hostname is never examined — exactly what
+   happened to line 2, which kept `127.0.1.1 dchserver1` through the first pass.
 
 ### 🔴 Still open: the clone master
 

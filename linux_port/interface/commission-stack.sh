@@ -122,7 +122,12 @@ elif [ "$CHECK_ONLY" = 1 ]; then
   changed "ntp" "NEEDS FIX — ${CUR_NTP:-unset} should be $NTP"
 else
   SUDO mkdir -p /etc/systemd/timesyncd.conf.d
-  printf '[Time]\nNTP=%s\n' "$NTP" | SUDO tee "$CONF" >/dev/null
+  if [ -n "$CUR_NTP" ]; then
+    SUDO cp -p "$CONF" "$CONF.bak-$(date +%Y%m%d-%H%M%S)"
+    SUDO sed -i "s/^NTP=.*/NTP=$NTP/" "$CONF"      # in place: keep the file's comment
+  else
+    printf '# Overhead: get time from the Interface PC (chrony NTP server on the controller net).\n[Time]\nNTP=%s\n' "$NTP" | SUDO tee "$CONF" >/dev/null
+  fi
   SUDO systemctl restart systemd-timesyncd
   changed "ntp" "${CUR_NTP:-unset} -> $NTP"
 fi
@@ -134,17 +139,40 @@ WANT_HOST="$HOSTNAME_OVERRIDE"
 if [ -z "$WANT_HOST" ] && [ -n "$MYIP" ]; then
   WANT_HOST="dchserver$(( ${MYIP##*.} - 10 ))"   # .11 -> dchserver1
 fi
+# The running hostname and the /etc/hosts 127.0.1.1 mapping are checked
+# SEPARATELY. A clone can have the right hostname but a stale hosts entry (Claxton
+# line 2 answered dchserver2 while /etc/hosts still said dchserver1), so folding
+# the hosts check inside the hostname-change branch silently skips it.
+HOSTS_WAS=$(awk '$1=="127.0.1.1"{print $2}' /etc/hosts)
+
 if [ -z "$WANT_HOST" ]; then
   say "hostname" "$(hostname) (could not derive; pass --hostname)"
-elif [ "$(hostname)" = "$WANT_HOST" ]; then
-  say "hostname" "$WANT_HOST already correct"
-elif [ "$CHECK_ONLY" = 1 ]; then
-  changed "hostname" "NEEDS FIX — $(hostname) should be $WANT_HOST"
 else
-  OLD=$(hostname)
-  SUDO hostnamectl set-hostname "$WANT_HOST"
-  SUDO sed -i "s/\b$OLD\b/$WANT_HOST/g" /etc/hosts
-  changed "hostname" "$OLD -> $WANT_HOST"
+  if [ "$(hostname)" = "$WANT_HOST" ]; then
+    say "hostname" "$WANT_HOST already correct"
+  elif [ "$CHECK_ONLY" = 1 ]; then
+    changed "hostname" "NEEDS FIX — $(hostname) should be $WANT_HOST"
+  else
+    OLD=$(hostname)
+    SUDO hostnamectl set-hostname "$WANT_HOST"
+    changed "hostname" "$OLD -> $WANT_HOST"
+  fi
+
+  if [ "$HOSTS_WAS" = "$WANT_HOST" ]; then
+    say "hosts 127.0.1.1" "$WANT_HOST already correct"
+  elif [ "$CHECK_ONLY" = 1 ]; then
+    changed "hosts 127.0.1.1" "NEEDS FIX — ${HOSTS_WAS:-missing} should be $WANT_HOST"
+  else
+    SUDO cp -p /etc/hosts "/etc/hosts.bak-$(date +%Y%m%d-%H%M%S)"
+    if [ -n "$HOSTS_WAS" ]; then
+      # rewrite the mapping itself; never substitute the old name, which may
+      # already disagree with the running hostname
+      SUDO sed -i "s/^\(127\.0\.1\.1[[:space:]]\+\).*/\1$WANT_HOST/" /etc/hosts
+    else
+      printf '127.0.1.1 %s\n' "$WANT_HOST" | SUDO tee -a /etc/hosts >/dev/null
+    fi
+    changed "hosts 127.0.1.1" "${HOSTS_WAS:-missing} -> $WANT_HOST"
+  fi
 fi
 
 # --- 4. GUI restart policy ----------------------------------------------------
