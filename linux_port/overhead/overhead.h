@@ -196,6 +196,14 @@ public:
                                                          // Include space for groups.
     fsave_grp     fsave_grp_tbl[MAX_GROUPS];       // groups of structs to save in files
     lblQ                batch_label;                     // send queue of batch labels
+    // 15.7.14 - batch label slot bookkeeping (BatchLabelSlots.h). Not on the wire.
+    UINT                label_alloc_seq[MAXBCHLABELS];   // allocation order per slot, reclaim oldest first
+    UINT                label_alloc_ctr;
+    UINT                label_reclaims;                  // reclaims since the last host ERROR_MSG
+    UINT                label_unreported;                // batches with no slot since the last host ERROR_MSG
+    time_t              label_reclaim_msg_time;          // rate limit for the ERROR_MSGs below
+    time_t              label_nofree_msg_time;
+    char                label_err_buf[2][MAXERRMBUFSIZE];// [0] reclaim, [1] no slot; GenError keeps the pointer until sent
     SHARE_MEMORY        *pShm;
     TRACE_MEMORY        *pTraceMemory;
     int					WriteLCReadsToFile;
@@ -324,6 +332,13 @@ public:
     void    TimePPM();
 	HANDLE	InitDebugShell();
 	int     SendDrpManager(int cmd, int drop, int var1, int var2, int var3, int var4);
+
+    // 15.7.14 - batch label slots (overhead.cpp "Batch label slots", BatchLabelSlots.h).
+    // Public: used from the LABEL_INFO / CLEAR_DROP_BATCH / APPLY_BATCH_NUMBER macros,
+    // which also expand in InterSystems.cpp and DropManager.cpp.
+    int     GetLabelSlot(int drp);              // slot for a new batch on drop drp (0-based), -1 = none
+    void    ReleaseCutShortLabel(int drp);      // drop drp's batch is being cleared: free its slot if cut short
+    UINT    NextBatchNumber();                  // next batch number incl. line bits, skipping numbers in use
 
 
     static void __stdcall DebugThread(PVOID unused);

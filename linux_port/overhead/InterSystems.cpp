@@ -1223,17 +1223,14 @@ void InterSystems::ProcessRx(int rdq_indx)
                 if (prxmsg->maint.msgdata.action == isys_drop_batch_req)
                 {
                     //	pGET_BATCH_NUMBER(prxmsg->maint.msgdata.drop_num - 1)
-					UINT line_mult;
-					line_mult = app->this_lineid << LINE_SHIFT;
+					//	15.7.14: same numbering as APPLY_BATCH_NUMBER (skips numbers still in use)
 					if (app->pShm->sys_stat.DropStatus[prxmsg->maint.msgdata.drop_num - 1].batch_number == 0)
 					{
-						app->pShm->sys_stat.DropStatus[prxmsg->maint.msgdata.drop_num - 1].batch_number = app->sav_drp_rec_file_info.nxt_lbl_seqnum + line_mult;
+						app->pShm->sys_stat.DropStatus[prxmsg->maint.msgdata.drop_num - 1].batch_number = app->NextBatchNumber();
 						if (HOST_OK) 
 						{
 							LABEL_INFO(prxmsg->maint.msgdata.drop_num - 1)
 						}
-						if(++app->sav_drp_rec_file_info.nxt_lbl_seqnum >= MAXBCHLBLNUM)
-						   app->sav_drp_rec_file_info.nxt_lbl_seqnum = 1;
 					}
 					txmsg.maint.batch = app->pShm->sys_stat.DropStatus[prxmsg->maint.msgdata.drop_num - 1].batch_number;
 

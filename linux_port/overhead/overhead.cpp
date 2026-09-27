@@ -4,6 +4,7 @@
 
 #include "types.h"
 #include "telnetsrv.h"
+#include "BatchLabelSlots.h"   // 15.7.14 - pure slot bookkeeping, see "Batch label slots"
 #include <sys/socket.h>   // controller derives its line id from its own IP
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -1992,6 +1993,15 @@ void overhead::InitLocals()
     for (i = 0; i < MAXBCHLABELS; i++)
         slave_batch[i]   = 0;
 
+    // 15.7.14 - slot bookkeeping (see "Batch label slots")
+    memset(label_alloc_seq, 0, sizeof(label_alloc_seq));
+    memset(label_err_buf,   0, sizeof(label_err_buf));
+    label_alloc_ctr        = 0;
+    label_reclaims         = 0;
+    label_unreported       = 0;
+    label_reclaim_msg_time = 0;
+    label_nofree_msg_time  = 0;
+
 #ifdef _SIMULATION_MODE_
 
     simulation_mode = true;
@@ -2780,6 +2790,156 @@ void overhead::SendLabelInfo()
             }
         }
     }
+}
+
+//--------------------------------------------------------
+//  Batch label slots (15.7.14)
+//
+//  batch_label.info[] holds one slot per numbered batch until the host has
+//  answered both PRN_BCH_REQ (310 -> 311) and PRN_BCH_PRE_REQ (320 -> 321).
+//  320 is only sent when the batch's last bird drops, so a batch cleared
+//  before it completed (operator RESET_BATCH, mode change, clear totals) held
+//  its slot until CLEAR_BATCH_RECS or a restart, and once all MAXBCHLABELS
+//  were held LABEL_INFO silently sent no 310 for any new batch. And after a
+//  319 / RESET_BCH_NUMS restarted the numbering, a new batch could take the
+//  number of one still open on another drop. The pure logic and the reasons
+//  each choice is invisible to both hosts are in BatchLabelSlots.h.
+//
+//  These run from several threads (timer scan, host mailbox, drop manager,
+//  intersystems), like every other batch_label access, so they trace with
+//  the thread-safe DebugTrace rather than a per-thread trc buffer.
+//--------------------------------------------------------
+
+#define LABEL_MSG_SECS  60      // at most one host ERROR_MSG of each kind per minute (a clock step back re-arms it)
+
+//----- Next batch number (line bits included), skipping numbers still in use.
+
+UINT overhead::NextBatchNumber()
+{
+    UINT open[MAXDROPS];
+    UINT was = sav_drp_rec_file_info.nxt_lbl_seqnum;
+    UINT num;
+    int  skipped = 0;
+
+    for (int d = 0; d < MAXDROPS; d++)
+        open[d] = pShm->sys_stat.DropStatus[d].batch_number;
+
+    num = BLS_NextBatchNumber(&sav_drp_rec_file_info.nxt_lbl_seqnum,
+                              (UINT) this_lineid << LINE_SHIFT, MAXBCHLBLNUM,
+                              open, MAXDROPS, batch_label.info, MAXBCHLABELS, &skipped);
+
+    if (skipped > 0)
+        DebugTrace(_LABELS_, "Lbl\tskip\t%d\tbch# from\t%u\tto\t%u\t(still open or queued)\n",
+                   skipped, was, num & BATCH_MASK);
+
+    return num;
+}
+
+//----- A slot for a new batch on drop drp. If the table is full, reuse the
+//      oldest slot the host has already opened (311 received) whose batch is no
+//      longer any drop's current batch. Never silent: both cases raise a
+//      rate-limited ERROR_MSG to the host.
+
+int overhead::GetLabelSlot(int drp)
+{
+    UINT   open[MAXDROPS];
+    UINT   new_bch = pShm->sys_stat.DropStatus[drp].batch_number;
+    int    idx;
+    time_t now;
+
+    idx = BLS_FindFree(batch_label.info, MAXBCHLABELS);
+
+    if (idx < 0)
+    {
+        for (int d = 0; d < MAXDROPS; d++)
+            open[d] = pShm->sys_stat.DropStatus[d].batch_number;
+
+        idx = BLS_PickReclaim(batch_label.info, MAXBCHLABELS, label_alloc_seq, open, MAXDROPS);
+        time(&now);
+
+        if (idx >= 0)
+        {
+            DebugTrace(_LABELS_, "Lbl\treclaim\tbch#\t%u\tdrop\t%d\tindx\t%d\tpre\t%d\tfor bch#\t%u\tdrop\t%d\n",
+                       batch_label.info[idx].seq_num & BATCH_MASK, batch_label.info[idx].drop, idx,
+                       batch_label.info[idx].pre_label_step, new_bch & BATCH_MASK, drp + 1);
+
+            label_reclaims++;
+            if ( (label_reclaim_msg_time == 0) || (now < label_reclaim_msg_time) ||
+                 ((now - label_reclaim_msg_time) >= LABEL_MSG_SECS) )
+            {
+                snprintf(label_err_buf[0], MAXERRMBUFSIZE,
+                         "Batch label table full (%d): reused the slot of batch %u (drop %d, already sent to host) "
+                         "for batch %u (drop %d). %u reuse(s) since last report.\n",
+                         MAXBCHLABELS, batch_label.info[idx].seq_num & BATCH_MASK, batch_label.info[idx].drop,
+                         new_bch & BATCH_MASK, drp + 1, label_reclaims);
+                GenError(informational, label_err_buf[0]);
+                label_reclaim_msg_time = now;
+                label_reclaims         = 0;
+            }
+
+            memset(&batch_label.info[idx], 0, sizeof(print_info));
+        }
+        else
+        {
+            DebugTrace(_LABELS_, "Lbl\tnoslot\tbch#\t%u\tdrop\t%d\t(all %d slots await PRN_BCH_RESP)\n",
+                       new_bch & BATCH_MASK, drp + 1, MAXBCHLABELS);
+
+            label_unreported++;
+            if ( (label_nofree_msg_time == 0) || (now < label_nofree_msg_time) ||
+                 ((now - label_nofree_msg_time) >= LABEL_MSG_SECS) )
+            {
+                snprintf(label_err_buf[1], MAXERRMBUFSIZE,
+                         "Batch %u (drop %d) NOT sent to host: all %d batch label slots are waiting for the "
+                         "host to answer PRN_BCH_REQ. %u batch(es) not sent since last report.\n",
+                         new_bch & BATCH_MASK, drp + 1, MAXBCHLABELS, label_unreported);
+                GenError(warning, label_err_buf[1]);
+                label_nofree_msg_time = now;
+                label_unreported      = 0;
+            }
+            return -1;
+        }
+    }
+
+    label_alloc_seq[idx] = ++label_alloc_ctr;
+    return idx;
+}
+
+//----- Drop drp's batch is about to be cleared (CLEAR_DROP_BATCH / CLEAR_TOTALS).
+//      If it never completed, no last-in-batch bird exists and no 320 will ever
+//      be sent for it: finish its slot now, or as soon as the host's 311 arrives.
+
+void overhead::ReleaseCutShortLabel(int drp)
+{
+    UINT bch;
+    int  idx, rc;
+
+    if ( (drp < 0) || (drp >= MAXDROPS) )
+        return;
+
+    bch = pShm->sys_stat.DropStatus[drp].batch_number;
+
+    // Not numbered, an InterSystems slave's temporary number, or another line's
+    // number (InterSystems: the slot lives on the master line only).
+    if ( (bch == 0) || (bch == TEMP_BATCH_NUM) || ((int) (bch >> LINE_SHIFT) != this_lineid) )
+        return;
+
+    // Completed: the shackle of its last bird still carries last_in_batch and
+    // will send the 320 when it drops. Leave the normal path alone.
+    if (pShm->sys_stat.DropStatus[drp].Batched)
+        return;
+
+    idx = BLS_FindSlot(batch_label.info, MAXBCHLABELS, bch);
+    rc  = BLS_MarkCutShort(batch_label.info, idx);
+
+    if ( (rc != BLS_FREE_NOW) && (rc != BLS_FREE_ON_ACK) )
+        return;
+
+    DebugTrace(_LABELS_, "Lbl\tcutshort\tbch#\t%u\tdrop\t%d\tindx\t%d\t%s\n",
+               bch & BATCH_MASK, drp + 1, idx,
+               (rc == BLS_FREE_NOW) ? "freed" : "frees on PRN_BCH_RESP");
+
+    if (rc == BLS_FREE_NOW)
+        memset(&batch_label.info[idx], 0, sizeof(print_info));
 }
 
 //--------------------------------------------------------
