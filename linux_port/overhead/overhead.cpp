@@ -1915,6 +1915,7 @@ void overhead::InitLocals()
         ss_trolley_stall[i]     = 0;
         ss_tab_run[i]           = SS_MIN_TROLLEYS_BETWEEN_TABS;  // allow the FIRST tab through
         ss_trolley_shrink[i]    = 0;
+        ss_ovr_pass[i]          = false;   // 15.7.14: single-sensor duplicate-pass guard
     }
     for (i = 0; i < MAXGRADESYNCS; i++)
     {
@@ -1923,6 +1924,7 @@ void overhead::InitLocals()
         ss_grade_trolley_stall[i]     = 0;
         ss_grade_tab_run[i]           = SS_MIN_TROLLEYS_BETWEEN_TABS;
         ss_grade_trolley_shrink[i]    = 0;
+        ss_grade_ovr_pass[i]          = false;   // 15.7.14
     }
 
     for (i = 0; i < MAXGRADESYNCS; i++)
@@ -6407,6 +6409,10 @@ void overhead::GradeSyncs()
 			gradesync_zero_triggered[GradeSyncIndex] = false; //GLC added 3/9/05
 			//RtPrintf("Grade sync\n");
 
+			// 15.7.14: single-sensor duplicate-pass guard - grade-sync mirror of ProcessSyncs.
+			bool ssGradeTabDup = false;	// accepted tab whose GradeProcess would repeat the Shackles+1 one
+			bool ssGradeRan    = false;	// this edge ran GradeProcess
+
 			// Standard mode reads the grade zero bit; single-sensor mode derives
 			// the grade zero from the double-pulse timing on the grade count bit.
 			bool grade_zero_detected = (pShm->ZeroFlagMode == 1)
@@ -6461,6 +6467,20 @@ void overhead::GradeSyncs()
 				pShm->sys_stat.dbg_sync[ZERO_ON][MAXSYNCS - 1]	= 0;
 				pShm->sys_stat.dbg_sync[SYNC_ON][MAXSYNCS - 1]++;
 
+				// 15.7.14: single-sensor double pulse - see ProcessSyncs. The grade flag trolley's
+				// body pulse was counted as Shackles+1 and already ran GradeProcess for exactly the
+				// shackles this tab maps to again (RingSub(1,x) == RingSub(Shackles+1,x)).
+				if (pShm->ZeroFlagMode == 1)
+				{
+					ssGradeTabDup = ss_grade_ovr_pass[GradeSyncIndex];
+
+					if ( ssGradeTabDup && (!trc[MAINBUFID].buffer_full) && (TraceMask & _ZEROS_ ) )
+					{
+						sprintf((char*) &tmp_trc_buf[MAINBUFID],"GrdZero\t%d\tSS tab\tdup GradeProcess skipped\tShk\t%d\n",
+								GradeSyncIndex, pShm->sys_set.Shackles + 1);
+						strcat((char*) &trc_buf[MAINBUFID],(char*) &tmp_trc_buf[MAINBUFID] );
+					}
+				}
 			}
 			else
 			{
@@ -6503,13 +6523,21 @@ void overhead::GradeSyncs()
 				}
 			}
 
-			if ( (pShm->OpMode == ModeRun) && (grade_zeroed[GradeSyncIndex]) )
+			if ( (pShm->OpMode == ModeRun) && (grade_zeroed[GradeSyncIndex]) &&
+				 !ssGradeTabDup )	// 15.7.14
 			{
 				GradeProcess(GradeSyncIndex);
+				ssGradeRan = true;
 			}
 			 //else
 			 //    RtPrintf("OpMode %d grade_zeroed %d\n",
 			 //               pShm->OpMode, grade_zeroed);
+			// 15.7.14: arm / disarm the tab guard exactly as ProcessSyncs does (ss_ovr_pass).
+			if (ssGradeRan)
+				ss_grade_ovr_pass[GradeSyncIndex] = (pShm->ZeroFlagMode == 1) &&
+					(pShm->grade_shackle[GradeSyncIndex] == pShm->sys_set.Shackles + 1);
+			else if (pShm->grade_shackle[GradeSyncIndex] != pShm->sys_set.Shackles + 1)
+				ss_grade_ovr_pass[GradeSyncIndex] = false;
 
 		}
 		else
@@ -6550,6 +6578,10 @@ void overhead::GradeSyncs()
 				grade_armed[GradeSyncIndex] = false;
 				gradesync_zero_triggered[GradeSyncIndex] = false; //GLC added 3/9/05
 				//RtPrintf("Grade sync\n");
+
+				// 15.7.14: single-sensor duplicate-pass guard - grade-sync mirror of ProcessSyncs.
+				bool ssGradeTabDup = false;	// accepted tab whose GradeProcess would repeat the Shackles+1 one
+				bool ssGradeRan    = false;	// this edge ran GradeProcess
 
 				// Standard mode reads the grade zero bit; single-sensor mode derives
 				// the grade zero from the double-pulse timing on the grade count bit.
@@ -6601,6 +6633,20 @@ void overhead::GradeSyncs()
 					pShm->sys_stat.dbg_sync[ZERO_ON][MAXSYNCS + GradeSyncIndex - 1] = 0;
 					pShm->sys_stat.dbg_sync[SYNC_ON][MAXSYNCS + GradeSyncIndex - 1]++;
 
+					// 15.7.14: single-sensor double pulse - see ProcessSyncs. The grade flag trolley's
+					// body pulse was counted as Shackles+1 and already ran GradeProcess for exactly the
+					// shackles this tab maps to again (RingSub(1,x) == RingSub(Shackles+1,x)).
+					if (pShm->ZeroFlagMode == 1)
+					{
+						ssGradeTabDup = ss_grade_ovr_pass[GradeSyncIndex];
+
+						if ( ssGradeTabDup && (!trc[MAINBUFID].buffer_full) && (TraceMask & _ZEROS_ ) )
+						{
+							sprintf((char*) &tmp_trc_buf[MAINBUFID],"GrdZero\t%d\tSS tab\tdup GradeProcess skipped\tShk\t%d\n",
+									GradeSyncIndex, pShm->sys_set.Shackles + 1);
+							strcat((char*) &trc_buf[MAINBUFID],(char*) &tmp_trc_buf[MAINBUFID] );
+						}
+					}
 				}
 				else
 				{
@@ -6647,13 +6693,21 @@ void overhead::GradeSyncs()
 				// Hard coded for now. We should not need more than 2 grade syncs
 				// But NEVER say NEVER
 				if ( (pShm->OpMode == ModeRun) &&
-					(grade_zeroed[0] && grade_zeroed[1]) )
+					(grade_zeroed[0] && grade_zeroed[1]) &&
+					!ssGradeTabDup )	// 15.7.14
 				{
 					GradeProcess(GradeSyncIndex);
+					ssGradeRan = true;
 				}
 				//else
 				//    RtPrintf("OpMode %d grade_zeroed %d\n",
 				//               pShm->OpMode, grade_zeroed);
+				// 15.7.14: arm / disarm the tab guard exactly as ProcessSyncs does (ss_ovr_pass).
+				if (ssGradeRan)
+					ss_grade_ovr_pass[GradeSyncIndex] = (pShm->ZeroFlagMode == 1) &&
+						(pShm->grade_shackle[GradeSyncIndex] == pShm->sys_set.Shackles + 1);
+				else if (pShm->grade_shackle[GradeSyncIndex] != pShm->sys_set.Shackles + 1)
+					ss_grade_ovr_pass[GradeSyncIndex] = false;
 
 			}
 			else
@@ -11382,6 +11436,12 @@ void overhead::ProcessSyncs()
 
 				//----- Zero flag detected -----
 
+                 // 15.7.14: single-sensor duplicate-pass guard (armed at the end of this edge,
+                 // see ss_ovr_pass[i] there). Standard mode (ZeroFlagMode==0) never sets these.
+                 bool ssTab     = false;   // this edge is an accepted single-sensor zero TAB
+                 bool ssTabDup  = false;   // ...whose pass would repeat the one already run at Shackles+1
+                 bool ssPassRan = false;   // this edge ran the drop / missed-bird pass
+
  				 // Zero-flag decision. Standard mode (ZeroFlagMode==0) reads the
 				 // dedicated odd zero bit, byte-for-byte unchanged. Single-sensor mode
 				 // (ZeroFlagMode==1) ignores the zero bit and derives zero from the
@@ -11445,6 +11505,28 @@ void overhead::ProcessSyncs()
                     {
                         sprintf((char*) &tmp_trc_buf[MAINBUFID],"Zero\t%d\tOK\n", i);
                         strcat((char*) &trc_buf[MAINBUFID],(char*) &tmp_trc_buf[MAINBUFID] );
+                    }
+
+                    // 15.7.14: single-sensor DOUBLE PULSE. The flag trolley's BODY pulse came
+                    // first, could not yet be known as the zero, and was counted as Shackles+1
+                    // (the overshoot tolerated below) - and it already ran this sync's per-shackle
+                    // pass. This TAB pulse realigns the counter to 1, but RingSub(1, x) ==
+                    // RingSub(Shackles+1, x) for every offset, so re-running the pass would process
+                    // the very same shackles a second time ~0.4 trolley later: a second drop kick,
+                    // a second missed-bird check and DROP_RECORD (shackle 1172 on the rig), a second
+                    // last-bird / pre-label step. The tab only realigns: the counter reset above and
+                    // the weigh relabel below (WeighShackle -> 1, the auto-zero shackle) are unchanged.
+                    if (pShm->ZeroFlagMode == 1)
+                    {
+                        ssTab    = true;
+                        ssTabDup = ss_ovr_pass[i];
+
+                        if ( ssTabDup && (!trc[MAINBUFID].buffer_full) && (TraceMask & _ZEROS_ ) )
+                        {
+                            sprintf((char*) &tmp_trc_buf[MAINBUFID],"Zero\t%d\tSS tab\tdup pass skipped\tShk\t%d\n",
+                                    i, pShm->sys_set.Shackles + 1);
+                            strcat((char*) &trc_buf[MAINBUFID],(char*) &tmp_trc_buf[MAINBUFID] );
+                        }
                     }
                  }
 
@@ -11568,7 +11650,9 @@ void overhead::ProcessSyncs()
                 // recalculate shackle to shackle ticks on every other shackle
                 if ( i == SCALE1SYNCBIT )
                 {
-                    isys_shksec_sec_cnt++; // not part of avg/capt
+                    // 15.7.14: a single-sensor tab is not a trolley (its body pulse was counted).
+                    if (!ssTab)
+                        isys_shksec_sec_cnt++; // not part of avg/capt
 
                     // The offsets can vary from install to install. Skip all of these
                     // to be out of the way of any automatic resets which may occur.
@@ -11680,8 +11764,11 @@ void overhead::ProcessSyncs()
                     (dual_scale               ||
                     (!dual_scale              &&
                     (i != SCALE2SYNCBIT)))    &&
-                    (pShm->OpMode == ModeRun) )
+                    (pShm->OpMode == ModeRun) &&
+                    !ssTabDup )               // 15.7.14: tab repeating the body pulse's pass
                 {
+                    ssPassRan = true;         // 15.7.14: arms ss_ovr_pass[i] at the end of the edge
+
                     //If this sync supports drops, see if the shackle has a drop assigned
 
                     if ((pSyncSet->first > 0) && (pSyncSet->last > 0))
@@ -11842,6 +11929,21 @@ void overhead::ProcessSyncs()
                         } // if (pShm->sys_set.MBSync == i)
                     } // for loop
                 } // if (dual_scale... i != SCALE2SYNCBIT)
+
+                // 15.7.14: single-sensor duplicate-pass guard for the tab. ARMED when this edge
+                // ran the pass with the counter at the tolerated Shackles+1 overshoot (= the flag
+                // trolley's body pulse). DISARMED by a pass at any other count, or as soon as the
+                // counter leaves Shackles+1. An edge that neither counts nor runs the pass (a
+                // SkipTrollies trolley) leaves it as it is: the counter - and so the shackles a
+                // pass maps to - has not moved. So a tab skips its pass only when that pass would
+                // repeat shackles already processed at Shackles+1. A missed / rejected / out-of-
+                // window tab, an early tab, the first zero after start-up and standard mode leave
+                // it clear and run exactly as before. The counter itself is never touched here.
+                if (ssPassRan)
+                    ss_ovr_pass[i] = (pShm->ZeroFlagMode == 1) &&
+                                     (pSyncStat->shackleno == pShm->sys_set.Shackles + 1);
+                else if (pSyncStat->shackleno != pShm->sys_set.Shackles + 1)
+                    ss_ovr_pass[i] = false;
            }  // if sync_debounce[i] = 0
          } // if sync_in
          else if (!BITSET(sync_in[byte], i))

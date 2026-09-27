@@ -37,6 +37,48 @@ If you forget this and deploy the `0xFF` stub to real hardware, the `inb()` read
 
 Applies to both VM and real hardware. The capability is stored on the file and gets wiped by every rebuild/copy.
 
+## Sep 26, 2026 - 15.7.14: batch label slots, batch-number reuse, single-sensor zero-tab double pass
+
+Found by the dual-scale distribution soak on the office rig (host write-up:
+`overhead/docs/DUALSCALE_SOAK_AND_BATCH_FIXES_2026-09-26.md`). Wire protocol and host behaviour
+(Delphi and the Go API) unchanged. Deployed to the rig controller `.11` only (sha256 `844daeb3...`).
+
+### Batch label slots (`overhead/BatchLabelSlots.h`, `overheadmacros.h`, `overhead.cpp`, `InterSystems.cpp`)
+- **Leak.** A label slot (MAXBCHLABELS = 64) was freed only after the host's 311 AND the 320/321
+  pre-label exchange, and 320 is sent only when the batch's last bird drops. A batch cleared before
+  completion (RESET_BATCH / "Start New", mode change, CLEAR_TOTALS) held its slot until a 319 or a
+  restart. At 64 `LABEL_INFO` silently found no slot: batching continued but no 310 reached the host
+  (no batch record, no label, no alarm).
+- **Fix (a):** `ReleaseCutShortLabel(drp)` at the head of `CLEAR_DROP_BATCH` and before the CLEAR_TOTALS
+  wipe frees the slot of a batch that never completed (`Batched==0`, this line's number): at once if the
+  host already answered the 310, otherwise on its 311. Completed batches still send their 320.
+- **Fix (b):** `GetLabelSlot()` - when full, reuse the oldest slot the host has acked (311) whose batch
+  is no drop's current batch, and raise ERROR_MSG (<=1/min) "Batch label table full..." /
+  "Batch N (drop D) NOT sent to host...". Never silent again.
+- **Fix (c):** `NextBatchNumber()` follows the old sequence but skips numbers that are still a drop's
+  current batch or held in a slot - no reuse after CLEAR_BATCH_RECS (319) or the 999->1 wrap.
+- `LABEL_INFO` now also resets `pre_label_step` when it takes a slot. Traces under `_LABELS_`
+  (`Lbl cutshort|reclaim|noslot|skip`).
+- Test: `tools/batchlabel_slots_test.cpp` (62/62; 200 mid-batch resets: 15.7.13 holds all 64 slots and
+  136 batches never reach the host, 15.7.14 holds 0). Rig: 100 mid-batch resets -> 100 batch opens.
+- **RTX:** `rtx_source/Overhead` has byte-identical macros - needs the same change (VC6) for EPM-19 sites.
+
+### Single-sensor zero flag: shackle processed twice per revolution (`overhead.cpp`, `overhead.h`)
+- In `zero_flag_mode=1` the flag trolley's body pulse counts 1189 -> 1190, then the tab (~140 ms later)
+  resets to 1; `RingSub` maps both to the same shackle (1172 on the rig), so the whole per-edge block ran
+  twice: every drop on a tab-detecting sync **fired its kicker a second time**, the missed-bird check and
+  `AddDropRecord` ran twice (phantom row graded area 0's letter), `GradeProcess` re-read the eye, the
+  InterSystems shackles/sec counted +1.
+- **Fix:** per-sync flags `ss_ovr_pass` / `ss_grade_ovr_pass`; on an accepted single-sensor tab after a
+  pass at Shackles+1, still reset the counter and re-label the weighment, but skip the duplicate
+  drop/missed-bird pass and GradeProcess and don't count the tab for the IS rate. Standard (two-sensor)
+  mode, missed/late/early tabs and the first zero after restart behave exactly as before.
+- Test: `tools/sszero_tab_dup_test.sh` runs the real 15.7.13 and 15.7.14 `ProcessSyncs`/`GradeSyncs`
+  side by side (15 scenarios, 290/290; counters/zeroing identical on every scan; 5 mutants caught).
+  Rig: 21-min capture - 0 repeated shackles, 1172 once per revolution.
+
+`APP_VER3` 13 -> 14.
+
 ## Aug 15, 2026 - 10" Kiosk Window Position (`DCH_GUI_X` / `DCH_GUI_Y`)
 
 Added `DCH_GUI_X` / `DCH_GUI_Y` origin-offset env vars to `linux_port/interface/dch-server-gui.py`
