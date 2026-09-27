@@ -103,6 +103,12 @@ public:
     int                 ss_grade_trolley_stall[MAXGRADESYNCS];
     int                 ss_grade_tab_run[MAXGRADESYNCS];
     int                 ss_grade_trolley_shrink[MAXGRADESYNCS];
+    // 15.7.14: single-sensor duplicate-pass guard (ProcessSyncs / GradeSyncs). Armed when the sync
+    // ran its per-shackle pass with the counter at the tolerated Shackles+1 overshoot (the flag
+    // trolley's body pulse); disarmed once the counter leaves Shackles+1. The tab that follows maps
+    // to the same shackles (RingSub(1,x) == RingSub(Shackles+1,x)), so it must not run that pass again.
+    bool                ss_ovr_pass[MAXSYNCS];
+    bool                ss_grade_ovr_pass[MAXGRADESYNCS];
     __int64             ss_last_warn_tick; // single-sensor: throttle "Zero Flag NOT Detected" sends to the host
 
     // --- Sensor Scope: raw-input pulse capture (SandCat only; host arch-gated) ---
