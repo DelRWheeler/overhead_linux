@@ -37,7 +37,57 @@ If you forget this and deploy the `0xFF` stub to real hardware, the `inb()` read
 
 Applies to both VM and real hardware. The capability is stored on the file and gets wiped by every rebuild/copy.
 
+## Oct 5, 2026 - 15.7.15 (hotfix line `hotfix/sszero-measured-window`): single-sensor zero at any line speed
+
+Pitman Farms (skip 1, 304 shackles, flag tab at 0.42 of the trolley pitch) lost its single-sensor zero
+whenever the line ran slow: the host's `ZeroTabWindowMaxMs` = 375 ms rejected the genuine tab below
+~33.6 SPM (tab = 0.42 x 30000/SPM ms), so the count drifted, drops fired on the wrong trolleys and
+operators hand-unloaded birds. Single-sensor mode (`ZeroFlagMode == 1`) only; standard two-sensor mode
+is unchanged (proven event-for-event against 15.7.13). Wire protocol and shared-memory layout unchanged.
+
+**What this binary is:** `f9f2968` (15.7.13 + trickle-suspend guard = the `e1bf768c` build at Pitman,
+Holmes, Claxton L1) + `02bf814` (15.7.14 single-sensor duplicate-pass guard, cherry-picked clean) + the
+changes below. It does **NOT** contain `9da7827` (15.7.14 batch-label slots) - mainline 15.7.14 does.
+
+### Tab detector (`SingleSensorIsZeroTab` -> `SingleSensorTabRule`, constants in `overheadconst.h`)
+- Measured, not guessed: G = the last trolley-to-trolley gap, G2 = the one before (tabs never update
+  them). TAB only if (a) `0.20*G <= delta <= 0.65*G`, (b) G within 70..143% of G2 (not accelerating),
+  (c) `tabRun >= R - 8` trolleys since the last accepted tab, R = Shackles*(SkipTrollies+1).
+- `ZeroTabWindowMinMs/MaxMs` and the 0.18..0.50 x EMA test are no longer consulted (fields + host push
+  kept). EMA `interval`, stall / shrink re-seeds and timebase semantics unchanged; `tabRun` now counts
+  every trolley-classified edge.
+- Boot confirmation (`SS_BOOT_CONFIRM 1`): the first zero after a controller start needs a second
+  tab-shaped edge R+1 +/- 8 trolleys after an earlier one (per-sync bit ring of 8192 positions).
+  Costs up to one extra revolution before the first zero (~14 min at turkey speed, ~5 at chicken);
+  set `SS_BOOT_CONFIRM 0` to take the first tab-shaped edge instead.
+
+### Alarms (per sync, single-sensor only)
+- Owner's rule replaces `SingleSensorWarnOk` (<= 1 per 30 s GLOBAL, which swallowed other syncs'
+  alarms): no zero-flag alarm until the sync has counted Shackles+1 since boot, then at most one per
+  Shackles+1 counts - for "NOT Detected", "Early", "Late" and the new "position mismatch". Counting
+  on a missed zero is unchanged. "Initial" is not gated.
+- New "Zero Flag position mismatch. <sync> count n trolley t expected Shackles+1/0": an accepted tab
+  must find the flag body's count (Shackles+1, skip parity 0); catches the misplaced zeros Late/Early
+  cannot see (e.g. skip 1: missed tab then a false zero one trolley later).
+- New informational "Zero Flag re-acquired. <sync>" on the first good zero after a raised
+  "NOT Detected" / "position mismatch" (the rule usually swallows the "Late" that used to say it).
+- While a boot candidate awaits confirmation the threshold is two revolutions, so a normal start-up
+  raises no alarm.
+
+### Tests (`linux_port/tools/`)
+- `sszero_tab_dup_test.sh` (adapted): standard mode vs real 15.7.13 identical; single-sensor
+  duplicate-pass guard vs the same tree without it. 353/353 with `SS_BOOT_CONFIRM` 1 and 0.
+- `sszero_window_test.sh` (new): real ProcessSyncs/GradeSyncs over 5 ms scan streams of a moving
+  chain - Pitman/chicken steady, steps, ramps, stops, jitter, noise, missing flags, any-plant grid.
+  Steady and 5-15 s ramps: 0 missed / 0 false. Residuals (all alarmed): instant or 2 s speed-up 1-8
+  trolleys before the flag; a stop with the flag body in front of the sensor.
+
+`APP_VER3` 13 -> 15.
+
 ## Sep 26, 2026 - 15.7.14: batch label slots, batch-number reuse, single-sensor zero-tab double pass
+
+> **Hotfix line note:** the 15.7.15 hotfix branch carries only the single-sensor part of this entry
+> (`02bf814`); the batch-label slot fix (`9da7827`) below is mainline 15.7.14 only.
 
 Found by the dual-scale distribution soak on the office rig (host write-up:
 `overhead/docs/DUALSCALE_SOAK_AND_BATCH_FIXES_2026-09-26.md`). Wire protocol and host behaviour

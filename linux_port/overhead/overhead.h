@@ -18,6 +18,19 @@
 
 #include "types.h"
 
+// 15.7.15: per-sync state of the single-sensor tab rule (SingleSensorIsZeroTab), one per drop /
+// scale sync and one per grade sync. Zero-initialised = boot (no gaps measured, not confirmed).
+struct SSTabRuleState
+{
+    __int64 gap;                    // G : the most recent trolley-classified gap (scan ticks)
+    __int64 gapPrev;                // G2: the trolley gap before G
+    bool    confirmed;              // a tab has been accepted since boot: the revolution gate applies
+    bool    haveCand;               // boot only: a tab-shaped edge has been seen
+    unsigned int  bootPos;          // boot only: trolley edges counted since boot (wraps)
+    unsigned int  lastCand;         // boot only: bootPos of the most recent tab-shaped edge
+    unsigned char cand[SS_BOOT_RING / 8];  // boot only: bit p = tab-shaped edge at bootPos p (mod ring)
+};
+
 class overhead:app_type
 {
 
@@ -109,7 +122,17 @@ public:
     // to the same shackles (RingSub(1,x) == RingSub(Shackles+1,x)), so it must not run that pass again.
     bool                ss_ovr_pass[MAXSYNCS];
     bool                ss_grade_ovr_pass[MAXGRADESYNCS];
-    __int64             ss_last_warn_tick; // single-sensor: throttle "Zero Flag NOT Detected" sends to the host
+    // 15.7.15: tab-rule state (measured gaps G/G2, boot confirmation), per sync.
+    SSTabRuleState      ss_rule[MAXSYNCS];
+    SSTabRuleState      ss_grade_rule[MAXGRADESYNCS];
+    // 15.7.15: owner's zero-flag alarm rule (SingleSensorAlarmOk), per sync: shackle counts since
+    // this sync's last zero-flag alarm (or since boot). Replaces the GLOBAL 30 s ss_last_warn_tick.
+    int                 ss_alarm_cnt[MAXSYNCS];
+    int                 ss_grade_alarm_cnt[MAXGRADESYNCS];
+    // 15.7.15: this sync has raised "Zero Flag NOT Detected" / "position mismatch" since its last
+    // good zero, so its next zero announces "Zero Flag re-acquired" (informational, once).
+    bool                ss_zero_lost[MAXSYNCS];
+    bool                ss_grade_zero_lost[MAXGRADESYNCS];
 
     // --- Sensor Scope: raw-input pulse capture (SandCat only; host arch-gated) ---
     // Sampled in App_Timer_Main every 5 ms; streamed as SYNC_CAPTURE_INFO. One sample =
@@ -272,9 +295,18 @@ private:
     void    ProcessSyncs();
     // Single-sensor zero-flag detector: classify one confirmed count edge as the
     // zero TAB (true) or a normal trolley (false), updating the per-sync timebase.
-    bool    SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval, int &stall, int &tabRun, int &shrink);
-    // Rate-limit "Zero Flag NOT Detected" sends in single-sensor mode (anti-flood).
-    bool    SingleSensorWarnOk();
+    bool    SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval, int &stall, int &tabRun, int &shrink,
+                                  SSTabRuleState &rs);
+    bool    SingleSensorTabRule(__int64 delta, __int64 gap, __int64 gapPrev, int tabRun, int revGate);
+    int     SingleSensorRevTrolleys();
+    int     SingleSensorRevGate();
+    bool    SingleSensorBootConfirm(SSTabRuleState &rs);
+    bool    SingleSensorBootPending(const SSTabRuleState &rs);
+    void    SingleSensorTrolleyEdge(int &tabRun, SSTabRuleState &rs);
+    void    SingleSensorAlarmTick(int &cnt);
+    bool    SingleSensorAlarmOk(int &cnt, const SSTabRuleState &rs);
+    // (15.7.15: SingleSensorWarnOk, the GLOBAL 30 s throttle, is replaced by the per-sync
+    //  SingleSensorAlarmTick / SingleSensorAlarmOk above.)
     // Sensor Scope capture (SandCat only): append a scan sample + drive streaming.
     void    SyncCaptureScan();
     void    SyncCaptureSend(int windowLen, int triggerIdx);

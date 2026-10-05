@@ -83,7 +83,7 @@
 
 #define APP_VER1         15 // Major
 #define APP_VER2         7  // Minor
-#define APP_VER3         13	// Local
+#define APP_VER3         15	// Local -- 15.7.15 = Pitman hotfix line: f9f2968 + 02bf814 + measured-gap tab + per-sync alarm (NOT 9da7827)
 
 #define CREATE_VER_STRING(string) \
     sprintf((char *)string, "GS-1000 RTOS Version %d.%d.%d %s ", \
@@ -272,6 +272,43 @@
 // noise blips are isolated) and far below any real speed change, which produces
 // hundreds of consecutive shorter gaps.
 #define SS_SHRINK_RUN                 4
+// Saturation for the per-sync "trolleys since the last accepted tab" counter (tabRun) and
+// the per-sync zero-flag alarm counter. Also the boot value of tabRun: "no tab seen yet",
+// so the first real tab after boot (or before the host has pushed Shackles) is accepted.
+#define SS_TAB_RUN_MAX                1000000
+// --- 15.7.15 single-sensor TAB RULE (SingleSensorTabRule). Everything is measured on the
+// line itself, so no per-plant tuning: G = the most recent trolley-to-trolley gap, G2 = the
+// gap before it (accepted tabs never update either). A count edge is the zero TAB only if
+//   (a) SS_TAB_BAND_LO_PERMIL*G <= 1000*delta <= SS_TAB_BAND_HI_PERMIL*G
+//       (the flag tab sits 0.20..0.65 of the measured trolley gap: covers every tab
+//       geometry 0.25..0.50 incl. 0.27 flags with jitter; Pitman ~0.42),
+//   (b) SS_GAP_AGREE_LO_PCT*G2 <= 100*G <= SS_GAP_AGREE_HI_PCT*G2
+//       (the two previous trolley gaps agree: the line is not accelerating), and
+//   (c) tabRun >= Rg, the revolution gate: R = Shackles*(SkipTrollies+1) trolleys per chain
+//       revolution, Rg = R - SS_GATE_MARGIN, never below SS_MIN_TROLLEYS_BETWEEN_TABS.
+//       Pitman: R=608 -> Rg=600. A false zero can only land in the last few trolleys before
+//       the real flag (and the exact-count check in ProcessSyncs/GradeSyncs alarms it).
+// BOOT CONFIRMATION (SS_BOOT_CONFIRM): until a sync's detector has accepted its first tab
+// since boot, (c) is replaced by "a SECOND tab-shaped edge arrives R+1 +/- SS_GATE_MARGIN
+// trolleys after an earlier one" (the first is counted as a trolley, hence +1). Every
+// tab-shaped edge is remembered by its trolley position (a bit ring of SS_BOOT_RING
+// positions per sync, no capacity limit), so noise before or between the real tabs cannot
+// block the confirmation. With noise present the first in-band edge after boot is otherwise
+// often a false one. SS_BOOT_RING must exceed R+1+SS_GATE_MARGIN (Shackles <= MAXPENDANT
+// 2000 at SkipTrollies <= 3); a longer chain is simply never boot-confirmed. TRADE-OFF: after every controller restart the first zero comes up to
+// ONE EXTRA REVOLUTION later (~14 min at turkey speed, ~5 min at chicken speed) and no drops
+// fire before the first zero. Set SS_BOOT_CONFIRM 0 to accept the first tab-shaped edge
+// after boot instead (the 15.7.14 start-up behaviour); nothing else changes.
+// The host-pushed ZeroTabWindowMinMs/MaxMs are no longer consulted (shm + wire unchanged).
+#define SS_TAB_BAND_LO_PERMIL         200
+#define SS_TAB_BAND_HI_PERMIL         650
+#define SS_GAP_AGREE_LO_PCT           70
+#define SS_GAP_AGREE_HI_PCT           143
+#define SS_GATE_MARGIN                8
+#define SS_BOOT_RING                  8192  // power of 2
+#ifndef SS_BOOT_CONFIRM
+#define SS_BOOT_CONFIRM               1     // 1 = boot confirmation ON (default), 0 = OFF
+#endif
 
 #define CAPTURE_SPEED       3
 #define SAMPLE_WEIGHTS      1000
