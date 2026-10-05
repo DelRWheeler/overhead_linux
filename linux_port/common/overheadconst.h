@@ -307,7 +307,7 @@
 #define SS_GATE_MARGIN                8
 #define SS_BOOT_RING                  8192  // power of 2
 #ifndef SS_BOOT_CONFIRM
-#define SS_BOOT_CONFIRM               1     // 1 = boot confirmation ON (default), 0 = OFF
+#define SS_BOOT_CONFIRM               0     // 0 = OFF (default: first flag pass zeroes, as before), 1 = wait for a 2nd matching pass
 #endif
 
 #define CAPTURE_SPEED       3
