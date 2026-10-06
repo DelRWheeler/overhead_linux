@@ -62,6 +62,18 @@ for f in "int overhead::RingSub(" "bool overhead::SingleSensorIsZeroTab(" "bool 
     [ -s "$OUT/n.tmp" ] || { echo "extract failed: $f"; exit 2; }
     cat "$OUT/n.tmp" >> "$OUT/sszero_shared.inc"
 done
+# 15.7.16: the cross-sync count check the working tree's ProcessSyncs calls (if present)
+if grep -q 'SingleSensorXCCheck' "$NEWSRC"; then
+    tr -d '\r' < "$NEWSRC" | grep -E '^static inline (double|int) +ssxc_(abs|round)\(' >> "$OUT/sszero_shared.inc"
+    for f in "double overhead::SingleSensorXCWrap(" "double overhead::SingleSensorXCPos(" "bool overhead::SingleSensorXCEligible(" \
+             "bool overhead::SingleSensorXCSteady(" "double overhead::SingleSensorXCOffset(" "void overhead::SingleSensorXCGapEdge(" \
+             "void overhead::SingleSensorXCDrop(" "void overhead::SingleSensorXCZero(" "void overhead::SingleSensorXCOverrun(" \
+             "int overhead::SingleSensorXCCheck(" "bool overhead::SingleSensorXCApply("; do
+        extract "$NEWSRC" "$f" > "$OUT/n.tmp"
+        [ -s "$OUT/n.tmp" ] || { echo "extract failed: $f"; exit 2; }
+        cat "$OUT/n.tmp" >> "$OUT/sszero_shared.inc"
+    done
+fi
 [ "$(grep -c '^}' "$OUT/sszero_old.inc")" -eq 4 ] || { echo "extract failed: sszero_old.inc"; exit 2; }
 [ "$(grep -c '^}' "$OUT/sszero_new.inc")" -eq 2 ] || { echo "extract failed: sszero_new.inc"; exit 2; }
 

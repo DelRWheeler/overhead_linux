@@ -37,6 +37,58 @@ If you forget this and deploy the `0xFF` stub to real hardware, the `inb()` read
 
 Applies to both VM and real hardware. The capability is stored on the file and gets wiped by every rebuild/copy.
 
+## Oct 6, 2026 - 15.7.16 (hotfix line `hotfix/sszero-crosscheck`): single-sensor cross-sync count check
+
+Owner: "once the initial zero happens we should never allow the line to run a full revolution with the
+wrong shackle count." Until 15.7.15 a sync's count could only be corrected at its own next zero flag. At
+Pitman (single-sensor zero, SkipTrollies 1, 303 shackles = 606 trolleys, count syncs Scale 1 / Drop Sync 1
+/ Drop Sync 2) the chain ROLLS BACK at line stops: a sensor that sat on a body rolls off it and counts it
+again on restart, so drops fired one trolley off for up to a revolution (field 2026-10-05: DS2 "305
+expected 303" 16:54:22 / 17:03:12, Scale 1 "trolley 1" 16:58:43, ...). Single-sensor mode
+(`ZeroFlagMode == 1`) only; standard two-sensor mode is unchanged. Wire protocol and shm layout unchanged.
+This is 15.7.15 (`b269cf8`, the Pitman build) + this change; `SS_BOOT_CONFIRM` stays 0.
+
+### The check (`SingleSensorXC*` in `overhead.cpp`, constants + full rules in `overheadconst.h`, `SS_CROSSCHECK 1`)
+- All count syncs sit on one chain: once zeroed, each sync's phase-accurate position since its zero
+  (P = trolleys counted + time since the last edge / measured gap G) differs from another's by the sensor
+  spacing D. A miscount moves that sync a whole trolley against the others; it is corrected
+  (shackleno / trolly_counters / true_shackle_count / tab run moved back one trolley) a few trolleys after
+  the restart, with "Count corrected: <sync> -1 trolley (cross-check with <others>)" (warning, not
+  rate-limited), and the next zero finds the count exact.
+- D is learned only from clean zeros (exact-count check passed on both syncs), confirmed by a second
+  clean sample, then TRACKED: the Pitman captures show D varies with chain position by up to 0.42 trolley
+  around the revolution (uneven pitch) but repeats to sd 0.02, so a constant D would leave almost no
+  margin. Only the fractional residual is tracked; the integer part can never absorb a miscount.
+- Only a sync one trolley AHEAD is corrected (a rollback can only add counts), never one that is behind,
+  never one anchored by its own zero since the last disturbance, only with >= 3 syncs in the vote, only for
+  a disagreement that arose in one step from all pairs at 0, after 2 consecutive edges, in steady running
+  (gaps within 87..115% of the previous one - tighter than the 70..143% first proposed, see
+  `overheadconst.h`). (P1) lone sync ahead of the others; (P2) after a real line stop, the lower of two
+  levels is right - this covers two sensors re-counting at one stop (two of the six real events).
+- No per-shackle pass runs twice or is skipped: the correction lands on a count whose drop / missed-bird
+  pass already ran one trolley early, so that edge's pass is skipped; the scale re-weighs the shackle on
+  it (SkipTrollies >= 1, the early weighment is still averaging) or skips its pass (SkipTrollies 0).
+- "Count disagreement: <a> vs <b> by <k> trolley" (warning, once per revolution per pair) when a
+  disagreement cannot be corrected: 2-sync lines, a sync behind, two syncs off at once in steady running.
+- Not corrected (zeros realign them as before): a lost count; the overrun reset's -1/-2 after a tab
+  rejected at a restart; every sync re-counting at the same stop (invisible to any cross-check); large
+  offsets (false zeros). Arming from boot takes ~2.4 clean revolutions after the first zero.
+
+### Tests (`linux_port/tools/`)
+- `sszero_crosscheck_test.sh` (new): the real extracted ProcessSyncs / helpers replay the three Pitman
+  Sensor Scope captures (`/home/del/data/pitman-scope-2026-10-05`) against hand-verified ground truth
+  (flag-to-flag 606 trolleys everywhere). 15.7.15 reproduces every field zero mark scan for scan and the
+  field alarm texts. 15.7.16 (offsets learned before the capture): 7 corrections, 7 right, 0 false; each
+  real re-count fixed 6-8 counted edges after the restart (15.7.15: 192-583 edges, until the next zero);
+  the literal 2-of-3 majority rule makes 10 false corrections on the same data. Cold / from boot: counter
+  state identical to 15.7.15 on every scan. Synthetic: Pitman + chicken, 7-200 SPM, steps, ramps, stops
+  with and without rollback, extra / missing edges, 2-sync, two syncs at once, near-coincident phases,
+  4 syncs, a 9 h soak: 0 false corrections; clean lines identical to 15.7.15 scan for scan.
+- `sszero_tab_dup_test.sh`, `sszero_window_test.sh`: extract the new functions; output byte-identical
+  to 15.7.15 (353/353, 5775/0, `SS_BOOT_CONFIRM` 0 and 1); standard mode identical to 15.7.13.
+
+`APP_VER3` 15 -> 16.
+
 ## Oct 5, 2026 - 15.7.15 (hotfix line `hotfix/sszero-measured-window`): single-sensor zero at any line speed
 
 Pitman Farms (skip 1, 304 shackles, flag tab at 0.42 of the trolley pitch) lost its single-sensor zero

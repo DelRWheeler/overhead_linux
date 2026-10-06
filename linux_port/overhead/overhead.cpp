@@ -1919,7 +1919,29 @@ void overhead::InitLocals()
         memset(&ss_rule[i], 0, sizeof(ss_rule[i]));   // 15.7.15: no gaps measured, not confirmed
         ss_alarm_cnt[i]         = 0;       // 15.7.15: no zero-flag alarm until a revolution is counted
         ss_zero_lost[i]         = false;   // 15.7.15
+        ss_xc_steady[i]         = 0;       // 15.7.16: cross-sync count check - nothing learned
+        ss_xc_refgap[i]         = 0;
+        ss_xc_clean[i]          = false;
+        ss_xc_anchor[i]         = false;
+        ss_xc_edges[i]          = 0;
+        ss_xc_vcnt[i]           = 0;
     }
+    memset(ss_xc_pair, 0, sizeof(ss_xc_pair));   // 15.7.16
+    ss_xc_line_ok     = false;
+    ss_xc_dist_open   = false;
+    ss_xc_dist_pre_ok = false;
+    ss_xc_dist_zero   = false;
+    ss_xc_dist_evals  = 0;
+    ss_xc_dist_mask   = 0;
+    ss_xc_ok_before   = false;
+    ss_xc_pat_valid   = false;
+    ss_xc_pat_vmask   = 0;
+    ss_xc_pat_rezero  = 0;
+    memset(ss_xc_pat_lev, 0, sizeof(ss_xc_pat_lev));
+    ss_xc_prev_valid  = false;
+    ss_xc_prev_int    = false;
+    ss_xc_prev_vmask  = 0;
+    memset(ss_xc_prev_lev, 0, sizeof(ss_xc_prev_lev));
     for (i = 0; i < MAXGRADESYNCS; i++)
     {
         ss_grade_last_trolley_tick[i] = 0;
@@ -6375,6 +6397,436 @@ bool overhead::SingleSensorAlarmOk(int &cnt, const SSTabRuleState &rs)
     if (cnt < rev)
         return false;
     cnt = 0;
+    return true;
+}
+
+//--------------------------------------------------------
+//  SingleSensorXC*  (15.7.16, SS_CROSSCHECK) - cross-sync count check, single-sensor only
+//
+// Owner (2026-10-06): "once the initial zero happens we should never allow the line to run a
+// full revolution with the wrong shackle count." Until 15.7.15 a sync's count was corrected
+// only at its next zero flag. All count syncs sit on one chain, so their positions agree with
+// each other through a learned offset; a miscount moves one sync a whole trolley against the
+// others and is corrected within a few trolleys. Rules and constants: overheadconst.h
+// (SS_XC_*). Pairs [a][b], a < b, hold the tracked offset d = P_a - P_b.
+//
+// PITMAN CAPTURES 2026-10-05 drove three choices the bare idea does not have:
+//  - the offset is a function of chain position (+/-0.2 trolley, uneven pitch), repeatable to
+//    sd 0.02, so it is tracked (fractional part only) instead of being a constant;
+//  - every miscount was an EXTRA count (a rollback at a stop re-passes a body; any pass of a
+//    body in either direction is an edge), so a sync is only ever corrected DOWN;
+//  - two of six were two sensors at one stop, so after a line stop the lower of two levels is
+//    taken as right (P2) - a 2-of-3 vote would have moved the one good sync.
+// Nothing here runs in standard mode (ZeroFlagMode != 1); every caller is gated on it.
+//--------------------------------------------------------
+static inline double ssxc_abs(double x)   { return x < 0 ? -x : x; }
+static inline int    ssxc_round(double x) { return x >= 0 ? (int) (x + 0.5) : -(int) (-x + 0.5); }
+
+// wrap to (-R/2, R/2], R = trolleys per chain revolution
+double overhead::SingleSensorXCWrap(double x)
+{
+    double R = (double) SingleSensorRevTrolleys();
+    if (R < 2)
+        return x;
+    for (int n = 0; n < 8 && x > R / 2; n++)   x -= R;
+    for (int n = 0; n < 8 && x <= -R / 2; n++) x += R;
+    return x;
+}
+
+// P_i: trolleys since sync i's last zero, phase-accurate. T counts exactly as ProcessSyncs does
+// ((shackleno-1)*(SkipTrollies+1) + trolly_counters: the tab sets 1/0 = trolley 0, the flag body
+// before it reads Shackles+1/0 = R, the same trolley mod R); frac = scan ticks since the last
+// counted trolley edge over G, the detector's measured gap (tabs never move either), below 1.
+double overhead::SingleSensorXCPos(int i)
+{
+    int skip = pShm->sys_set.SkipTrollies;
+    if (skip < 0) skip = 0;
+    double  T = (double) (pShm->SyncStatus[i].shackleno - 1) * (double) (skip + 1) + (double) trolly_counters[i];
+    __int64 g = ss_rule[i].gap;
+    double  frac = 0;
+    if (g > 0)
+    {
+        frac = (double) (ss_scan_tick - ss_last_trolley_tick[i]) / (double) g;
+        if (frac < 0)     frac = 0;
+        if (frac > 0.999) frac = 0.999;
+    }
+    return T + frac;
+}
+
+// a count sync that can take part: in this line's sync range, zeroed, tab rule confirmed, gaps measured
+bool overhead::SingleSensorXCEligible(int i, int numSyncs)
+{
+    return (i >= 0) && (i < numSyncs) && (i < MAXSYNCS) &&
+           pShm->SyncStatus[i].zeroed && ss_rule[i].confirmed &&
+           (ss_rule[i].gap > 0) && (ss_last_trolley_tick[i] > 0);
+}
+
+// steady: SS_XC_STEADY_GAPS normal gaps in a row, and not slowing / stopped now (open gap <= 115% G)
+bool overhead::SingleSensorXCSteady(int i)
+{
+    __int64 g = ss_rule[i].gap;
+    return (ss_xc_steady[i] >= SS_XC_STEADY_GAPS) && (g > 0) &&
+           ((ss_scan_tick - ss_last_trolley_tick[i]) * 100 <= g * SS_XC_OPEN_GAP_PCT);
+}
+
+// e_ab = P_a - P_b - d_ab (either order), wrapped
+double overhead::SingleSensorXCOffset(int a, int b)
+{
+    int lo = a < b ? a : b, hi = a < b ? b : a;
+    double e = SingleSensorXCWrap(SingleSensorXCPos(lo) - SingleSensorXCPos(hi) - ss_xc_pair[lo][hi].d);
+    return (a < b) ? e : -e;
+}
+
+// every edge ProcessSyncs counts as a trolley (SingleSensorIsZeroTab returned false; G/G2 just moved)
+void overhead::SingleSensorXCGapEdge(int i)
+{
+    ss_xc_edges[i]++;
+    __int64 g = ss_rule[i].gap, g2 = ss_rule[i].gapPrev;
+    bool normal = (g > 0) && (g2 > 0) &&
+                  (g * 100 >= g2 * SS_XC_GAP_LO_PCT) && (g * 100 <= g2 * SS_XC_GAP_HI_PCT);
+    if (normal)
+    {
+        if (ss_xc_steady[i] < SS_TAB_RUN_MAX) ss_xc_steady[i]++;
+        if (ss_xc_steady[i] >= SS_XC_STEADY_GAPS) ss_xc_refgap[i] = g;   // yardstick for a line stop
+    }
+    else
+    {
+        ss_xc_steady[i] = 0;          // a stop, a restart, an extra or a missing edge
+        ss_xc_anchor[i] = false;      // the count may have moved since the zero
+    }
+}
+
+// sync i's count can no longer be trusted for learning: drop its unconfirmed candidates
+void overhead::SingleSensorXCDrop(int i)
+{
+    ss_xc_clean[i]  = false;
+    ss_xc_anchor[i] = false;
+    ss_xc_vcnt[i]   = 0;
+    for (int j = 0; j < MAXSYNCS; j++)
+    {
+        if (j == i) continue;
+        SSXCPair &p = ss_xc_pair[i < j ? i : j][i < j ? j : i];
+        if (p.state == 1) p.state = 0;
+    }
+}
+
+// an accepted tab on sync i (after the counter reset). exact = the 15.7.15 exact-count check
+// passed (the flag body counted Shackles+1 / trolley 0). Learns from clean samples only.
+void overhead::SingleSensorXCZero(int i, bool exact, int numSyncs)
+{
+    if (ss_xc_dist_open) ss_xc_dist_zero = true;     // a zero moved a count during a disturbance
+    ss_xc_pat_rezero |= 1u << i;                     // its level now comes from the physical flag
+    if (!exact)
+    {
+        SingleSensorXCDrop(i);
+        ss_xc_anchor[i] = true;                      // realigned to the physical flag all the same
+        return;
+    }
+    ss_xc_clean[i]  = true;
+    ss_xc_anchor[i] = true;
+    ss_xc_vcnt[i]   = 0;
+    if (!SingleSensorXCSteady(i))
+        return;                                      // learn only in steady running
+    for (int j = 0; j < numSyncs && j < MAXSYNCS; j++)
+    {
+        if (j == i || !SingleSensorXCEligible(j, numSyncs) || !ss_xc_clean[j] || !SingleSensorXCSteady(j))
+            continue;
+        int lo = i < j ? i : j, hi = i < j ? j : i;
+        SSXCPair &p = ss_xc_pair[lo][hi];
+        double s = SingleSensorXCWrap(SingleSensorXCPos(lo) - SingleSensorXCPos(hi));
+        double r = SingleSensorXCWrap(s - p.d);
+        if (p.state == 0)
+        {
+            p.state = 1;                             // candidate, tracked from now on
+            p.d     = s;
+        }
+        else if (p.state == 1)
+        {
+            if (ssxc_abs(r) * 1000 < SS_XC_CONFIRM_TOL_PERMIL)
+                p.state = 2;                         // confirmed by a second clean sample: armed
+            else
+                p.state = 0;                         // one of the two samples was wrong: start over
+        }
+        else
+        {
+            double f = r - ssxc_round(r);
+            if (ssxc_abs(f) * 1000 >= SS_XC_RELEARN_TOL_PERMIL)
+                p.state = 0;                         // lost track of the offset: learn it again
+            // a whole-trolley r means sync j is off now (i just proved exact): the check owns that
+        }
+    }
+}
+
+// the "Zero Flag NOT Detected" overrun reset on sync i moved its count to a guess
+void overhead::SingleSensorXCOverrun(int i)
+{
+    if (ss_xc_dist_open) ss_xc_dist_zero = true;
+    SingleSensorXCDrop(i);
+}
+
+// At each counted trolley edge of sync i, after the count (and any overrun) moved: track the
+// offsets, judge, raise the disagreement alarm. Returns the shift to apply (-1 = one trolley
+// back) once the verdict has held SS_XC_HYST_EDGES edges, else 0. See overheadconst.h.
+int overhead::SingleSensorXCCheck(int i, int numSyncs)
+{
+    if ((pShm->ZeroFlagMode != 1) || !SingleSensorXCEligible(i, numSyncs))
+    {
+        ss_xc_vcnt[i] = 0;
+        return 0;
+    }
+    int R = SingleSensorRevTrolleys();
+    if (R <= 2 * SS_GATE_MARGIN)
+        return 0;                                    // settings not pushed yet
+    if (numSyncs > MAXSYNCS) numSyncs = MAXSYNCS;
+
+    bool iSteady = SingleSensorXCSteady(i);
+
+    //--- track: fold the fractional residual of every learned pair of i (integer part never moves)
+    __int64 gi = ss_rule[i].gap, gi2 = ss_rule[i].gapPrev;
+    bool iFlat = iSteady && (gi * 100 >= gi2 * (100 - SS_XC_TRACK_GAP_PCT)) && (gi * 100 <= gi2 * (100 + SS_XC_TRACK_GAP_PCT));
+    for (int j = 0; j < numSyncs && iFlat; j++)
+    {
+        if (j == i || !SingleSensorXCEligible(j, numSyncs) || !SingleSensorXCSteady(j)) continue;
+        int lo = i < j ? i : j, hi = i < j ? j : i;
+        SSXCPair &p = ss_xc_pair[lo][hi];
+        if (p.state == 0) continue;
+        __int64 gj = ss_rule[j].gap, gj2 = ss_rule[j].gapPrev;
+        if ((gj * 100 < gj2 * (100 - SS_XC_TRACK_GAP_PCT)) || (gj * 100 > gj2 * (100 + SS_XC_TRACK_GAP_PCT))) continue;
+        double e = SingleSensorXCOffset(lo, hi);
+        double f = e - ssxc_round(e);
+        if (ssxc_abs(f) * 1000 < SS_XC_TRACK_TOL_PERMIL)
+            p.d = SingleSensorXCWrap(p.d + f / SS_XC_TRACK_GAIN);
+    }
+
+    //--- the vote: eligible syncs whose pairs are all armed (drop the worst-connected until they are)
+    int  v[MAXSYNCS], n = 0;
+    for (int j = 0; j < numSyncs; j++)
+        if (SingleSensorXCEligible(j, numSyncs)) v[n++] = j;
+    for (;;)
+    {
+        int worst = -1, worstMiss = 0;
+        for (int a = 0; a < n; a++)
+        {
+            int miss = 0;
+            for (int b = 0; b < n; b++)
+                if (a != b && ss_xc_pair[v[a] < v[b] ? v[a] : v[b]][v[a] < v[b] ? v[b] : v[a]].state != 2) miss++;
+            if (miss > 0 && miss >= worstMiss) { worst = a; worstMiss = miss; }
+        }
+        if (worst < 0) break;
+        for (int a = worst; a + 1 < n; a++) v[a] = v[a + 1];
+        n--;
+    }
+    bool inVote = false;
+    for (int a = 0; a < n; a++) if (v[a] == i) inVote = true;
+    if (!inVote || n < 2)
+    {
+        ss_xc_vcnt[i] = 0;
+        return 0;
+    }
+
+    //--- a LINE STOP (opens the P2 window): a sync whose open gap, or last gap, is over
+    //    SS_XC_LINESTOP_PCT % of its last STEADY gap has seen the chain stop (against the last steady
+    //    gap, not the previous one: a jog in the middle of a stop splits the gap - DS2 at Pitman
+    //    16:48:48). A missing body is 2 x, jitter far less, so neither can open it; every sync of
+    //    the vote must have seen the stop for P2.
+    unsigned int unsteady = 0, stopped = 0, all = 0;
+    for (int a = 0; a < n; a++)
+    {
+        int j = v[a];
+        __int64 ref = ss_xc_refgap[j];
+        all |= 1u << j;
+        if (!SingleSensorXCSteady(j)) unsteady |= 1u << j;
+        if (ref > 0 && ((ss_scan_tick - ss_last_trolley_tick[j]) * 100 > ref * SS_XC_LINESTOP_PCT ||
+                        ss_rule[j].gap * 100 > ref * SS_XC_LINESTOP_PCT))
+            stopped |= 1u << j;
+    }
+    if (stopped)
+    {
+        if (!ss_xc_dist_open)
+        {
+            ss_xc_dist_open   = true;
+            ss_xc_dist_pre_ok = ss_xc_line_ok;       // as last seen steady, before the stop
+            ss_xc_dist_zero   = false;
+            ss_xc_dist_evals  = 0;
+            ss_xc_dist_mask   = 0;
+        }
+        ss_xc_dist_mask |= stopped;
+    }
+    if (unsteady)
+    {
+        ss_xc_vcnt[i] = 0;
+        return 0;
+    }
+
+    //--- integer offsets of every pair in the vote
+    int  o[MAXSYNCS][MAXSYNCS];
+    bool allInt = true, all0 = true;
+    for (int a = 0; a < n; a++)
+        for (int b = a + 1; b < n; b++)
+        {
+            double e = SingleSensorXCOffset(v[a], v[b]);
+            int    k = ssxc_round(e);
+            o[v[a]][v[b]] = k;
+            o[v[b]][v[a]] = -k;
+            if (ssxc_abs(e - k) * 1000 >= SS_XC_K_TOL_PERMIL) allInt = false;
+            if (k != 0 || ssxc_abs(e) * 1000 >= SS_XC_AGREE_TOL_PERMIL) all0 = false;
+        }
+    //--- line-state bookkeeping takes a reading only when the NEXT steady check reads the same:
+    //    a sync rolled back onto the previous body at the start of a stop counts it at a normal-
+    //    looking moment, and that one reading is garbage. (The verdict has its own 2-edge hysteresis.)
+    int  lev[MAXSYNCS];
+    for (int a = 0; a < n; a++) lev[v[a]] = (a == 0) ? 0 : o[v[a]][v[0]];
+    bool agree = ss_xc_prev_valid && (ss_xc_prev_int == allInt) && (ss_xc_prev_vmask == all);
+    for (int a = 0; a < n && agree && allInt; a++) if (ss_xc_prev_lev[v[a]] != lev[v[a]]) agree = false;
+    ss_xc_prev_valid = true;
+    ss_xc_prev_int   = allInt;
+    ss_xc_prev_vmask = all;
+    for (int a = 0; a < n; a++) ss_xc_prev_lev[v[a]] = lev[v[a]];
+    if (agree) ss_xc_line_ok = all0;
+    if (ss_xc_dist_open && ((agree && all0) || ++ss_xc_dist_evals > SS_XC_DIST_EVALS))
+        ss_xc_dist_open = false;                     // resolved (or given up: no P2 any more)
+
+    //--- how did the inconsistency arise? Only one that appeared in ONE step from every pair at 0
+    //    may be corrected; its level pattern may change afterwards only by our own corrections
+    //    (SingleSensorXCApply moves the stored level too). A second change while inconsistent -
+    //    e.g. two lost counts on two syncs at different times, which would leave the one good
+    //    sync looking "ahead" - makes it unattributable until every pair reads 0 again.
+    if (!agree)
+        ;                                            // wait for a second reading
+    else if (all0)
+    {
+        ss_xc_ok_before = true;
+        ss_xc_pat_valid = false;
+    }
+    else if (allInt)
+    {
+        if (!ss_xc_pat_valid)
+        {
+            ss_xc_pat_valid = true;                  // onset: ok_before tells whether all were at 0 just before
+            ss_xc_pat_vmask = all;
+            for (int a = 0; a < n; a++) ss_xc_pat_lev[v[a]] = lev[v[a]];
+        }
+        else
+        {
+            // a sync that zeroed since was moved by its flag, not by a miscount: take its new level
+            for (int a = 0; a < n; a++)
+                if (ss_xc_pat_rezero & (1u << v[a])) ss_xc_pat_lev[v[a]] = lev[v[a]] - lev[v[0]] + ss_xc_pat_lev[v[0]];
+            bool same = (ss_xc_pat_vmask == all);
+            for (int a = 0; a < n && same; a++) if (ss_xc_pat_lev[v[a]] - ss_xc_pat_lev[v[0]] != lev[v[a]]) same = false;
+            if (!same) ss_xc_ok_before = false;
+        }
+        ss_xc_pat_rezero = 0;                        // consumed by an agreed reading
+    }
+    if (agree && all0) ss_xc_pat_rezero = 0;
+
+    //--- verdict: is sync i one trolley AHEAD?
+    bool ahead = false;
+    if (allInt && (n >= SS_XC_MIN_SYNCS) && !ss_xc_anchor[i] && ss_xc_ok_before)
+    {
+        // P1: i is +1 against every other sync, and the others agree with each other
+        bool p1 = true;
+        for (int a = 0; a < n && p1; a++)
+        {
+            if (v[a] == i) continue;
+            if (o[i][v[a]] != 1) p1 = false;
+            for (int b = a + 1; b < n && p1; b++)
+                if (v[b] != i && o[v[a]][v[b]] != 0) p1 = false;
+        }
+        // P2: after a LINE stop that began with every pair at 0 and saw no zero / overrun: two
+        // levels a trolley apart, i in the upper one, no upper-level sync anchored by its zero
+        bool p2 = false;
+        if (!p1 && ss_xc_dist_open && ss_xc_dist_pre_ok && !ss_xc_dist_zero && ((ss_xc_dist_mask & all) == all))
+        {
+            bool lower = false;
+            p2 = true;
+            for (int a = 0; a < n && p2; a++)
+            {
+                int j = v[a];
+                if (j == i) continue;
+                if (o[i][j] == 1) lower = true;
+                else if (o[i][j] == 0) { if (ss_xc_anchor[j]) p2 = false; }
+                else p2 = false;
+                for (int b = 0; b < n && p2; b++)
+                    if (v[b] != i && v[b] != j && o[j][v[b]] != o[i][v[b]] - o[i][j]) p2 = false;
+            }
+            p2 = p2 && lower;
+        }
+        ahead = p1 || p2;
+    }
+    if (ahead) { if (ss_xc_vcnt[i] < SS_TAB_RUN_MAX) ss_xc_vcnt[i]++; }
+    else       ss_xc_vcnt[i] = 0;
+
+    //--- disagreement alarm (pairs whose lower sync is i): a whole-trolley offset that persists
+    for (int b = 0; b < n; b++)
+    {
+        int j = v[b];
+        if (j <= i) continue;
+        SSXCPair &p = ss_xc_pair[i][j];
+        double e = SingleSensorXCOffset(i, j);
+        int    k = ssxc_round(e);
+        if (k == 0 || k > SS_XC_MAX_K || k < -SS_XC_MAX_K || ssxc_abs(e - k) * 1000 >= SS_XC_K_TOL_PERMIL)
+        {
+            p.persist = 0;
+            continue;
+        }
+        if (k != p.persistK) { p.persistK = k; p.persist = 0; }
+        if (++p.persist >= SS_XC_ALARM_EDGES && (!p.alarmed || ss_xc_edges[i] - p.alarmEdge >= R))
+        {
+            p.alarmed   = true;
+            p.alarmEdge = ss_xc_edges[i];
+            sprintf(app_err_buf, "Count disagreement: %s vs %s by %+d trolley\n", sync_desc[i], sync_desc[j], k);
+            GenError(warning, app_err_buf);
+        }
+    }
+
+    return (ss_xc_vcnt[i] >= SS_XC_HYST_EDGES) ? -1 : 0;
+}
+
+// Shift sync i's count by `shift` trolleys (production: -1 only). Applied by ProcessSyncs at the
+// counted edge BEFORE its scale / drop pass. Refused (false, verdict kept for the next edge) unless
+// the corrected count lands on a shackle trolley (trolley counter 0) strictly inside the
+// revolution: the zero tab and the overrun own trolley 0 / Shackles+1. ProcessSyncs then skips
+// this edge's drop / missed-bird pass (that count already ran, one trolley early, at the previous
+// counted edge); the scale re-labels and re-weighs the shackle really on it when SkipTrollies >= 1
+// (the early weighment is still averaging and is replaced) and skips its pass when SkipTrollies is 0
+// (the early weighment has completed and been assigned - no slot is assigned twice).
+bool overhead::SingleSensorXCApply(int i, int shift, int numSyncs)
+{
+    TSyncStatus* ps = &pShm->SyncStatus[i];
+    int skip = pShm->sys_set.SkipTrollies;
+    if (skip < 0) skip = 0;
+    long long S1 = skip + 1;
+    long long T  = (long long) (ps->shackleno - 1) * S1 + trolly_counters[i];
+    long long T2 = T + shift;
+    if (T2 < 1 || T2 > SingleSensorRevTrolleys() || (T2 % S1) != 0)
+        return false;
+    int shk2 = (int) (T2 / S1) + 1;
+    int was  = ps->shackleno, wasTc = trolly_counters[i];
+    true_shackle_count[i] += shk2 - ps->shackleno;
+    if (true_shackle_count[i] < 1) true_shackle_count[i] = 1;
+    ps->shackleno      = shk2;
+    trolly_counters[i] = 0;
+    ss_tab_run[i] += shift;
+    if (ss_tab_run[i] < 0) ss_tab_run[i] = 0;
+    SingleSensorXCDrop(i);                           // not clean until its next exact zero
+    if (ss_xc_pat_valid) ss_xc_pat_lev[i] += shift;  // our own move does not make the pattern "new"
+    ss_xc_prev_valid = false;                        // ...and the next reading starts a fresh pair
+
+    char others[MAXSYNCS * (MAX_DBG_DESC + 2) + 4];
+    others[0] = 0;
+    for (int j = 0; j < numSyncs && j < MAXSYNCS; j++)
+    {
+        if (j == i || !SingleSensorXCEligible(j, numSyncs) || ss_xc_pair[i < j ? i : j][i < j ? j : i].state != 2) continue;
+        if (others[0]) strcat(others, ", ");
+        strncat(others, sync_desc[j], MAX_DBG_DESC);
+    }
+    sprintf(app_err_buf, "Count corrected: %s %+d trolley (cross-check with %s)\n", sync_desc[i], shift, others);
+    GenError(warning, app_err_buf);
+    if ( (!trc[MAINBUFID].buffer_full) && (TraceMask & _ZEROS_ ) )
+    {
+        sprintf((char*) &tmp_trc_buf[MAINBUFID],"XC\t%d\tshift\t%d\tShk\t%d/%d\t->\t%d/0\n", i, shift, was, wasTc, shk2);
+        strcat((char*) &trc_buf[MAINBUFID],(char*) &tmp_trc_buf[MAINBUFID] );
+    }
     return true;
 }
 
@@ -11631,6 +12083,10 @@ void overhead::ProcessSyncs()
                      ? SingleSensorIsZeroTab(ss_last_trolley_tick[i], ss_trolley_interval[i], ss_trolley_stall[i], ss_tab_run[i], ss_trolley_shrink[i],
                                              ss_rule[i])
                      : BITSET(sync_zero[byte], i);
+#if SS_CROSSCHECK
+                 if ((pShm->ZeroFlagMode == 1) && !zero_detected)
+                     SingleSensorXCGapEdge(i);      // 15.7.16: steadiness of this sync (trolley gap)
+#endif
 
  				 // Only zero the sync if the grade syncs have already zeroed. This is to prevent misgrading
 				 // in the time period between a scale sync zero and grade sync zero (if the zero flag passes
@@ -11641,6 +12097,9 @@ void overhead::ProcessSyncs()
                      syncCapEventAccum = 0x40 | (pShm->ZeroFlagMode == 1 ? 0x80 : 0) | (i & 0x07);
 
 					 bool ssMisplaced = false;	// 15.7.15: exact-count check failed on this zero
+					 // 15.7.16: the same exact-count test, kept for the cross-sync check (a clean zero)
+					 bool ssExact = (pShm->ZeroFlagMode == 1) && pSyncStat->zeroed &&
+					                (pSyncStat->shackleno == pShm->sys_set.Shackles + 1) && (trolly_counters[i] == 0);
 					 // GLC 2/14/05
 					 // If this sync has already zeroed before, show late or early zero flag if applicable
 					if ((pSyncStat->shackleno < true_shackle_count[i]) &&
@@ -11739,6 +12198,9 @@ void overhead::ProcessSyncs()
                     {
                         ssTab    = true;
                         ssTabDup = ss_ovr_pass[i];
+#if SS_CROSSCHECK
+                        SingleSensorXCZero(i, ssExact, NumSyncs);   // 15.7.16: anchor + learn offsets
+#endif
 
                         if ( ssTabDup && (!trc[MAINBUFID].buffer_full) && (TraceMask & _ZEROS_ ) )
                         {
@@ -11814,11 +12276,48 @@ void overhead::ProcessSyncs()
 					//RtPrintf("**ProcessSync: Trolly counter reset to 0\n");
                     trolly_counters[i]   = 0;
                     pSyncStat->shackleno = 1;
+#if SS_CROSSCHECK
+                    if (pShm->ZeroFlagMode == 1)
+                        SingleSensorXCOverrun(i);   // 15.7.16: the reset is a guess, not the flag
+#endif
                 }
+
+//----- 15.7.16: cross-sync count check (single-sensor, counted trolley edges only)
+
+                // A count that has slipped a whole trolley against the other count syncs is moved
+                // back here, BEFORE this edge's scale / drop pass (SingleSensorXCApply). The count
+                // it lands on already ran its drop / missed-bird pass at the previous counted edge
+                // (one trolley early, as every pass did while the count was ahead), so that pass is
+                // not repeated (xcSuppress). The scale: with SkipTrollies >= 1 the weighment started
+                // under that count one trolley ago is still averaging, so the scale re-labels and
+                // re-weighs the shackle really on it (capture / average re-armed, previousShackle = -1)
+                // and that weighment simply replaces the early one. With SkipTrollies 0 the early
+                // weighment (a whole shackle ago) has completed and been assigned, so the scale pass
+                // is skipped too (xcSuppressScale): no slot is weighed and assigned twice. Either way
+                // the shackle-to-shackle timing restarts. Standard mode: never set.
+                bool xcSuppress      = false;
+                bool xcSuppressScale = false;
+#if SS_CROSSCHECK
+                if ((pShm->ZeroFlagMode == 1) && !ssTab)
+                {
+                    int xcShift = SingleSensorXCCheck(i, NumSyncs);
+                    if (xcShift && SingleSensorXCApply(i, xcShift, NumSyncs))
+                    {
+                        xcSuppress      = true;
+                        xcSuppressScale = (pShm->sys_set.SkipTrollies <= 0);
+                        if (i == SCALE1SYNCBIT) app->cur_shk2shk_ticks = 0;
+                        if (!xcSuppressScale)
+                        {
+                            if (i == SCALE1SYNCBIT) app->previousShackle1 = -1;
+                            if (i == SCALE2SYNCBIT) app->previousShackle2 = -1;
+                        }
+                    }
+                }
+#endif
 
 //----- Reset status at scale 1 and trigger weighing
 
-                if ( SYNC_OK && (i == SCALE1SYNCBIT))
+                if ( SYNC_OK && (i == SCALE1SYNCBIT) && !xcSuppressScale)   // 15.7.16 (see above)
                 {
                     // clear drop & weight at scale 1
                     pShm->ShackleStatus[pSyncStat->shackleno].drop[0]   = 0;
@@ -11851,7 +12350,7 @@ void overhead::ProcessSyncs()
                 }
 
                 // trigger weighing for scale 2
-                if ( SYNC_OK && dual_scale && (i == SCALE2SYNCBIT) )
+                if ( SYNC_OK && dual_scale && (i == SCALE2SYNCBIT) && !xcSuppressScale )   // 15.7.16
                 {
                     pShm->ShackleStatus[pSyncStat->shackleno].drop[1]   = 0;
 					pShm->ShackleStatus[pSyncStat->shackleno].weight[1] = 0;
@@ -11987,7 +12486,8 @@ void overhead::ProcessSyncs()
                     (!dual_scale              &&
                     (i != SCALE2SYNCBIT)))    &&
                     (pShm->OpMode == ModeRun) &&
-                    !ssTabDup )               // 15.7.14: tab repeating the body pulse's pass
+                    !ssTabDup &&              // 15.7.14: tab repeating the body pulse's pass
+                    !xcSuppress )             // 15.7.16: count moved back onto an already-run pass
                 {
                     ssPassRan = true;         // 15.7.14: arms ss_ovr_pass[i] at the end of the edge
 

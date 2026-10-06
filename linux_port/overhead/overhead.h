@@ -31,6 +31,18 @@ struct SSTabRuleState
     unsigned char cand[SS_BOOT_RING / 8];  // boot only: bit p = tab-shaped edge at bootPos p (mod ring)
 };
 
+// 15.7.16: single-sensor cross-sync count check (SingleSensorXC*), one per unordered pair of
+// count syncs [a][b], a < b. d = the tracked offset P_a - P_b (trolleys). Zero-initialised = nothing learned.
+struct SSXCPair
+{
+    int     state;                  // 0 nothing, 1 candidate (tracked, not trusted), 2 armed
+    double  d;                      // tracked offset P_a - P_b, wrapped to +/- R/2
+    int     persist;                // consecutive checks of sync a with the same integer offset != 0
+    int     persistK;               // ...that offset
+    int     alarmEdge;              // ss_xc_edges[a] at the last disagreement alarm
+    bool    alarmed;                // alarmEdge is valid
+};
+
 class overhead:app_type
 {
 
@@ -133,6 +145,29 @@ public:
     // good zero, so its next zero announces "Zero Flag re-acquired" (informational, once).
     bool                ss_zero_lost[MAXSYNCS];
     bool                ss_grade_zero_lost[MAXGRADESYNCS];
+    // 15.7.16: cross-sync count check (SingleSensorXC*, SS_CROSSCHECK). Count syncs only.
+    SSXCPair            ss_xc_pair[MAXSYNCS][MAXSYNCS];   // [a][b], a < b
+    int                 ss_xc_steady[MAXSYNCS];   // consecutive normal trolley gaps (0 after a stop / odd gap)
+    __int64             ss_xc_refgap[MAXSYNCS];   // the gap at the sync's last steady edge (line-stop yardstick)
+    bool                ss_xc_clean[MAXSYNCS];    // last zero passed the exact-count check, not corrected since
+    bool                ss_xc_anchor[MAXSYNCS];   // zeroed and no abnormal gap since: count anchored to the flag
+    int                 ss_xc_edges[MAXSYNCS];    // counted trolley edges since boot (alarm once per revolution)
+    int                 ss_xc_vcnt[MAXSYNCS];     // consecutive counted edges with a correction verdict
+    bool                ss_xc_line_ok;            // at the last steady check every armed pair read 0
+    bool                ss_xc_dist_open;          // a disturbance (stop / restart / odd gap) is being resolved
+    bool                ss_xc_dist_pre_ok;        // ...and it began with every pair at 0
+    bool                ss_xc_dist_zero;          // ...and a sync zeroed / overran / was corrected during it
+    int                 ss_xc_dist_evals;         // steady checks since it ended without resolving
+    unsigned int        ss_xc_dist_mask;          // ...syncs that saw the chain stop in it (all of them = a LINE stop)
+    bool                ss_xc_ok_before;          // the current inconsistency arose in ONE step from all pairs at 0
+    bool                ss_xc_pat_valid;          // an inconsistency is being tracked: its pattern below
+    int                 ss_xc_pat_lev[MAXSYNCS];  // ...each vote sync's whole-trolley level against the first one
+    unsigned int        ss_xc_pat_vmask;          // ...and the vote it was seen in
+    unsigned int        ss_xc_pat_rezero;         // syncs that zeroed since: their new level is the flag's, accepted
+    bool                ss_xc_prev_valid;         // the previous steady check's reading (bookkeeping needs 2 alike)
+    bool                ss_xc_prev_int;
+    unsigned int        ss_xc_prev_vmask;
+    int                 ss_xc_prev_lev[MAXSYNCS];
 
     // --- Sensor Scope: raw-input pulse capture (SandCat only; host arch-gated) ---
     // Sampled in App_Timer_Main every 5 ms; streamed as SYNC_CAPTURE_INFO. One sample =
@@ -305,6 +340,18 @@ private:
     void    SingleSensorTrolleyEdge(int &tabRun, SSTabRuleState &rs);
     void    SingleSensorAlarmTick(int &cnt);
     bool    SingleSensorAlarmOk(int &cnt, const SSTabRuleState &rs);
+    // 15.7.16 cross-sync count check (SS_CROSSCHECK, single-sensor only)
+    double  SingleSensorXCWrap(double x);
+    double  SingleSensorXCPos(int i);
+    bool    SingleSensorXCEligible(int i, int numSyncs);
+    bool    SingleSensorXCSteady(int i);
+    double  SingleSensorXCOffset(int a, int b);
+    void    SingleSensorXCGapEdge(int i);
+    void    SingleSensorXCDrop(int i);
+    void    SingleSensorXCZero(int i, bool exact, int numSyncs);
+    void    SingleSensorXCOverrun(int i);
+    int     SingleSensorXCCheck(int i, int numSyncs);
+    bool    SingleSensorXCApply(int i, int shift, int numSyncs);
     // (15.7.15: SingleSensorWarnOk, the GLOBAL 30 s throttle, is replaced by the per-sync
     //  SingleSensorAlarmTick / SingleSensorAlarmOk above.)
     // Sensor Scope capture (SandCat only): append a scan sample + drive streaming.
