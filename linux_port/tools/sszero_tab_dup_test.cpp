@@ -74,7 +74,9 @@ char        sync_desc[MAXSYNCS][MAX_DBG_DESC] = {
     "Drop Sync 4", "Drop Sync 5", "Drop Sync 6" };
 volatile sig_atomic_t g_outputs_disabled = 0;
 const BYTE  Mask[8] = {0x01,0x2,0x4,0x8,0x10,0x20,0x40,0x80};    // overhead.cpp:418 (BITSET)
+#ifndef XC_REAL_ERRQ
 int  RtPrintf(const char*, ...) { return 0; }
+#endif
 void DebugTrace(UINT, char*, ...) {}
 
 #define _FILE_ "overhead.cpp"
@@ -129,7 +131,12 @@ void overhead::AddDropRecord(int shackle)
     int s = g_ev->empty() ? -1 : g_ev->back().idx;
     g_ev->push_back(Ev{g_tick, 'R', s, 0, shackle});
 }
+#ifdef XC_REAL_ERRQ          // 15.7.16: the real GenError -> queue -> SendError; the host's view is compared
+#include "errq_harness.h"
+static void deliverMsg(const char* t)                { g_msgs->push_back(t); }
+#else
 void overhead::GenError(int, char* txt)             { g_msgs->push_back(txt); }
+#endif
 void overhead::GradeProcess(int g)
 {
     // One representative grade area (offset 1) - RingSub(Shackles+1,1)==RingSub(1,1)
@@ -172,7 +179,7 @@ struct Scen
 enum { S_SC1 = 0, S_SC2 = 1, S_DS1 = 2, S_DS2 = 3, S_G1 = 8, S_G2 = 9, NSENS = 10 };
 
 struct Result
-{
+{ bool errqBad = false;
     std::vector<Ev>          ev;
     std::vector<std::string> msgs;
     std::vector<unsigned long long> hash;   // per-scan state hash (counters + detector state)
@@ -208,6 +215,9 @@ static Result run(const Scen& sc, Var var)
     SHARE_MEMORY* shm = (SHARE_MEMORY*) calloc(1, sizeof(SHARE_MEMORY));
     app = o; o->pShm = shm;
     memset(trc, 0, sizeof(trc)); memset(trc_buf, 0, sizeof(trc_buf));
+#ifdef XC_REAL_ERRQ
+    errq_begin(o); errq_deliver = deliverMsg;
+#endif
 
     //--- configuration (what the host pushes)
     shm->sys_set.Shackles     = sc.N;
@@ -330,6 +340,9 @@ static Result run(const Scen& sc, Var var)
         if (shm->sys_set.Grading)
         { if (var == V_NEW) o->GradeSyncs_NEW(); else if (var == V_NG) o->GradeSyncs_NG(); else o->GradeSyncs_OLD(); }
         if (var == V_NEW) o->ProcessSyncs_NEW(); else if (var == V_NG) o->ProcessSyncs_NG(); else o->ProcessSyncs_OLD();
+#ifdef XC_REAL_ERRQ
+        errq_drain(o);                                 // GpSendThread's pass
+#endif
 
         //--- isys shackles/sec: one event per count
         while (isysPrev < (unsigned int) o->isys_shksec_sec_cnt)
@@ -410,6 +423,9 @@ static Result run(const Scen& sc, Var var)
         r.hashDet.push_back(d);
         r.hash.push_back(fnv(h, (long long) d));
     }
+#ifdef XC_REAL_ERRQ
+    if (!errq_end(o)) { printf("  FAIL: the host did not get every controller message in order\n"); r.errqBad = true; }
+#endif
     free(shm); free(o); app = 0;
     return r;
 }
@@ -759,6 +775,10 @@ int main()
     { Scen s = base("standard two-sensor, grading");                             s.mode = 0; s.clean = false; checkScenario(s); }
     { Scen s = base("standard two-sensor, SkipTrollies=1, gs2, dual");           s.mode = 0; s.skip = 1; s.gs2 = true; s.dual = true; s.clean = false; checkScenario(s); }
 
+#ifdef XC_REAL_ERRQ
+    errq_report();
+    CHECK(g_errq_bad == 0, "%ld runs: the host did not get every controller message", g_errq_bad);
+#endif
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

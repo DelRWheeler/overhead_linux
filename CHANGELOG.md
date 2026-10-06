@@ -37,6 +37,44 @@ If you forget this and deploy the `0xFF` stub to real hardware, the `inb()` read
 
 Applies to both VM and real hardware. The capability is stored on the file and gets wiped by every rebuild/copy.
 
+## Oct 6, 2026 - 15.7.16 (same unreleased build): every controller message reaches the host
+
+Found on the rig in the 15.7.16 test: a two-sensor stop fired BOTH "Count corrected" GenErrors in one
+millisecond (dchserver.log 17:55:15.326, DS1 and DS3) but the host showed only the last; 8 "Count
+disagreement" lines at 17:34:22-23 arrived as 2. Inherited from the original design, every version and
+standard mode included: `GenError()` kept ONE slot (`send_error.sev / err_addr / send`) pointing at the
+caller's buffer, and `SendError()` (GpSendThread, every 50 ms) sent that slot - a second GenError before
+the next pass overwrote the first, and the shared `app_err_buf` could be rewritten before it was sent.
+
+### Fix (`overhead.cpp` GenError / SendError / new SendErrorMsg, ErrQueuePending; `ERRQ_LEN` in `overheadconst.h`)
+- GenError copies sev + text (up to `MAXERRMBUFSIZE`) into a ring of `ERRQ_LEN` 64 entries. Lock-free:
+  an atomic ticket picks the slot, the slot's sequence number is cleared, the text copied, the sequence
+  published - no producer ever waits (every thread is SCHED_FIFO; GenError is called from the 5 ms scan,
+  the GP / fast timers, the comms, mailbox, InterSystems, DropManager and load-cell threads and init).
+- SendError (single consumer, GpSendThread) drains the ring IN ORDER through the unchanged path: HOST_OK
+  gate, `trc[GPBUFID].mutex` (WAIT100MS), `SendHostMsg(ERROR_MSG, sev, text)`. It checks each slot's
+  sequence before and after copying, so a slot overwritten meanwhile is never sent torn.
+- Overflow: the newest message overwrites the OLDEST; after the survivors are delivered the host gets one
+  "N controller messages dropped (queue full)" (Warning). The scan is never blocked.
+- RtPrintf to dchserver.log is unchanged (byte-identical lines); the dropped-count summary is also logged.
+  `send_error.send` stays as "messages waiting"; nothing else reads `send_error`.
+- Visible differences, all from "every message is delivered": messages produced while the host is
+  disconnected, or while the send mutex times out, are kept and delivered later (up to 64, then the
+  summary) instead of only the latest; a message produced during a pass is no longer lost.
+
+### Tests (`linux_port/tools/`)
+- `errqueue_test.sh` (new, the real extracted functions + the real platform mutex): bursts of 1..64 in one
+  scan through the reused `app_err_buf` all delivered in order with the right text and severity (15.7.15:
+  1 delivered, with whatever the buffer held by then); log lines identical to 15.7.15; overflow 65..1064
+  -> the newest 64 + the summary; host down / mutex held -> kept, delivered later; text too long -> same
+  behaviour as before; 8 concurrent producer threads vs a live consumer: no torn text, no duplicate,
+  per-producer order kept, delivered + reported-dropped == produced (paced: 8000 of 8000 delivered).
+  38/38, also under ASan/UBSan.
+- `sszero_tab_dup_test`, `sszero_window_test`, `sszero_crosscheck_test` now take their message stream
+  through the real GenError -> queue -> SendError (drained like GpSendThread after each scan) and check
+  that the host received every message in order (484 / 5349 / 3732 messages): 354, 7765, 1720 passed;
+  their results are otherwise identical to before.
+
 ## Oct 6, 2026 - 15.7.16 (hotfix line `hotfix/sszero-crosscheck`): single-sensor cross-sync count check
 
 Owner: "once the initial zero happens we should never allow the line to run a full revolution with the

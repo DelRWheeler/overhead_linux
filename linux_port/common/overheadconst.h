@@ -222,6 +222,13 @@
 #define MAXDROPS            32
 #define MAXERRORS           39
 #define MAXERRMBUFSIZE      256
+// 15.7.16: controller -> host message queue (GenError -> SendError). Until 15.7.16 GenError kept
+// ONE slot pointing at the caller's buffer, so a second GenError before GpSendThread's next pass
+// (<= 50 ms) overwrote the first - two "Count corrected" in one scan reached the host as one, and a
+// burst of 8 as 2. GenError now copies sev + text into a ring of ERRQ_LEN entries (power of 2);
+// producers never wait (any thread, the 5 ms scan included); on overflow the OLDEST are dropped and
+// one "N controller messages dropped (queue full)" follows the survivors to the host.
+#define ERRQ_LEN            64
 #define MAXTRCIDHDRSIZE     16      // the length of buffer origin string
 #define MAXDATETIMESTR      48      // date/time strings
 #define MAXPENDANT          2000    // max number of pendants

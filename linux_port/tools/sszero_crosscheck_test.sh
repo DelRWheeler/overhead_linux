@@ -140,7 +140,17 @@ static inline int            iopl(int)                            { return -1; }
 static inline int            ioperm(unsigned long, unsigned long, int) { return -1; }
 STUB
 
-g++ -std=gnu++17 -O2 -fpermissive -w ${EXTRA_CXXFLAGS:-} \
+# 15.7.16: the real controller -> host message queue (GenError -> SendError) when the source has it
+ERRQ_FLAG=""
+if grep -q 'errq_head' "$NEWSRC"; then
+    : > "$OUT/errq.inc"
+    for f in "void overhead::GenError(int sev, char* txt)" "void overhead::SendError()" "bool overhead::SendErrorMsg(" "bool overhead::ErrQueuePending()"; do
+        extract "$NEWSRC" "$f" > "$OUT/q.tmp"; [ -s "$OUT/q.tmp" ] || { echo "extract failed: $f"; exit 2; }
+        cat "$OUT/q.tmp" >> "$OUT/errq.inc"
+    done
+    ERRQ_FLAG="-DXC_REAL_ERRQ -pthread"
+fi
+g++ -std=gnu++17 -O2 -fpermissive -w ${EXTRA_CXXFLAGS:-} $ERRQ_FLAG \
     -I"$OUT/stub" -I"$OUT" -I"$LP/overhead" -I"$LP/common" -I"$LP/interface" \
     "$HERE/sszero_crosscheck_test.cpp" -o "$OUT/t"
 CAPS="$OUT" "$OUT/t" "$@" | tee "${LOG:-/dev/null}"

@@ -31,6 +31,15 @@ struct SSTabRuleState
     unsigned char cand[SS_BOOT_RING / 8];  // boot only: bit p = tab-shaped edge at bootPos p (mod ring)
 };
 
+// 15.7.16: one queued controller -> host message (GenError -> SendError, see ERRQ_LEN).
+struct ErrQEntry
+{
+    unsigned long long seq;         // 0 = being written; ticket + 1 = this entry holds message `ticket`
+    int     sev;                    // API severity (GenError's mapping)
+    int     len;                    // strlen(txt); MAXERRMBUFSIZE = the caller's text was too long (not sent, as before)
+    char    txt[MAXERRMBUFSIZE];    // a COPY of the caller's text
+};
+
 // 15.7.16: single-sensor cross-sync count check (SingleSensorXC*), one per unordered pair of
 // count syncs [a][b], a < b. d = the tracked offset P_a - P_b (trolleys). Zero-initialised = nothing learned.
 struct SSXCPair
@@ -220,7 +229,14 @@ public:
     bool                sendBpmReset;                    // send reset to remotes
     bool                masterCheck;                     // send comchecks and determine master status
     bool                configGroupCheck;                // request settings file(s) from host
-    err_info            send_error;                      // send error message
+    err_info            send_error;                      // send error message (15.7.16: .send = queue not empty)
+    // 15.7.16: controller -> host message queue. Producers (GenError, any thread) take a ticket from
+    // errq_head atomically and never wait; the single consumer (SendError, GpSendThread) owns
+    // errq_tail / errq_dropped.
+    ErrQEntry           errq[ERRQ_LEN];
+    unsigned long long  errq_head;                       // next ticket (atomic)
+    unsigned long long  errq_tail;                       // next ticket to send (consumer only)
+    unsigned int        errq_dropped;                    // lost to overflow, not yet reported (consumer only)
     bool                sendBatchLabel;                  // send label info for batches
     bool                saveTotals;                      // save totals
     bool                saveDrpRecs;                     // save drop records
@@ -371,6 +387,8 @@ private:
     void    SendDropRecords();
     //int     SendDrpManager(int cmd, int drop, int var1, int var2, int var3, int var4);
     void    SendError();
+    bool    SendErrorMsg(int sev, char* txt);   // 15.7.16: one message to the host (HOST_OK + mutex)
+    bool    ErrQueuePending();                  // 15.7.16: something for SendError to do
     int     SendHostMsg( int cmd, int var, BYTE *data, int len);
     int     SendIsysMsg( int cmd, int lineId, BYTE *data, int len);
     void    SendLabelInfo();

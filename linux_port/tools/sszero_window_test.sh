@@ -90,7 +90,17 @@ static inline int            iopl(int)                            { return -1; }
 static inline int            ioperm(unsigned long, unsigned long, int) { return -1; }
 STUB
 
-g++ -std=gnu++17 -O2 -fpermissive -w ${EXTRA_CXXFLAGS:-} \
+# 15.7.16: the real controller -> host message queue (GenError -> SendError) when the source has it
+ERRQ_FLAG=""
+if grep -q 'errq_head' "$NEWSRC"; then
+    : > "$OUT/errq.inc"
+    for f in "void overhead::GenError(int sev, char* txt)" "void overhead::SendError()" "bool overhead::SendErrorMsg(" "bool overhead::ErrQueuePending()"; do
+        extract "$NEWSRC" "$f" > "$OUT/q.tmp"; [ -s "$OUT/q.tmp" ] || { echo "extract failed: $f"; exit 2; }
+        cat "$OUT/q.tmp" >> "$OUT/errq.inc"
+    done
+    ERRQ_FLAG="-DXC_REAL_ERRQ -pthread"
+fi
+g++ -std=gnu++17 -O2 -fpermissive -w ${EXTRA_CXXFLAGS:-} $ERRQ_FLAG \
     -I"$OUT/stub" -I"$OUT" -I"$LP/overhead" -I"$LP/common" -I"$LP/interface" \
     "$HERE/sszero_window_test.cpp" -o "$OUT/t"
 
@@ -114,6 +124,8 @@ xargs -P "${JOBS:-8}" -L 1 sh -c '"$0/t" "$2" > "$0/log.$1" 2>&1; echo $? > "$0/
         END { for (k in runs) printf "  %-20s runs %4d  tabs %6d  missed %4d  false %4d  silent %3d  alarms %4d  max alarms/rev/sync %d  rule viol %d\n",
                                      k, runs[k], tabs[k], miss[k], fz[k], sil[k], al[k], mpr[k], viol[k] }' | sort
     echo
+    cat "$OUT"/log.* | awk '/^controller messages through the real GenError queue/ { r += $8; m += $10; if ($NF != "yes") bad = 1; n++ }
+        END { if (n) printf "controller messages through the real GenError queue: %d runs, %d produced, every one delivered in order: %s\n", r, m, bad ? "NO" : "yes" }'
     awk '/ passed, .* failed/ { p += $1; f += $3 } END { printf "%d passed, %d failed\n", p, f }' "$OUT"/log.*
 } | tee "${LOG:-/dev/null}"
 fail=0

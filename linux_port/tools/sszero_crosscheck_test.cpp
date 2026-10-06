@@ -64,7 +64,9 @@ char        sync_desc[MAXSYNCS][MAX_DBG_DESC] = {
     "Drop Sync 4", "Drop Sync 5", "Drop Sync 6" };
 volatile sig_atomic_t g_outputs_disabled = 0;
 const BYTE  Mask[8] = {0x01,0x2,0x4,0x8,0x10,0x20,0x40,0x80};
+#ifndef XC_REAL_ERRQ
 int  RtPrintf(const char*, ...) { return 0; }
+#endif
 void DebugTrace(UINT, char*, ...) {}
 #define _FILE_ "overhead.cpp"
 typedef app_type::SHARE_MEMORY SHARE_MEMORY;
@@ -78,7 +80,12 @@ static long                g_tick = 0;
 void overhead::SetOutput(int, DBOOL)                 {}
 bool overhead::MissedBirdCheck(int k, int shk, int)  { if (g_mb) g_mb->push_back(MBRec{g_tick, k, shk}); return false; }
 void overhead::AddDropRecord(int)                    {}
+#ifdef XC_REAL_ERRQ          // 15.7.16: the real GenError -> queue -> SendError; the host's view is analysed
+#include "errq_harness.h"
+static void deliverMsg(const char* t)                 { g_msgs->push_back(Msg{g_tick, t}); }
+#else
 void overhead::GenError(int, char* txt)              { g_msgs->push_back(Msg{g_tick, txt}); }
+#endif
 void overhead::GradeProcess(int)                     {}
 int  overhead::SendLineMsg(int, int, int, BYTE*, int) { return 0; }
 
@@ -168,6 +175,7 @@ struct RunOut
     int mbDup = 0, mbMiss = 0, mbRevs = 0, weighRelabel = 0, weighDup = 0;
     int mbCorrRevs = 0, mbCorrDup = 0, mbCorrMiss = 0;   // revolutions with a correction and no overrun
     int alarmSpacingViol = 0;                      // disagreement alarms for one pair closer than a revolution
+    bool errqOk = true;                            // the host got every controller message, in order
     double maxFracSteady = 0; long pairChecks = 0, pairWrongInt = 0, pairWrong1 = 0;   // armed-pair measurement quality
                                                    // (WrongInt: wrong at 2 consecutive checks of the pair; Wrong1: single-shot)
     bool seeded = false; long seedTick = -1;
@@ -188,6 +196,9 @@ static RunOut runOne(Source& src, Variant var, const InitState& init, bool seedO
     SHARE_MEMORY* shm = (SHARE_MEMORY*) calloc(1, sizeof(SHARE_MEMORY));
     app = o; o->pShm = shm;
     memset(trc, 0, sizeof(trc)); memset(trc_buf, 0, sizeof(trc_buf));
+#ifdef XC_REAL_ERRQ
+    errq_begin(o); errq_deliver = deliverMsg;
+#endif
     for (int a = 0; a < MAXSYNCS; a++) for (int b = 0; b < MAXSYNCS; b++) R.armedAt[a][b] = -1;
 
     const int N = src.N, S1 = src.skip + 1;
@@ -290,6 +301,9 @@ static RunOut runOne(Source& src, Variant var, const InitState& init, bool seedO
             case V_SPEC:    o->ProcessSyncs_SPEC();    break;
             case V_NOTRACK: o->ProcessSyncs_NOTRACK(); break;
         }
+#ifdef XC_REAL_ERRQ
+        errq_drain(o);                                  // GpSendThread's pass: the host's view from here on
+#endif
         // weigh triggers (scale block)
         if (o->weigh_state[0] == WeighActive)
         {
@@ -441,6 +455,9 @@ static RunOut runOne(Source& src, Variant var, const InitState& init, bool seedO
         R.stateHash.push_back(h);
     }
     for (int b : src.bits) if (curErr[b] != 0) R.eps.push_back(Episode{b, epStart[b], -1, epMax[b], epEdges[b], "open at end", curErr[b]});
+#ifdef XC_REAL_ERRQ
+    R.errqOk = errq_end(o);
+#endif
     free(shm); free(o); app = 0; g_mb = 0;
     return R;
 }
@@ -599,6 +616,7 @@ static void groupReal(const char* capdir)
         CHECK(res[V_NEW].corrFalse == 0, "%s: 15.7.16 made %d FALSE corrections", rs.file, res[V_NEW].corrFalse);
         CHECK(res[V_NEW].pairWrongInt == 0, "%s: 15.7.16 read %ld wrong integer offsets", rs.file, res[V_NEW].pairWrongInt);
         CHECK(res[V_NEW].alarmSpacingViol == 0, "%s: disagreement alarm spacing", rs.file);
+        for (int vi = 0; vi < 5; vi++) CHECK(res[vars[vi]].errqOk, "%s %s: the host did not get every controller message", rs.file, vName[vars[vi]]);
         CHECK(res[V_NEW].mbCorrDup == 0 && res[V_NEW].mbCorrMiss == 0, "%s: 15.7.16 pass accounting in corrected revolutions dup %d miss %d", rs.file, res[V_NEW].mbCorrDup, res[V_NEW].mbCorrMiss);
 
         // cold starts: no offsets learned (counts exact) / from boot - must equal 15.7.15 scan for scan
@@ -782,6 +800,7 @@ static RunOut synRun(const std::string& grp, SynCfg c, bool verbose = false, Var
     }
     CHECK(rn.corrFalse == 0, "%s: %d FALSE corrections", c.name.c_str(), rn.corrFalse);
     CHECK(rn.pairWrongInt == 0, "%s: %ld wrong integer offsets", c.name.c_str(), rn.pairWrongInt);
+    CHECK(rn.errqOk && ro.errqOk, "%s: the host did not get every controller message in order", c.name.c_str());
     CHECK(rn.alarmSpacingViol == 0, "%s: %d disagreement alarms closer than one revolution for a pair", c.name.c_str(), rn.alarmSpacingViol);
     CHECK(rn.mbCorrDup == 0 && rn.mbCorrMiss == 0, "%s: pass accounting in corrected revolutions dup %d miss %d", c.name.c_str(), rn.mbCorrDup, rn.mbCorrMiss);
     { int open1 = 0; for (const Episode& e : rn.eps) if (e.lastErr == 1 && (e.how == "open at end" || e.how == "other")) open1++; t.unfixed += open1; }
@@ -1052,6 +1071,9 @@ int main(int argc, char** argv)
         printf("  %-22s   (armed-pair readings wrong at 2 consecutive checks: %ld, single-shot: %ld, of %ld checks; scale weigh labels repeated in a revolution: 15.7.15 %d, 15.7.16 %d)\n", "", t.wrongInt, t.wrong1, t.checks, t.weighDupOld, t.weighDup);
         if (t.identical || t.zeroResid) printf("  %-22s   (identical to 15.7.15 scan for scan: %d runs; runs where the shared zero detector miscounted: %d)\n", "", t.identical, t.zeroResid);
     }
+#ifdef XC_REAL_ERRQ
+    errq_report();
+#endif
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

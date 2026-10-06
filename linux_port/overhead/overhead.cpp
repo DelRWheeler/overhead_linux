@@ -1866,6 +1866,10 @@ void overhead::InitLocals()
     app->sendBlockGranted        = false;
     app->configGroupCheck        = false;
     app->send_error.send         = false;
+    memset(app->errq, 0, sizeof(app->errq));   // 15.7.16: controller -> host message queue empty
+    app->errq_head               = 0;
+    app->errq_tail               = 0;
+    app->errq_dropped            = 0;
     app->saveTotals              = false;
     app->saveDrpRecs             = false;
     app->drp_rec_count           = 0;
@@ -3711,11 +3715,9 @@ void __stdcall overhead::GpSendThread(PVOID unused)
 
 //----- Check to see if there are any error messages to send
 
-        if (HOST_OK && app->send_error.send)
-        {
+        // 15.7.16: drain the whole queue (every message, in order), not one slot
+        if (HOST_OK && app->ErrQueuePending())
             app->SendError();
-            app->send_error.send = false;
-        }
 
 //----- Check to see if there are any needed settings
 
@@ -11595,8 +11597,26 @@ void overhead::GenError(int sev, char* txt)
         default:             api_sev = 0; break; // Info
     }
 
-    send_error.sev      = api_sev;
-    send_error.err_addr = txt;
+    // 15.7.16: queue a COPY of the message. It used to be ONE slot pointing at the caller's buffer:
+    // a second GenError before GpSendThread's next pass (<= 50 ms) overwrote the first, and the
+    // shared app_err_buf could be rewritten before it was sent. Lock-free, so no caller ever waits
+    // (the 5 ms scan included, every thread is SCHED_FIFO): an atomic ticket picks the slot, the
+    // slot's seq is cleared, the text copied, the seq published. A full ring overwrites its oldest
+    // entry; SendError notices the gap and reports it.
+    if (txt == NULL) txt = (char*) "";
+    unsigned long long t = __atomic_fetch_add(&errq_head, 1ULL, __ATOMIC_ACQ_REL);
+    ErrQEntry &e = errq[t % ERRQ_LEN];
+    __atomic_store_n(&e.seq, 0ULL, __ATOMIC_RELAXED);         // being written
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    size_t len = strnlen(txt, MAXERRMBUFSIZE);
+    e.sev = api_sev;
+    e.len = (int) len;
+    if (len < MAXERRMBUFSIZE) memcpy(e.txt, txt, len + 1);
+    else                      e.txt[0] = 0;                    // too long: SendError logs it, as before
+    __atomic_store_n(&e.seq, t + 1, __ATOMIC_RELEASE);        // published
+
+    send_error.sev      = api_sev;                             // kept: the latest message
+    send_error.err_addr = e.txt;
     send_error.send     = true;
 
     if (sev == critical)
@@ -11612,32 +11632,91 @@ void overhead::GenError(int sev, char* txt)
 //  SendError
 //--------------------------------------------------------
 
+// 15.7.16: drains the GenError queue IN ORDER - every message, each with the same HOST_OK gate,
+// mutex and SendHostMsg(ERROR_MSG, sev, text) as before. Single consumer (GpSendThread). A message
+// the host or the mutex cannot take now stays queued for the next pass. An entry overwritten by a
+// full ring (or while being copied) is counted, and once the survivors are delivered one
+// "N controller messages dropped (queue full)" is sent. A text of MAXERRMBUFSIZE or more is not
+// sent, with the same log line as before.
 void overhead::SendError()
 {
     // Guard: skip if pShm is invalid (HOST_OK dereferences pShm)
     if (!isPShmValid()) return;
 
-    int len = strlen(send_error.err_addr);
-
-    if (len >= MAXERRMBUFSIZE)
+    bool stalled = false;
+    for (;;)
     {
-        RtPrintf("Error file %s, line %d\n", _FILE_, __LINE__);
-        return;
+        unsigned long long head = __atomic_load_n(&errq_head, __ATOMIC_ACQUIRE);
+        if (errq_tail == head) break;                                  // empty
+        if (head - errq_tail > ERRQ_LEN)                               // lapped: the oldest were overwritten
+        {
+            errq_dropped += (unsigned int) (head - ERRQ_LEN - errq_tail);
+            errq_tail     = head - ERRQ_LEN;
+        }
+        ErrQEntry &e = errq[errq_tail % ERRQ_LEN];
+        unsigned long long s1 = __atomic_load_n(&e.seq, __ATOMIC_ACQUIRE);
+        if (s1 != errq_tail + 1)
+        {
+            if (s1 > errq_tail + 1) { errq_dropped++; errq_tail++; continue; }   // overwritten by a newer one
+            break;                                                     // still being written: next pass
+        }
+        int  sev = e.sev, len = e.len;
+        char buf[MAXERRMBUFSIZE];
+        if (len < MAXERRMBUFSIZE) memcpy(buf, e.txt, len + 1);
+        else                      buf[0] = 0;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&e.seq, __ATOMIC_RELAXED) != s1) { errq_dropped++; errq_tail++; continue; }   // overwritten while copied
+
+        if (len >= MAXERRMBUFSIZE)
+        {
+            RtPrintf("Error file %s, line %d\n", _FILE_, __LINE__);  // too long: not sent, as before
+            errq_tail++;
+            continue;
+        }
+        if (!SendErrorMsg(sev, buf)) { stalled = true; break; }        // keep it for the next pass
+        errq_tail++;
     }
+
+    if (errq_dropped && !stalled)
+    {
+        char buf[80];
+        sprintf(buf, "%u controller messages dropped (queue full)\n", errq_dropped);
+        RtPrintf("GenError: %s", buf);
+        if (SendErrorMsg(1 /* API Warning */, buf))
+            errq_dropped = 0;
+    }
+
+    if (!ErrQueuePending())
+    {
+        send_error.sev      = 0;
+        send_error.err_addr = NULL;
+        send_error.send     = false;
+    }
+}
+
+// 15.7.16: one message to the host - the body SendError always had. false = not sent (host not
+// connected, or the send mutex timed out), so the caller keeps the message.
+bool overhead::SendErrorMsg(int sev, char* txt)
+{
+    if (!(HOST_OK))
+        return false;
     // Request Mutex for send
     if(RtWaitForSingleObject(trc[GPBUFID].mutex, WAIT100MS) != WAIT_OBJECT_0)
-        RtPrintf("Wait failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
-    else
     {
-        if HOST_OK
-            SendHostMsg( ERROR_MSG, send_error.sev, (BYTE*) send_error.err_addr, strlen(send_error.err_addr));
-
-        if(!RtReleaseMutex(trc[GPBUFID].mutex))
-            RtPrintf("Release failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
+        RtPrintf("Wait failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
+        return false;
     }
+    SendHostMsg( ERROR_MSG, sev, (BYTE*) txt, strlen(txt));
 
-    send_error.sev      = 0;
-    send_error.err_addr = NULL;
+    if(!RtReleaseMutex(trc[GPBUFID].mutex))
+        RtPrintf("Release failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
+    return true;
+}
+
+// 15.7.16: a queued message, or an overflow summary, waits to be sent (consumer side only)
+bool overhead::ErrQueuePending()
+{
+    return (errq_tail != __atomic_load_n(&errq_head, __ATOMIC_ACQUIRE)) || (errq_dropped != 0);
 }
 
 //--------------------------------------------------------

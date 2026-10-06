@@ -59,7 +59,9 @@ char        sync_desc[MAXSYNCS][MAX_DBG_DESC] = {
     "Drop Sync 4", "Drop Sync 5", "Drop Sync 6" };
 volatile sig_atomic_t g_outputs_disabled = 0;
 const BYTE  Mask[8] = {0x01,0x2,0x4,0x8,0x10,0x20,0x40,0x80};
+#ifndef XC_REAL_ERRQ
 int  RtPrintf(const char*, ...) { return 0; }
+#endif
 void DebugTrace(UINT, char*, ...) {}
 #define _FILE_ "overhead.cpp"
 typedef app_type::SHARE_MEMORY SHARE_MEMORY;
@@ -71,7 +73,12 @@ static long              g_tick = 0;
 void overhead::SetOutput(int, DBOOL)                 {}
 bool overhead::MissedBirdCheck(int, int, int)        { return false; }
 void overhead::AddDropRecord(int)                    {}
+#ifdef XC_REAL_ERRQ          // 15.7.16: the real GenError -> queue -> SendError; the host's view is analysed
+#include "errq_harness.h"
+static void deliverMsg(const char* t)                 { g_msgs->push_back(Msg{g_tick, t}); }
+#else
 void overhead::GenError(int, char* txt)              { g_msgs->push_back(Msg{g_tick, txt}); }
+#endif
 void overhead::GradeProcess(int)                     {}
 int  overhead::SendLineMsg(int, int, int, BYTE*, int) { return 0; }
 
@@ -196,6 +203,9 @@ static RunRes run(const Cfg& c, bool useOld)
     SHARE_MEMORY* shm = (SHARE_MEMORY*) calloc(1, sizeof(SHARE_MEMORY));
     app = o; o->pShm = shm;
     memset(trc, 0, sizeof(trc)); memset(trc_buf, 0, sizeof(trc_buf));
+#ifdef XC_REAL_ERRQ
+    errq_begin(o); errq_deliver = deliverMsg;
+#endif
 
     shm->sys_set.Shackles     = c.N;
     shm->sys_set.SkipTrollies = c.skip;
@@ -295,6 +305,9 @@ static RunRes run(const Cfg& c, bool useOld)
 
         if (c.grading) { if (useOld) o->GradeSyncs_OLD(); else o->GradeSyncs_NEW(); }
         if (useOld) o->ProcessSyncs_OLD(); else o->ProcessSyncs_NEW();
+#ifdef XC_REAL_ERRQ
+        errq_drain(o);                                  // GpSendThread's pass
+#endif
 
         bool gradeInitial = c.grading && !gzPre && o->grade_zeroed[0];
         for (int s = 0; s < NSY; s++)
@@ -422,6 +435,9 @@ static RunRes run(const Cfg& c, bool useOld)
             if (alarmCnt[s][a] - prev < c.N + 1) st.spacingViol++;
         }
     }
+#ifdef XC_REAL_ERRQ
+    CHECK(errq_end(o), "%s: the host did not get every controller message in order", c.name.c_str());
+#endif
     free(shm); free(o); app = 0;
     return R;
 }
@@ -781,6 +797,9 @@ int main(int argc, char** argv)
         printf("  %-20s runs %4d  tabs %6d  missed %4d  false %4d  silent %3d  alarms %4d  max alarms/rev/sync %d  rule viol %d%s\n",
                it->first.c_str(), t.runs, t.tabs, t.miss, t.fz, t.silent, t.alarms, t.maxPerRev, t.viol, t.lost ? "  (tab pulses lost by debounce!)" : "");
     }
+#ifdef XC_REAL_ERRQ
+    errq_report();
+#endif
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
