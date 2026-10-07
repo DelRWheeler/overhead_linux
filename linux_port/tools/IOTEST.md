@@ -207,3 +207,39 @@ PORT_A1/B1/C1       <= 0xFF   (re-assert, belt and braces)
 * **`--status` shows channels energized while the controller is stopped** → the
   card was left in a driven state; run any `iotest` mode to reset it to all-off,
   or check whether something else opened the gates.
+
+---
+
+## Field findings
+
+### Pitman Farms — 2026-07-26 — 3 channels latch-good / field-dead
+
+Two full 24-channel sweeps agreed: **channels 11, 13 and 20 never fire**, while
+`--readback` reports "verify OK" on all three.
+
+| Channel | Port  | Bit | Latch signature | Result |
+|---------|-------|-----|-----------------|--------|
+| 11      | 0x305 | 2   | `FB`            | latch OK, no field output |
+| 13      | 0x305 | 4   | `EF`            | latch OK, no field output |
+| 20      | 0x306 | 3   | `F7`            | latch OK, no field output |
+
+Per "Reading the results" above this is the *latch takes the value but nothing
+happens* case — the fault is downstream of the 8255. Two facts moved the leading
+theory off the card itself:
+
+* the board was **bench-certified all-24-good before install**, and
+* the three dead channels are **scattered, not adjacent** (two on port B1 but
+  non-consecutive bits, one on C1), which is not how a failed driver bank fails.
+
+Leading hypothesis is therefore the **50-pin ribbon** — pinched or creased during
+panel mounting — or **bent header pins**, rather than a card fault. A reseat test
+and/or a board swap were under consideration on site.
+
+Mitigation shipped in controller **15.7.13**: the logical-drop → physical-channel
+map (`data/settings/output_map.cfg`). Station 11's solenoid was rewired to
+channel 14 and the site runs `11=14`. See the header comments in that file.
+
+> **If the ribbon is reseated or the board is swapped, re-run the sweep before
+> trusting any existing map.** The dead-channel set can move with the ribbon.
+> If every channel comes back healthy, delete `output_map.cfg` — an absent file
+> means identity (drop N fires channel N).
