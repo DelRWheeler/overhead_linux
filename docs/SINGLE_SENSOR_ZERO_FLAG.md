@@ -49,6 +49,9 @@ What we actually do:
   offset shifts → interface wire format unchanged → EPM-19 unaffected.
 
 ## Detector algorithm (controller) — configurable ms window + learned `T` as a sanity bound
+
+> ⚠️ **SUPERSEDED by 15.7.15 (2026-10-05).** The fixed ms window below failed in the field: at Pitman it rejected
+> every zero below ~34 SPM. See **15.7.15 / 15.7.16** at the end of this document. Kept for history.
 Geometry: trolleys on **6" centers**, block ~1.1–1.25" wide. Normal = one count edge per trolley
 interval `T`. Zero flag tab's rising edge lands at ~2.5" after the trolley = **~40% of `T`**.
 Tick unit = `App_Timer_Main` scans (**5 ms**); `ss_scan_tick` is a monotonic scan counter.
@@ -107,3 +110,66 @@ zeroed on the tab (`Δ≈28` ticks in the 30–250 ms window), shackle count tra
 per bird, production records grew, **10.5h soak clean** (0 disconnects, 0 floods, steady
 production), and **standard-mode regression clean** (two-sensor zeroing unchanged).
 Remaining: turkey (`SkipTrollies=1`) spot-check; demo-simulator synthesis for off-rig demo.
+
+
+## 15.7.15 / 15.7.16 (2026-10) — measured-gap tab rule, alarm rule, cross-sync check, message queue
+
+**Field failure that forced this (Pitman Farms, 2026-10-05).** Single-sensor, `SkipTrollies` 1, 303 shackles.
+- **What failed:** the measured tab sits at **0.41·T** (Sensor Scope: 0.403/0.411/0.418 on three heads). With the
+  `ZeroTabWindowMaxMs` 375 rail, every zero was rejected below 12600/375 = 33.6 SPM, and the plant runs turkeys at
+  21–33 SPM.
+- **Why no fixed ms window can work:** the 21 SPM tab (~600 ms) is longer than a 72 SPM trolley gap (417 ms).
+- **Owner requirement:** single-sensor zero must work at ANY plant (any skip, length, speed range, flag geometry)
+  with no per-plant tuning.
+
+**15.7.15** (`hotfix/sszero-measured-window`, b269cf8; base f9f2968 + 02bf814; constants in overheadconst.h):
+- **`SingleSensorTabRule`:** a candidate edge is the tab only if all three hold:
+  - **band:** `200·G <= 1000·delta <= 650·G`, where G = the last trolley-classified gap (accepted tabs never
+    update G or G2);
+  - **steadiness:** `70·G2 <= 100·G <= 143·G2`;
+  - **revolution gate:** `tabRun >= Shackles·(SkipTrollies+1) - 8`.
+
+  `ZeroTabWindowMin/MaxMs` and the `0.18–0.50·interval` test are no longer consulted (the shm fields and host
+  push are unchanged). Stall/shrink/EMA are unchanged. Clean in simulation for every skip/geometry combination
+  (tab 0.25–0.50) at 0–5 % jitter, 10–220 SPM.
+- **Boot confirmation** (two candidates R±8 apart before the first zero): built, `SS_BOOT_CONFIRM 0`. The owner
+  requires a restart to zero on the first flag pass, as before.
+- **Exact-count check:** an accepted tab must find `shackleno == Shackles+1 && trolly_counters == 0`, else
+  "Zero Flag position mismatch". It catches the skip-1 half-shackle slip that Early/Late cannot see. At Pitman it
+  exposed a 303-shackle chain configured as 304.
+- **Alarm rule (owner):** per sync, no zero-flag alarm before the count first reaches the preset; then at most
+  one per revolution (NOT Detected / Early / Late / mismatch). It replaces `SingleSensorWarnOk` (one per 30 s
+  across ALL syncs, which swallowed alarms). An informational "Zero Flag re-acquired" marks the first good zero
+  after an alarm.
+
+**15.7.16** (`hotfix/sszero-crosscheck`, 0750225; `SS_CROSSCHECK 1`):
+- **Cross-sync count check.** All count syncs share one chain, so their phase-accurate trolley offset is a
+  constant once zeroed. It varies ~0.4 trolley around the chain but repeats within sd 0.02, so it is tracked.
+  - **Learning:** from clean zeros, confirmed twice; afterwards only the fraction is tracked.
+  - **Correction:** only a sync **one trolley ahead**, by −1. A stop only adds counts (chain rollback re-counts);
+    a lost count is alarm-only.
+    - **P1:** one sync ahead while the others agree.
+    - **P2:** after a real stop, the lower of two levels wins. Two sensors re-counting at one stop is common; a
+      symmetric majority made false corrections on real data.
+  - **Guards:**
+    - ≥ 3 syncs;
+    - steady gate 87–115 %;
+    - 2 consecutive agreeing edges;
+    - a disagreement that appears in one step;
+    - never a sync anchored by its own zero.
+  - **Arming:** ~2.4 clean revolutions after the first zero; until then, behaviour is exactly 15.7.15.
+  - **Messages:** "Count corrected: <sync> -1 trolley (cross-check with …)" (never rate-limited);
+    "Count disagreement: <a> vs <b> by <k> trolley" (once per revolution per pair).
+  - **Proof:** replay of real Pitman captures 7/7 corrected, 0 false; rig fault injection, all cases.
+  - **Field:** first correction 2026-10-07 00:52:48 PDT, verified by the next zero.
+- **GenError message queue.** `GenError` used a single `send_error` slot, so simultaneous messages reached the
+  host as the last one only. This is inherited and present in every version, standard mode included. It is now a
+  64-entry lock-free FIFO of copied text, drained in order by SendError:
+  - on overflow the newest overwrites the oldest, followed by an "N controller messages dropped" summary;
+  - dchserver.log is unchanged.
+
+  Tests: `tools/errqueue_test.sh` (38/0, ASan/UBSan clean).
+
+Tests for all of the above: `tools/sszero_tab_dup_test.sh`, `tools/sszero_window_test.sh`,
+`tools/sszero_crosscheck_test.sh`, `tools/errqueue_test.sh`. Full field write-up: overhead repo
+`docs/PITMAN_SINGLE_SENSOR_ZERO_FIX_2026-10-05.md`.
