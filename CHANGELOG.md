@@ -37,7 +37,168 @@ If you forget this and deploy the `0xFF` stub to real hardware, the `inb()` read
 
 Applies to both VM and real hardware. The capability is stored on the file and gets wiped by every rebuild/copy.
 
+## Oct 7, 2026 - 15.7.17: mainline merge of the Pitman hotfix line (15.7.16) and 15.7.14 batch-label slots
+
+This is the mainline merge, with no new behaviour: `hotfix/sszero-crosscheck` (43c3233) merged into
+`fix/sandcat-dual-scale-com2` (2dcbf92). The build is **everything in Pitman's 15.7.16 (`0750225`)
+plus `9da7827` (15.7.14 batch-label slots)**, and there is no other behaviour change. Wire protocol and
+shm layout are unchanged.
+
+- Single-sensor zero (`ProcessSyncs`, `GradeSyncs`, `SingleSensorIsZeroTab` / `SingleSensorTabRule` and
+  helpers, the alarm rule, the `SingleSensorXC*` cross-sync check) and the `GenError` / `SendError`
+  message queue, with their state and constants, are byte-identical to `0750225`.
+- Batch-label code (`ReleaseCutShortLabel`, `GetLabelSlot`, `NextBatchNumber`, `BatchLabelSlots.h`,
+  the `overheadmacros.h` / `InterSystems.cpp` changes) is byte-identical to `9da7827`.
+- `02bf814` (15.7.14 single-sensor duplicate-pass guard) was on both sides (`56bd573` is its clean
+  cherry-pick) and is contained once.
+- The number is 15.7.17, not 15.7.16, because Pitman's 15.7.16 binary lacks `9da7827`.
+- Tests on the merged tree (same results as on each branch): `sszero_tab_dup_test` 354/354,
+  `sszero_window_test` 7765/7765, `sszero_crosscheck_test` 1720/1720, `errqueue_test` 38/38,
+  `batchlabel_slots_test` 62/62.
+
+`APP_VER3` 16 -> 17 (mainline 14 -> 17).
+
+## Oct 6, 2026 - 15.7.16 (same unreleased build): every controller message reaches the host
+
+Found on the rig in the 15.7.16 test: a two-sensor stop fired BOTH "Count corrected" GenErrors in one
+millisecond (dchserver.log 17:55:15.326, DS1 and DS3) but the host showed only the last; 8 "Count
+disagreement" lines at 17:34:22-23 arrived as 2. Inherited from the original design, every version and
+standard mode included: `GenError()` kept ONE slot (`send_error.sev / err_addr / send`) pointing at the
+caller's buffer, and `SendError()` (GpSendThread, every 50 ms) sent that slot - a second GenError before
+the next pass overwrote the first, and the shared `app_err_buf` could be rewritten before it was sent.
+
+### Fix (`overhead.cpp` GenError / SendError / new SendErrorMsg, ErrQueuePending; `ERRQ_LEN` in `overheadconst.h`)
+- GenError copies sev + text (up to `MAXERRMBUFSIZE`) into a ring of `ERRQ_LEN` 64 entries. Lock-free:
+  an atomic ticket picks the slot, the slot's sequence number is cleared, the text copied, the sequence
+  published - no producer ever waits (every thread is SCHED_FIFO; GenError is called from the 5 ms scan,
+  the GP / fast timers, the comms, mailbox, InterSystems, DropManager and load-cell threads and init).
+- SendError (single consumer, GpSendThread) drains the ring IN ORDER through the unchanged path: HOST_OK
+  gate, `trc[GPBUFID].mutex` (WAIT100MS), `SendHostMsg(ERROR_MSG, sev, text)`. It checks each slot's
+  sequence before and after copying, so a slot overwritten meanwhile is never sent torn.
+- Overflow: the newest message overwrites the OLDEST; after the survivors are delivered the host gets one
+  "N controller messages dropped (queue full)" (Warning). The scan is never blocked.
+- RtPrintf to dchserver.log is unchanged (byte-identical lines); the dropped-count summary is also logged.
+  `send_error.send` stays as "messages waiting"; nothing else reads `send_error`.
+- Visible differences, all from "every message is delivered": messages produced while the host is
+  disconnected, or while the send mutex times out, are kept and delivered later (up to 64, then the
+  summary) instead of only the latest; a message produced during a pass is no longer lost.
+
+### Tests (`linux_port/tools/`)
+- `errqueue_test.sh` (new, the real extracted functions + the real platform mutex): bursts of 1..64 in one
+  scan through the reused `app_err_buf` all delivered in order with the right text and severity (15.7.15:
+  1 delivered, with whatever the buffer held by then); log lines identical to 15.7.15; overflow 65..1064
+  -> the newest 64 + the summary; host down / mutex held -> kept, delivered later; text too long -> same
+  behaviour as before; 8 concurrent producer threads vs a live consumer: no torn text, no duplicate,
+  per-producer order kept, delivered + reported-dropped == produced (paced: 8000 of 8000 delivered).
+  38/38, also under ASan/UBSan.
+- `sszero_tab_dup_test`, `sszero_window_test`, `sszero_crosscheck_test` now take their message stream
+  through the real GenError -> queue -> SendError (drained like GpSendThread after each scan) and check
+  that the host received every message in order (484 / 5349 / 3732 messages): 354, 7765, 1720 passed;
+  their results are otherwise identical to before.
+
+## Oct 6, 2026 - 15.7.16 (hotfix line `hotfix/sszero-crosscheck`): single-sensor cross-sync count check
+
+Owner: "once the initial zero happens we should never allow the line to run a full revolution with the
+wrong shackle count." Until 15.7.15 a sync's count could only be corrected at its own next zero flag. At
+Pitman (single-sensor zero, SkipTrollies 1, 303 shackles = 606 trolleys, count syncs Scale 1 / Drop Sync 1
+/ Drop Sync 2) the chain ROLLS BACK at line stops: a sensor that sat on a body rolls off it and counts it
+again on restart, so drops fired one trolley off for up to a revolution (field 2026-10-05: DS2 "305
+expected 303" 16:54:22 / 17:03:12, Scale 1 "trolley 1" 16:58:43, ...). Single-sensor mode
+(`ZeroFlagMode == 1`) only; standard two-sensor mode is unchanged. Wire protocol and shm layout unchanged.
+This is 15.7.15 (`b269cf8`, the Pitman build) + this change; `SS_BOOT_CONFIRM` stays 0.
+
+### The check (`SingleSensorXC*` in `overhead.cpp`, constants + full rules in `overheadconst.h`, `SS_CROSSCHECK 1`)
+- All count syncs sit on one chain: once zeroed, each sync's phase-accurate position since its zero
+  (P = trolleys counted + time since the last edge / measured gap G) differs from another's by the sensor
+  spacing D. A miscount moves that sync a whole trolley against the others; it is corrected
+  (shackleno / trolly_counters / true_shackle_count / tab run moved back one trolley) a few trolleys after
+  the restart, with "Count corrected: <sync> -1 trolley (cross-check with <others>)" (warning, not
+  rate-limited), and the next zero finds the count exact.
+- D is learned only from clean zeros (exact-count check passed on both syncs), confirmed by a second
+  clean sample, then TRACKED: the Pitman captures show D varies with chain position by up to 0.42 trolley
+  around the revolution (uneven pitch) but repeats to sd 0.02, so a constant D would leave almost no
+  margin. Only the fractional residual is tracked; the integer part can never absorb a miscount.
+- Only a sync one trolley AHEAD is corrected (a rollback can only add counts), never one that is behind,
+  never one anchored by its own zero since the last disturbance, only with >= 3 syncs in the vote, only for
+  a disagreement that arose in one step from all pairs at 0, after 2 consecutive edges, in steady running
+  (gaps within 87..115% of the previous one - tighter than the 70..143% first proposed, see
+  `overheadconst.h`). (P1) lone sync ahead of the others; (P2) after a real line stop, the lower of two
+  levels is right - this covers two sensors re-counting at one stop (two of the six real events).
+- No per-shackle pass runs twice or is skipped: the correction lands on a count whose drop / missed-bird
+  pass already ran one trolley early, so that edge's pass is skipped; the scale re-weighs the shackle on
+  it (SkipTrollies >= 1, the early weighment is still averaging) or skips its pass (SkipTrollies 0).
+- "Count disagreement: <a> vs <b> by <k> trolley" (warning, once per revolution per pair) when a
+  disagreement cannot be corrected: 2-sync lines, a sync behind, two syncs off at once in steady running.
+- Not corrected (zeros realign them as before): a lost count; the overrun reset's -1/-2 after a tab
+  rejected at a restart; every sync re-counting at the same stop (invisible to any cross-check); large
+  offsets (false zeros). Arming from boot takes ~2.4 clean revolutions after the first zero.
+
+### Tests (`linux_port/tools/`)
+- `sszero_crosscheck_test.sh` (new): the real extracted ProcessSyncs / helpers replay the three Pitman
+  Sensor Scope captures (`/home/del/data/pitman-scope-2026-10-05`) against hand-verified ground truth
+  (flag-to-flag 606 trolleys everywhere). 15.7.15 reproduces every field zero mark scan for scan and the
+  field alarm texts. 15.7.16 (offsets learned before the capture): 7 corrections, 7 right, 0 false; each
+  real re-count fixed 6-8 counted edges after the restart (15.7.15: 192-583 edges, until the next zero);
+  the literal 2-of-3 majority rule makes 10 false corrections on the same data. Cold / from boot: counter
+  state identical to 15.7.15 on every scan. Synthetic: Pitman + chicken, 7-200 SPM, steps, ramps, stops
+  with and without rollback, extra / missing edges, 2-sync, two syncs at once, near-coincident phases,
+  4 syncs, a 9 h soak: 0 false corrections; clean lines identical to 15.7.15 scan for scan.
+- `sszero_tab_dup_test.sh`, `sszero_window_test.sh`: extract the new functions; output byte-identical
+  to 15.7.15 (353/353, 5775/0, `SS_BOOT_CONFIRM` 0 and 1); standard mode identical to 15.7.13.
+
+`APP_VER3` 15 -> 16.
+
+## Oct 5, 2026 - 15.7.15 (hotfix line `hotfix/sszero-measured-window`): single-sensor zero at any line speed
+
+Pitman Farms (skip 1, 304 shackles, flag tab at 0.42 of the trolley pitch) lost its single-sensor zero
+whenever the line ran slow: the host's `ZeroTabWindowMaxMs` = 375 ms rejected the genuine tab below
+~33.6 SPM (tab = 0.42 x 30000/SPM ms), so the count drifted, drops fired on the wrong trolleys and
+operators hand-unloaded birds. Single-sensor mode (`ZeroFlagMode == 1`) only; standard two-sensor mode
+is unchanged (proven event-for-event against 15.7.13). Wire protocol and shared-memory layout unchanged.
+
+**What this binary is:** `f9f2968` (15.7.13 + trickle-suspend guard = the `e1bf768c` build at Pitman,
+Holmes, Claxton L1) + `02bf814` (15.7.14 single-sensor duplicate-pass guard, cherry-picked clean) + the
+changes below. It does **NOT** contain `9da7827` (15.7.14 batch-label slots) - mainline 15.7.14 does.
+
+### Tab detector (`SingleSensorIsZeroTab` -> `SingleSensorTabRule`, constants in `overheadconst.h`)
+- Measured, not guessed: G = the last trolley-to-trolley gap, G2 = the one before (tabs never update
+  them). TAB only if (a) `0.20*G <= delta <= 0.65*G`, (b) G within 70..143% of G2 (not accelerating),
+  (c) `tabRun >= R - 8` trolleys since the last accepted tab, R = Shackles*(SkipTrollies+1).
+- `ZeroTabWindowMinMs/MaxMs` and the 0.18..0.50 x EMA test are no longer consulted (fields + host push
+  kept). EMA `interval`, stall / shrink re-seeds and timebase semantics unchanged; `tabRun` now counts
+  every trolley-classified edge.
+- Boot confirmation (`SS_BOOT_CONFIRM 1`): the first zero after a controller start needs a second
+  tab-shaped edge R+1 +/- 8 trolleys after an earlier one (per-sync bit ring of 8192 positions).
+  Costs up to one extra revolution before the first zero (~14 min at turkey speed, ~5 at chicken);
+  set `SS_BOOT_CONFIRM 0` to take the first tab-shaped edge instead.
+
+### Alarms (per sync, single-sensor only)
+- Owner's rule replaces `SingleSensorWarnOk` (<= 1 per 30 s GLOBAL, which swallowed other syncs'
+  alarms): no zero-flag alarm until the sync has counted Shackles+1 since boot, then at most one per
+  Shackles+1 counts - for "NOT Detected", "Early", "Late" and the new "position mismatch". Counting
+  on a missed zero is unchanged. "Initial" is not gated.
+- New "Zero Flag position mismatch. <sync> count n trolley t expected Shackles+1/0": an accepted tab
+  must find the flag body's count (Shackles+1, skip parity 0); catches the misplaced zeros Late/Early
+  cannot see (e.g. skip 1: missed tab then a false zero one trolley later).
+- New informational "Zero Flag re-acquired. <sync>" on the first good zero after a raised
+  "NOT Detected" / "position mismatch" (the rule usually swallows the "Late" that used to say it).
+- While a boot candidate awaits confirmation the threshold is two revolutions, so a normal start-up
+  raises no alarm.
+
+### Tests (`linux_port/tools/`)
+- `sszero_tab_dup_test.sh` (adapted): standard mode vs real 15.7.13 identical; single-sensor
+  duplicate-pass guard vs the same tree without it. 353/353 with `SS_BOOT_CONFIRM` 1 and 0.
+- `sszero_window_test.sh` (new): real ProcessSyncs/GradeSyncs over 5 ms scan streams of a moving
+  chain - Pitman/chicken steady, steps, ramps, stops, jitter, noise, missing flags, any-plant grid.
+  Steady and 5-15 s ramps: 0 missed / 0 false. Residuals (all alarmed): instant or 2 s speed-up 1-8
+  trolleys before the flag; a stop with the flag body in front of the sensor.
+
+`APP_VER3` 13 -> 15.
+
 ## Sep 26, 2026 - 15.7.14: batch label slots, batch-number reuse, single-sensor zero-tab double pass
+
+> **Hotfix line note:** the 15.7.15 hotfix branch carries only the single-sensor part of this entry
+> (`02bf814`); the batch-label slot fix (`9da7827`) below is mainline 15.7.14 only.
 
 Found by the dual-scale distribution soak on the office rig (host write-up:
 `overhead/docs/DUALSCALE_SOAK_AND_BATCH_FIXES_2026-09-26.md`). Wire protocol and host behaviour

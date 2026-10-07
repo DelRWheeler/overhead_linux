@@ -2,9 +2,17 @@
 //  sszero_tab_dup_test.cpp - single-sensor zero tab duplicate-pass test (15.7.14)
 //
 //  Build + run:   linux_port/tools/sszero_tab_dup_test.sh
-//  (the script cuts the REAL ProcessSyncs / GradeSyncs / SingleSensorIsZeroTab /
-//   SingleSensorWarnOk / RingSub out of overhead.cpp - 15.7.13 as *_OLD, the
-//   working tree as *_NEW - and compiles this file against the controller headers)
+//  (the script cuts the REAL ProcessSyncs / GradeSyncs / detector / alarm gate /
+//   RingSub out of overhead.cpp - 15.7.13 as *_OLD, the working tree as *_NEW, and
+//   the working tree minus ONLY the duplicate-pass guard as *_NG - and compiles
+//   this file against the controller headers)
+//
+//  15.7.15 changed the single-sensor detector (measured-gap tab rule) and the
+//  zero-flag alarm rule, so 15.7.13 and the working tree legitimately differ in
+//  single-sensor mode. The duplicate-pass property is therefore proven NG vs NEW
+//  (identical code but for the guard); standard two-sensor mode is still proven
+//  against the real 15.7.13 (OLD vs NEW event-for-event identical). In clean
+//  single-sensor runs the 15.7.13 and 15.7.15 detectors must accept the same edges.
 //
 //  THE DEFECT (rig, 2026-09-26). In single-sensor zero mode (ZeroFlagMode==1)
 //  the flag trolley gives the count sensor a double pulse. The BODY pulse is
@@ -44,8 +52,10 @@
 // Give the class two extra member declarations (the renamed OLD / NEW copies)
 // and open its private section to the harness. Test-only preprocessor tricks;
 // the controller headers are used unmodified.
-#define ProcessSyncs ProcessSyncs(); void ProcessSyncs_OLD(); void ProcessSyncs_NEW
-#define GradeSyncs   GradeSyncs();   void GradeSyncs_OLD();   void GradeSyncs_NEW
+#define ProcessSyncs ProcessSyncs(); void ProcessSyncs_OLD(); void ProcessSyncs_NG(); \
+    bool SingleSensorIsZeroTab_OLD(__int64 &lastTrolleyTick, __int64 &interval, int &stall, int &tabRun, int &shrink); \
+    bool SingleSensorWarnOk_OLD(); __int64 ss_last_warn_tick; void ProcessSyncs_NEW
+#define GradeSyncs   GradeSyncs();   void GradeSyncs_OLD();   void GradeSyncs_NG();   void GradeSyncs_NEW
 #define private public
 #include "types.h"
 #undef private
@@ -64,7 +74,9 @@ char        sync_desc[MAXSYNCS][MAX_DBG_DESC] = {
     "Drop Sync 4", "Drop Sync 5", "Drop Sync 6" };
 volatile sig_atomic_t g_outputs_disabled = 0;
 const BYTE  Mask[8] = {0x01,0x2,0x4,0x8,0x10,0x20,0x40,0x80};    // overhead.cpp:418 (BITSET)
+#ifndef XC_REAL_ERRQ
 int  RtPrintf(const char*, ...) { return 0; }
+#endif
 void DebugTrace(UINT, char*, ...) {}
 
 #define _FILE_ "overhead.cpp"
@@ -119,7 +131,12 @@ void overhead::AddDropRecord(int shackle)
     int s = g_ev->empty() ? -1 : g_ev->back().idx;
     g_ev->push_back(Ev{g_tick, 'R', s, 0, shackle});
 }
+#ifdef XC_REAL_ERRQ          // 15.7.16: the real GenError -> queue -> SendError; the host's view is compared
+#include "errq_harness.h"
+static void deliverMsg(const char* t)                { g_msgs->push_back(t); }
+#else
 void overhead::GenError(int, char* txt)             { g_msgs->push_back(txt); }
+#endif
 void overhead::GradeProcess(int g)
 {
     // One representative grade area (offset 1) - RingSub(Shackles+1,1)==RingSub(1,1)
@@ -128,9 +145,13 @@ void overhead::GradeProcess(int g)
 }
 int overhead::SendLineMsg(int, int, int, BYTE*, int) { return 0; }
 
-#include "sszero_shared.inc"     // RingSub, SingleSensorIsZeroTab, SingleSensorWarnOk (real)
-#include "sszero_old.inc"        // 15.7.13 ProcessSyncs_OLD / GradeSyncs_OLD (real)
+#include "sszero_shared.inc"     // RingSub + working-tree detector / tab rule / alarm gate (real)
+#include "sszero_old.inc"        // 15.7.13 ProcessSyncs_OLD / GradeSyncs_OLD + its detector / WarnOk (real)
 #include "sszero_new.inc"        // working tree ProcessSyncs_NEW / GradeSyncs_NEW (real)
+#include "sszero_ng.inc"         // working tree minus the 15.7.14 guard: ProcessSyncs_NG / GradeSyncs_NG
+
+enum Var { V_OLD, V_NG, V_NEW };
+static const char* varName(Var v) { return v == V_OLD ? "15.7.13" : v == V_NG ? "no-guard" : "NEW"; }
 
 //----- Checks -------------------------------------------------------------
 static int g_fail = 0, g_pass = 0;
@@ -158,10 +179,12 @@ struct Scen
 enum { S_SC1 = 0, S_SC2 = 1, S_DS1 = 2, S_DS2 = 3, S_G1 = 8, S_G2 = 9, NSENS = 10 };
 
 struct Result
-{
+{ bool errqBad = false;
     std::vector<Ev>          ev;
     std::vector<std::string> msgs;
-    std::vector<unsigned long long> hash;   // per-scan state hash
+    std::vector<unsigned long long> hash;   // per-scan state hash (counters + detector state)
+    std::vector<unsigned long long> hashCore; // per-scan hash without the detector's private state
+    std::vector<unsigned long long> hashDet;  // per-scan hash of the detector's private state only
     std::map<int, std::vector<long> > zeroTicks;   // accepted zero edges per sync (grade: 8+g)
     std::map<int, std::vector<long> > edgeTicks;   // confirmed edges per sync (grade: 8+g)
     std::map<int, std::vector<int> >  edgeCtr;     // counter value after each of those edges
@@ -183,7 +206,7 @@ static int assignDrop(const Scen& sc, int s, const int* dupShk, int nd)
     return 1 + (s % nd);
 }
 
-static Result run(const Scen& sc, bool fixed)
+static Result run(const Scen& sc, Var var)
 {
     Result r; r.dupTrace = 0;
     g_ev = &r.ev; g_msgs = &r.msgs;
@@ -192,6 +215,9 @@ static Result run(const Scen& sc, bool fixed)
     SHARE_MEMORY* shm = (SHARE_MEMORY*) calloc(1, sizeof(SHARE_MEMORY));
     app = o; o->pShm = shm;
     memset(trc, 0, sizeof(trc)); memset(trc_buf, 0, sizeof(trc_buf));
+#ifdef XC_REAL_ERRQ
+    errq_begin(o); errq_deliver = deliverMsg;
+#endif
 
     //--- configuration (what the host pushes)
     shm->sys_set.Shackles     = sc.N;
@@ -234,13 +260,13 @@ static Result run(const Scen& sc, bool fixed)
     for (int i = 0; i < MAXSYNCS; i++)
     {
         o->sync_armed[i] = true; o->sync_debounce[i] = shm->sys_set.SyncOn;
-        o->ss_tab_run[i] = SS_MIN_TROLLEYS_BETWEEN_TABS;
+        o->ss_tab_run[i] = (var == V_OLD) ? SS_MIN_TROLLEYS_BETWEEN_TABS : 0;   // each version's InitLocals
     }
     for (int g = 0; g < MAXGRADESYNCS; g++)
     {
         o->grade_armed[g] = false; o->grade_zeroed[g] = false;
         o->grade_debounce[g] = shm->sys_set.SyncOn;
-        o->ss_grade_tab_run[g] = SS_MIN_TROLLEYS_BETWEEN_TABS;
+        o->ss_grade_tab_run[g] = (var == V_OLD) ? SS_MIN_TROLLEYS_BETWEEN_TABS : 0;
     }
     o->ss_scan_tick = 0; o->ss_last_warn_tick = -100000;
     o->shk2shk_ticks = sc.T;
@@ -311,8 +337,12 @@ static Result run(const Scen& sc, bool fixed)
         for (int g = 0; g < MAXGRADESYNCS; g++) { gArmedPre[g] = o->grade_armed[g]; gTruePre[g] = o->true_grade_shackle_count[g]; }
 
         //--- the scan (App_Timer_Main order: GradeSyncs, then ProcessSyncs)
-        if (shm->sys_set.Grading) { if (fixed) o->GradeSyncs_NEW(); else o->GradeSyncs_OLD(); }
-        if (fixed) o->ProcessSyncs_NEW(); else o->ProcessSyncs_OLD();
+        if (shm->sys_set.Grading)
+        { if (var == V_NEW) o->GradeSyncs_NEW(); else if (var == V_NG) o->GradeSyncs_NG(); else o->GradeSyncs_OLD(); }
+        if (var == V_NEW) o->ProcessSyncs_NEW(); else if (var == V_NG) o->ProcessSyncs_NG(); else o->ProcessSyncs_OLD();
+#ifdef XC_REAL_ERRQ
+        errq_drain(o);                                 // GpSendThread's pass
+#endif
 
         //--- isys shackles/sec: one event per count
         while (isysPrev < (unsigned int) o->isys_shksec_sec_cnt)
@@ -359,30 +389,43 @@ static Result run(const Scen& sc, bool fixed)
         trc_buf[MAINBUFID][0] = 0;
 
         //--- state hash: everything the counter / zero / realign path owns
-        unsigned long long h = 1469598103934665603ULL;
+        unsigned long long h = 1469598103934665603ULL, d = h;
         for (int i = 0; i < MAXSYNCS; i++)
         {
             h = fnv(h, shm->SyncStatus[i].shackleno); h = fnv(h, shm->SyncStatus[i].zeroed);
             h = fnv(h, o->true_shackle_count[i]);     h = fnv(h, o->trolly_counters[i]);
             h = fnv(h, o->sync_armed[i]);             h = fnv(h, o->sync_debounce[i]);
-            h = fnv(h, o->ss_last_trolley_tick[i]);   h = fnv(h, o->ss_trolley_interval[i]);
-            h = fnv(h, o->ss_trolley_stall[i]);       h = fnv(h, o->ss_tab_run[i]);
-            h = fnv(h, o->ss_trolley_shrink[i]);
+            d = fnv(d, o->ss_last_trolley_tick[i]);   d = fnv(d, o->ss_trolley_interval[i]);
+            d = fnv(d, o->ss_trolley_stall[i]);       d = fnv(d, o->ss_tab_run[i]);
+            d = fnv(d, o->ss_trolley_shrink[i]);
+            d = fnv(d, o->ss_rule[i].gap);            d = fnv(d, o->ss_rule[i].gapPrev);
+            d = fnv(d, o->ss_rule[i].confirmed);      d = fnv(d, o->ss_rule[i].haveCand);
+            d = fnv(d, o->ss_rule[i].bootPos);        d = fnv(d, o->ss_rule[i].lastCand);
+            d = fnv(d, o->ss_alarm_cnt[i]);           d = fnv(d, o->ss_zero_lost[i]);
         }
         h = fnv(h, o->trolly_counters[MAXSYNCS]);
         for (int g = 0; g < MAXGRADESYNCS; g++)
         {
             h = fnv(h, shm->grade_shackle[g]);          h = fnv(h, o->true_grade_shackle_count[g]);
             h = fnv(h, o->grade_zeroed[g]);             h = fnv(h, o->grade_armed[g]);
-            h = fnv(h, o->ss_grade_last_trolley_tick[g]); h = fnv(h, o->ss_grade_trolley_interval[g]);
-            h = fnv(h, o->ss_grade_tab_run[g]);         h = fnv(h, o->ss_grade_trolley_shrink[g]);
+            d = fnv(d, o->ss_grade_last_trolley_tick[g]); d = fnv(d, o->ss_grade_trolley_interval[g]);
+            d = fnv(d, o->ss_grade_tab_run[g]);         d = fnv(d, o->ss_grade_trolley_shrink[g]);
+            d = fnv(d, o->ss_grade_rule[g].gap);        d = fnv(d, o->ss_grade_rule[g].gapPrev);
+            d = fnv(d, o->ss_grade_rule[g].confirmed);  d = fnv(d, o->ss_grade_rule[g].haveCand);
+            d = fnv(d, o->ss_grade_rule[g].bootPos);    d = fnv(d, o->ss_grade_rule[g].lastCand);
+            d = fnv(d, o->ss_grade_alarm_cnt[g]);       d = fnv(d, o->ss_grade_zero_lost[g]);
         }
         h = fnv(h, shm->WeighShackle[0]); h = fnv(h, shm->WeighShackle[1]);
         h = fnv(h, shm->WeighZero[0]);    h = fnv(h, o->previousShackle1); h = fnv(h, o->previousShackle2);
         h = fnv(h, o->w_avg[0].avg_trigger_cntr); h = fnv(h, o->capt_wt.capture);
         h = fnv(h, (long long) r.msgs.size());
-        r.hash.push_back(h);
+        r.hashCore.push_back(h);
+        r.hashDet.push_back(d);
+        r.hash.push_back(fnv(h, (long long) d));
     }
+#ifdef XC_REAL_ERRQ
+    if (!errq_end(o)) { printf("  FAIL: the host did not get every controller message in order\n"); r.errqBad = true; }
+#endif
     free(shm); free(o); app = 0;
     return r;
 }
@@ -406,15 +449,47 @@ static std::map<int,int> perShackle(const Result& r, char type, int sync, int su
 
 static void checkScenario(const Scen& sc)
 {
-    printf("\n== %s\n", sc.name);
-    Result O = run(sc, false);
-    Result Nw = run(sc, true);
+    // Single-sensor: baseline = the working tree without the guard (detector and alarm rule
+    // identical, so only the guard differs). Standard mode: baseline = the real 15.7.13.
+    const Var bv = (sc.mode == 1) ? V_NG : V_OLD;
+    printf("\n== %s   [baseline %s]\n", sc.name, varName(bv));
+    Result O = run(sc, bv);
+    Result Nw = run(sc, V_NEW);
 
     //--- A. identical counter realignment
-    size_t firstDiff = O.hash.size();
-    for (size_t i = 0; i < O.hash.size() && i < Nw.hash.size(); i++) if (O.hash[i] != Nw.hash[i]) { firstDiff = i; break; }
-    CHECK(O.hash.size() == Nw.hash.size() && firstDiff == O.hash.size(),
+    const std::vector<unsigned long long>& ho = (sc.mode == 1) ? O.hash  : O.hashCore;
+    const std::vector<unsigned long long>& hn = (sc.mode == 1) ? Nw.hash : Nw.hashCore;
+    size_t firstDiff = ho.size();
+    for (size_t i = 0; i < ho.size() && i < hn.size(); i++) if (ho[i] != hn[i]) { firstDiff = i; break; }
+    CHECK(ho.size() == hn.size() && firstDiff == ho.size(),
           "counter/zero/detector/weigh state diverges at scan %zu", firstDiff);
+    if (sc.mode == 0)
+    {
+        // standard mode never touches the single-sensor detector / alarm state, in either version
+        bool oc = true, nc = true;
+        for (size_t i = 1; i < O.hashDet.size(); i++)  if (O.hashDet[i]  != O.hashDet[0])  oc = false;
+        for (size_t i = 1; i < Nw.hashDet.size(); i++) if (Nw.hashDet[i] != Nw.hashDet[0]) nc = false;
+        CHECK(oc && nc, "standard mode touched single-sensor state (15.7.13 %d, NEW %d)", !oc, !nc);
+        Result G = run(sc, V_NG);
+        CHECK(G.hash == Nw.hash && G.ev == Nw.ev && G.msgs == Nw.msgs, "standard mode: no-guard build differs from NEW");
+    }
+    else if (sc.clean)
+    {
+        // clean steady single-sensor running: 15.7.13's detector (rails 30/250 ms, 0.18..0.50 EMA)
+        // and 15.7.15's measured-gap rule must accept exactly the same edges, with no alarms -
+        // except that with SS_BOOT_CONFIRM 15.7.15 takes its FIRST zero one flag later.
+        Result Old = run(sc, V_OLD);
+        std::map<int, std::vector<long> > oz = Old.zeroTicks;
+        if (SS_BOOT_CONFIRM)
+            for (std::map<int, std::vector<long> >::iterator it = oz.begin(); it != oz.end(); ++it)
+                if (!it->second.empty()) it->second.erase(it->second.begin());
+        CHECK(oz == Nw.zeroTicks && Old.edgeTicks == Nw.edgeTicks,
+              "clean run: 15.7.13 and 15.7.15 detectors accept different edges (%zu vs %zu zeros on sync 0)",
+              Old.zeroTicks[S_SC1].size(), Nw.zeroTicks[S_SC1].size());
+        CHECK(Old.msgs == Nw.msgs, "clean run: alarm streams differ (15.7.13 %zu, NEW %zu)", Old.msgs.size(), Nw.msgs.size());
+        for (size_t m = 0; m < Nw.msgs.size(); m++)
+            CHECK(strstr(Nw.msgs[m].c_str(), "Initial Zero Flag Detected") != 0, "clean run alarm: %s", Nw.msgs[m].c_str());
+    }
     CHECK(O.msgs == Nw.msgs, "GenError stream differs (%zu vs %zu msgs)", O.msgs.size(), Nw.msgs.size());
     CHECK(O.weigh == Nw.weigh, "weigh relabel sequence differs");
     CHECK(O.zeroTicks == Nw.zeroTicks && O.edgeTicks == Nw.edgeTicks, "edge / zero ticks differ");
@@ -608,13 +683,13 @@ int main()
         Scen s = base("rig replica: N=1189, 180 SPM, tab 140 ms, grading, single-sensor");
         s.N = 1189; s.revs = 3;
         checkScenario(s);
-        Result O = run(s, false), Nw = run(s, true);
+        Result O = run(s, V_NG), Nw = run(s, V_NEW);
         int o1172 = 0, n1172 = 0;
         long lo = O.zeroTicks[S_DS1][1], hi = O.zeroTicks[S_DS1][2];
         for (size_t i = 0; i < O.ev.size(); i++)  if (O.ev[i].type == 'R'  && O.ev[i].shk == 1172 && O.ev[i].idx == S_DS1 && O.ev[i].tick >= lo && O.ev[i].tick < hi) o1172++;
         for (size_t i = 0; i < Nw.ev.size(); i++) if (Nw.ev[i].type == 'R' && Nw.ev[i].shk == 1172 && Nw.ev[i].idx == S_DS1 && Nw.ev[i].tick >= lo && Nw.ev[i].tick < hi) n1172++;
         CHECK(o1172 == 2 && n1172 == 1, "shackle 1172 drop records per rev: OLD %d NEW %d", o1172, n1172);
-        printf("   shackle 1172 DROP_RECORDs per revolution: OLD %d  NEW %d\n", o1172, n1172);
+        printf("   shackle 1172 DROP_RECORDs per revolution: no-guard %d  NEW %d\n", o1172, n1172);
         // weigh relabel still lands the flag trolley on shackle 1 (auto-zero) every revolution
         int relabel = 0;
         for (size_t i = 1; i < Nw.weigh.size(); i++)
@@ -630,35 +705,52 @@ int main()
     { Scen s = base("single-sensor, 20 revolutions (counter wrap x20)");  s.revs = 20; checkScenario(s); }
 
     // 3. Perturbations: counter must realign exactly as 15.7.13; only true duplicates go
-    const int zClean = (int) run(base("ref"), true).zeroTicks[S_DS1].size();
+    const int zClean = (int) run(base("ref"), V_NEW).zeroTicks[S_DS1].size();
     {
         Scen s = base("missed tab in revolution 3 (Zero Flag NOT Detected path)");  s.clean = false; s.missTabRev = 3; checkScenario(s);
-        Result r = run(s, true);
+        Result r = run(s, V_NEW);
         CHECK((int) r.zeroTicks[S_DS1].size() == zClean - 1, "missed tab: zeros %zu vs clean %d", r.zeroTicks[S_DS1].size(), zClean);
         CHECK(countMsg(r, "Zero Flag NOT Detected") >= 1, "missed tab: no 'Zero Flag NOT Detected'");
+        // 15.7.15: every sync that raised NOT Detected announces its recovery exactly once
+        CHECK(countMsg(r, "Zero Flag re-acquired") == countMsg(r, "Zero Flag NOT Detected"),
+              "missed tab: %d 're-acquired' for %d 'NOT Detected'", countMsg(r, "Zero Flag re-acquired"), countMsg(r, "Zero Flag NOT Detected"));
+        printf("   alarms: NOT Detected %d, Late %d (once-per-revolution rule), re-acquired %d\n", countMsg(r, "Zero Flag NOT Detected"),
+               countMsg(r, "Late Zero Flag"), countMsg(r, "Zero Flag re-acquired"));
     }
     {
-        Scen s = base("late tab (0.60T, out of window) in revolution 3");          s.clean = false; s.lateTabRev = 3; s.lateG = 40; checkScenario(s);
-        Result r = run(s, true);
+        Scen s = base("late tab (0.68T, out of band) in revolution 3");            s.clean = false; s.lateTabRev = 3; s.lateG = 45; checkScenario(s);
+        Result r = run(s, V_NEW);
         CHECK(countMsg(r, "Zero Flag NOT Detected") >= 1, "late tab: tab was not rejected");
     }
     {
-        Scen s = base("early tab (0.15T, below window) in revolution 3");          s.clean = false; s.W = 6; s.W2 = 6; s.lateTabRev = 3; s.lateG = 10; checkScenario(s);
-        Result r = run(s, true);
+        Scen s = base("early tab (0.15T, below band) in revolution 3");            s.clean = false; s.W = 6; s.W2 = 6; s.lateTabRev = 3; s.lateG = 10; checkScenario(s);
+        Result r = run(s, V_NEW);
         CHECK(countMsg(r, "Zero Flag NOT Detected") >= 1, "early tab: tab was not rejected");
     }
     {
-        Scen s = base("spurious double pulse mid-revolution (Early Zero)");        s.clean = false; s.noiseRev = 3; s.noiseTrolley = 30; checkScenario(s);
-        Result r = run(s, true);
-        CHECK((int) r.zeroTicks[S_DS1].size() == zClean + 1, "spurious: zeros %zu vs clean %d", r.zeroTicks[S_DS1].size(), zClean);
-        CHECK(countMsg(r, "Early Zero Flag Detected") >= 1, "spurious: no 'Early Zero Flag Detected'");
+        // 15.7.15: the revolution gate (tabRun >= Rg) rejects a tab-like pulse mid-revolution;
+        // 15.7.13 took it as an Early zero and re-zeroed the counter half a chain early.
+        Scen s = base("spurious double pulse mid-revolution (rejected by the revolution gate)"); s.clean = false; s.noiseRev = 3; s.noiseTrolley = 30; checkScenario(s);
+        Result r = run(s, V_NEW), o = run(s, V_OLD);
+        CHECK((int) r.zeroTicks[S_DS1].size() == zClean, "spurious: zeros %zu vs clean %d", r.zeroTicks[S_DS1].size(), zClean);
+        CHECK(countMsg(r, "Early Zero Flag Detected") == 0, "spurious: NEW still raised 'Early Zero Flag Detected'");
+        CHECK(countMsg(o, "Early Zero Flag Detected") >= 1, "spurious: 15.7.13 did not take the false zero (harness blind?)");
+        printf("   15.7.13 Early-zero alarms %d, NEW %d (zeros NEW %zu = clean %d)\n",
+               countMsg(o, "Early Zero Flag Detected"), countMsg(r, "Early Zero Flag Detected"), r.zeroTicks[S_DS1].size(), zClean);
+    }
+    {
+        // ...but inside the gate margin (the last max(16, R/50) trolleys before the flag) a
+        // tab-like pulse is still taken: the Early-zero path and its duplicate-pass guard.
+        Scen s = base("spurious double pulse 5 trolleys before the flag (Early Zero)"); s.clean = false; s.noiseRev = 3; s.noiseTrolley = s.N - 5; checkScenario(s);
+        Result r = run(s, V_NEW);
+        CHECK(countMsg(r, "Early Zero Flag Detected") >= 1, "spurious in margin: no 'Early Zero Flag Detected'");
     }
     {
         Scen s = base("OpMode Raw over the body pulse, Run for the tab");          s.clean = false; s.rawBodyRev = 3; checkScenario(s);
         // The body pass did not run (Raw), so the tab must run it - exactly once, in both versions.
         for (int v = 0; v < 2; v++)
         {
-            Result r = run(s, v == 1);
+            Result r = run(s, v == 1 ? V_NEW : V_OLD);
             CHECK(!r.rawTicks.empty(), "raw window never applied");
             long tab = 0;
             for (size_t i = 0; i < r.zeroTicks[S_DS1].size(); i++) if (r.zeroTicks[S_DS1][i] > r.rawTicks.back()) { tab = r.zeroTicks[S_DS1][i]; break; }
@@ -683,6 +775,10 @@ int main()
     { Scen s = base("standard two-sensor, grading");                             s.mode = 0; s.clean = false; checkScenario(s); }
     { Scen s = base("standard two-sensor, SkipTrollies=1, gs2, dual");           s.mode = 0; s.skip = 1; s.gs2 = true; s.dual = true; s.clean = false; checkScenario(s); }
 
+#ifdef XC_REAL_ERRQ
+    errq_report();
+    CHECK(g_errq_bad == 0, "%ld runs: the host did not get every controller message", g_errq_bad);
+#endif
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

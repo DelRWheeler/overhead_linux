@@ -83,7 +83,7 @@
 
 #define APP_VER1         15 // Major
 #define APP_VER2         7  // Minor
-#define APP_VER3         14	// Local
+#define APP_VER3         17	// Local -- 15.7.17 = mainline merge: Pitman 15.7.16 (0750225) + 9da7827 batch-label slots
 
 #define CREATE_VER_STRING(string) \
     sprintf((char *)string, "GS-1000 RTOS Version %d.%d.%d %s ", \
@@ -222,6 +222,13 @@
 #define MAXDROPS            32
 #define MAXERRORS           39
 #define MAXERRMBUFSIZE      256
+// 15.7.16: controller -> host message queue (GenError -> SendError). Until 15.7.16 GenError kept
+// ONE slot pointing at the caller's buffer, so a second GenError before GpSendThread's next pass
+// (<= 50 ms) overwrote the first - two "Count corrected" in one scan reached the host as one, and a
+// burst of 8 as 2. GenError now copies sev + text into a ring of ERRQ_LEN entries (power of 2);
+// producers never wait (any thread, the 5 ms scan included); on overflow the OLDEST are dropped and
+// one "N controller messages dropped (queue full)" follows the survivors to the host.
+#define ERRQ_LEN            64
 #define MAXTRCIDHDRSIZE     16      // the length of buffer origin string
 #define MAXDATETIMESTR      48      // date/time strings
 #define MAXPENDANT          2000    // max number of pendants
@@ -272,6 +279,132 @@
 // noise blips are isolated) and far below any real speed change, which produces
 // hundreds of consecutive shorter gaps.
 #define SS_SHRINK_RUN                 4
+// Saturation for the per-sync "trolleys since the last accepted tab" counter (tabRun) and
+// the per-sync zero-flag alarm counter. Also the boot value of tabRun: "no tab seen yet",
+// so the first real tab after boot (or before the host has pushed Shackles) is accepted.
+#define SS_TAB_RUN_MAX                1000000
+// --- 15.7.15 single-sensor TAB RULE (SingleSensorTabRule). Everything is measured on the
+// line itself, so no per-plant tuning: G = the most recent trolley-to-trolley gap, G2 = the
+// gap before it (accepted tabs never update either). A count edge is the zero TAB only if
+//   (a) SS_TAB_BAND_LO_PERMIL*G <= 1000*delta <= SS_TAB_BAND_HI_PERMIL*G
+//       (the flag tab sits 0.20..0.65 of the measured trolley gap: covers every tab
+//       geometry 0.25..0.50 incl. 0.27 flags with jitter; Pitman ~0.42),
+//   (b) SS_GAP_AGREE_LO_PCT*G2 <= 100*G <= SS_GAP_AGREE_HI_PCT*G2
+//       (the two previous trolley gaps agree: the line is not accelerating), and
+//   (c) tabRun >= Rg, the revolution gate: R = Shackles*(SkipTrollies+1) trolleys per chain
+//       revolution, Rg = R - SS_GATE_MARGIN, never below SS_MIN_TROLLEYS_BETWEEN_TABS.
+//       Pitman: R=608 -> Rg=600. A false zero can only land in the last few trolleys before
+//       the real flag (and the exact-count check in ProcessSyncs/GradeSyncs alarms it).
+// BOOT CONFIRMATION (SS_BOOT_CONFIRM): until a sync's detector has accepted its first tab
+// since boot, (c) is replaced by "a SECOND tab-shaped edge arrives R+1 +/- SS_GATE_MARGIN
+// trolleys after an earlier one" (the first is counted as a trolley, hence +1). Every
+// tab-shaped edge is remembered by its trolley position (a bit ring of SS_BOOT_RING
+// positions per sync, no capacity limit), so noise before or between the real tabs cannot
+// block the confirmation. With noise present the first in-band edge after boot is otherwise
+// often a false one. SS_BOOT_RING must exceed R+1+SS_GATE_MARGIN (Shackles <= MAXPENDANT
+// 2000 at SkipTrollies <= 3); a longer chain is simply never boot-confirmed. TRADE-OFF: after every controller restart the first zero comes up to
+// ONE EXTRA REVOLUTION later (~14 min at turkey speed, ~5 min at chicken speed) and no drops
+// fire before the first zero. Set SS_BOOT_CONFIRM 0 to accept the first tab-shaped edge
+// after boot instead (the 15.7.14 start-up behaviour); nothing else changes.
+// The host-pushed ZeroTabWindowMinMs/MaxMs are no longer consulted (shm + wire unchanged).
+#define SS_TAB_BAND_LO_PERMIL         200
+#define SS_TAB_BAND_HI_PERMIL         650
+#define SS_GAP_AGREE_LO_PCT           70
+#define SS_GAP_AGREE_HI_PCT           143
+#define SS_GATE_MARGIN                8
+#define SS_BOOT_RING                  8192  // power of 2
+#ifndef SS_BOOT_CONFIRM
+#define SS_BOOT_CONFIRM               0     // 0 = OFF (default: first flag pass zeroes, as before), 1 = wait for a 2nd matching pass
+#endif
+
+// --- 15.7.16 single-sensor CROSS-SYNC COUNT CHECK (SingleSensorXC*, ZeroFlagMode == 1 only).
+// All count syncs (ProcessSyncs syncs, not grade syncs) sit on ONE chain, so once each has zeroed
+// the trolley offset between two of them, D = P_a - P_b, is fixed by the sensor spacing. P is a
+// sync's phase-accurate position since its last zero: P = T + frac, T = (shackleno-1)*(SkipTrollies+1)
+// + trolly_counters, frac = scan ticks since its last counted trolley edge / G (its measured gap),
+// clamped below 1. A miscount on one sync moves its offset to every other sync by a whole trolley.
+//
+// MEASURED AT PITMAN (scope captures 2026-10-05, offline, exact interpolation): D is NOT a scalar
+// constant - it varies with chain position by up to 0.42 trolley peak-to-peak around the
+// revolution (uneven pitch between sensors 145..249 trolleys apart), but repeats revolution to
+// revolution within sd 0.02 and across stops. So D is SEEDED at clean zeros (the spec) and then
+// TRACKED: at each steady edge its FRACTIONAL residual is folded in (gain 1/SS_XC_TRACK_GAIN); the
+// integer part is never touched, so a miscount can never be absorbed. Residual in steady running:
+// ~0.05 trolley, against a 1.0 trolley miscount.
+// Every miscount seen in those captures was +1 (a rollback at a stop re-passes a body: an extra
+// edge). Two of the six were TWO sensors at the same stop, where a symmetric 2-of-3 vote picks the
+// wrong sync. Hence: only a sync that is AHEAD is ever corrected (never a "lost" count), and a sync
+// whose count was anchored by its own zero since its last disturbance is never corrected.
+//   learn   : pair state 0 none -> 1 candidate (tracked) -> 2 armed. A sample is taken when a sync's
+//             accepted tab passes the exact-count check and the other sync's last zero did too (and
+//             it was not corrected since), both steady. The candidate is armed by the NEXT clean
+//             sample of either sync agreeing within SS_XC_CONFIRM_TOL_PERMIL. A non-exact zero,
+//             an overrun or a correction of either sync discards a candidate; a clean sample whose
+//             fractional residual vs an armed D exceeds SS_XC_RELEARN_TOL_PERMIL disarms the pair.
+//   steady  : a sync is steady after SS_XC_STEADY_GAPS consecutive trolley gaps each within
+//             SS_XC_GAP_LO..HI_PCT of the previous one, while its open gap stays <= SS_XC_OPEN_GAP_PCT
+//             % of G. Nothing is checked, learned or tracked unless every sync in the vote is steady.
+//             TIGHTER THAN THE IDEA (70..143%, stopped at an open gap > 2 x G), from the data: a
+//             sync's phase estimate is stale by up to |1 - speed ratio| x frac, so within 70..143%
+//             two syncs can read up to ~0.5 trolley off (synthetic 7<->71 SPM steps), and at
+//             Pitman the chain decelerating into a stop left two syncs at 1.5 / 1.9 x G - a pair
+//             read 0 where the truth was +1. 99.4% of Pitman's in-band gap ratios are within 15%
+//             (all the others are stops / restarts), so +/-15% costs only a trolley after a restart.
+//   vote    : the largest set of zeroed syncs whose pairs are all armed. e = P_a - P_b - D, wrapped
+//             to +/-R/2; a pair is "integer" when |e - round(e)| < SS_XC_K_TOL_PERMIL.
+//   one-step: a disagreement is acted on only if it arose in ONE step from every pair reading 0,
+//             and its level pattern has since changed only by our own corrections or by a sync's
+//             own zero (its new level is the physical flag's). Anything else - e.g. two lost counts
+//             on two syncs at different times, which leaves the one good sync looking "ahead" - is
+//             alarm only until every pair reads 0 again. The line-state bookkeeping (all at 0, the
+//             pattern) only takes a reading the next steady check confirms: a sync rolled back onto
+//             the previous body at the start of a stop counts it at a normal-looking moment, and
+//             that one reading is garbage.
+//   correct : sync i by -1 trolley when every pair in the vote is integer, the vote has >=
+//             SS_XC_MIN_SYNCS syncs, i is not anchored, the disagreement is one-step, the same
+//             verdict holds on SS_XC_HYST_EDGES consecutive counted edges of i, at an edge where the
+//             corrected count lands on a shackle trolley (tc 0), and EITHER
+//             (P1) i is +1 against every other sync and they agree with each other (0) - any time;
+//             (P2) after a LINE STOP - every vote sync saw a gap over SS_XC_LINESTOP_PCT % of its last
+//                  steady gap - that began with every pair at 0 and saw no zero or overrun: the vote
+//                  splits into two levels a whole trolley apart, i is in the upper level and no
+//                  upper-level sync is anchored (a stopped chain rolling back can only ADD counts, so
+//                  the lower level is right - two sensors re-counting at one stop, as at Pitman).
+//             The pass for the count it lands on already ran (one trolley early): ProcessSyncs skips
+//             this edge's drop / missed-bird pass; the scale re-weighs (SkipTrollies >= 1) or skips
+//             its pass too (SkipTrollies 0, where the early weighment has completed).
+//   never   : a sync BEHIND (a lost count, or the overrun reset's -1/-2 after a rejected tab) and a
+//             common-mode error (every sync re-counted at one stop) are not corrected; the zeros
+//             realign them as before. A 2-sync line alarms only.
+//   alarm   : "Count disagreement: <a> vs <b> by <k> trolley" when an integer offset k != 0
+//             (|k| <= SS_XC_MAX_K) persists SS_XC_ALARM_EDGES counted edges of <a> without a
+//             correction - at most once per revolution per pair. Every correction raises
+//             "Count corrected: <sync> -1 trolley (cross-check with <others>)" (never rate-limited).
+//   arming  : from boot about 2.4 clean revolutions after the first zero (each pair needs two
+//             clean zeros), and only revolutions whose zeros come out exact count.
+// Standard mode (ZeroFlagMode != 1) never runs any of this. SS_CROSSCHECK 0 removes it entirely.
+// Proof: linux_port/tools/sszero_crosscheck_test.sh (real Pitman captures + synthetic chains).
+#ifndef SS_CROSSCHECK
+#define SS_CROSSCHECK                 1
+#endif
+#define SS_XC_K_TOL_PERMIL            300   // |e - k| < 0.30 trolley: e is the integer k
+#define SS_XC_AGREE_TOL_PERMIL        350   // |e| < 0.35: two syncs agree (only used through K_TOL < AGREE_TOL)
+#define SS_XC_STEADY_GAPS             3     // normal gaps after a disturbance before a sync is steady
+#define SS_XC_GAP_LO_PCT              87    // a normal trolley gap: 87..115% of the previous one
+#define SS_XC_GAP_HI_PCT              115
+#define SS_XC_OPEN_GAP_PCT            115   // open gap > 115% of G: the sync is slowing / stopped
+#define SS_XC_HYST_EDGES              2     // same verdict on 2 consecutive counted edges of the sync
+#define SS_XC_MIN_SYNCS               3     // syncs in the vote needed to CORRECT (2 = alarm only)
+#define SS_XC_CONFIRM_TOL_PERMIL      150   // candidate armed when the next clean sample agrees within 0.15
+#define SS_XC_RELEARN_TOL_PERMIL      300   // armed pair disarmed if a clean sample is off by >= 0.30 (fractional)
+#define SS_XC_TRACK_TOL_PERMIL        200   // only fractional residuals < 0.20 are tracked
+#define SS_XC_TRACK_GAP_PCT           10    // ...and only while both syncs' last two gaps agree within 10%
+#define SS_XC_TRACK_GAIN              16    // D += residual / 16 per tracked edge
+#define SS_XC_ALARM_EDGES             8     // a disagreement must persist 8 counted edges before the alarm
+#define SS_XC_DIST_EVALS              48    // a line-stop window left unresolved for 48 steady checks is closed
+#define SS_XC_LINESTOP_PCT            350   // a gap over 3.5 x the sync's last steady gap = the chain stopped
+                                            // (a missing body is 2 x, two 3 x; real Pitman stops 4.3..8 x and more)
+#define SS_XC_MAX_K                   3     // disagreements larger than this are left to the zero alarms
 
 #define CAPTURE_SPEED       3
 #define SAMPLE_WEIGHTS      1000

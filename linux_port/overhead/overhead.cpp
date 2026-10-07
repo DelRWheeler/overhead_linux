@@ -1867,6 +1867,10 @@ void overhead::InitLocals()
     app->sendBlockGranted        = false;
     app->configGroupCheck        = false;
     app->send_error.send         = false;
+    memset(app->errq, 0, sizeof(app->errq));   // 15.7.16: controller -> host message queue empty
+    app->errq_head               = 0;
+    app->errq_tail               = 0;
+    app->errq_dropped            = 0;
     app->saveTotals              = false;
     app->saveDrpRecs             = false;
     app->drp_rec_count           = 0;
@@ -1897,7 +1901,6 @@ void overhead::InitLocals()
 
     // Single-sensor zero-flag detector timebase (ZeroFlagMode==1 only)
     ss_scan_tick = 0;
-    ss_last_warn_tick = -100000;  // allow the first warning immediately
 
     // Sensor Scope capture off until the host enables it
     syncCapMode = 0;
@@ -1914,18 +1917,47 @@ void overhead::InitLocals()
         ss_last_trolley_tick[i] = 0;
         ss_trolley_interval[i]  = 0;
         ss_trolley_stall[i]     = 0;
-        ss_tab_run[i]           = SS_MIN_TROLLEYS_BETWEEN_TABS;  // allow the FIRST tab through
+        ss_tab_run[i]           = 0;       // 15.7.15: trolleys since boot (boot confirmation decides
+                                           // the first tab; see SingleSensorIsZeroTab)
         ss_trolley_shrink[i]    = 0;
         ss_ovr_pass[i]          = false;   // 15.7.14: single-sensor duplicate-pass guard
+        memset(&ss_rule[i], 0, sizeof(ss_rule[i]));   // 15.7.15: no gaps measured, not confirmed
+        ss_alarm_cnt[i]         = 0;       // 15.7.15: no zero-flag alarm until a revolution is counted
+        ss_zero_lost[i]         = false;   // 15.7.15
+        ss_xc_steady[i]         = 0;       // 15.7.16: cross-sync count check - nothing learned
+        ss_xc_refgap[i]         = 0;
+        ss_xc_clean[i]          = false;
+        ss_xc_anchor[i]         = false;
+        ss_xc_edges[i]          = 0;
+        ss_xc_vcnt[i]           = 0;
     }
+    memset(ss_xc_pair, 0, sizeof(ss_xc_pair));   // 15.7.16
+    ss_xc_line_ok     = false;
+    ss_xc_dist_open   = false;
+    ss_xc_dist_pre_ok = false;
+    ss_xc_dist_zero   = false;
+    ss_xc_dist_evals  = 0;
+    ss_xc_dist_mask   = 0;
+    ss_xc_ok_before   = false;
+    ss_xc_pat_valid   = false;
+    ss_xc_pat_vmask   = 0;
+    ss_xc_pat_rezero  = 0;
+    memset(ss_xc_pat_lev, 0, sizeof(ss_xc_pat_lev));
+    ss_xc_prev_valid  = false;
+    ss_xc_prev_int    = false;
+    ss_xc_prev_vmask  = 0;
+    memset(ss_xc_prev_lev, 0, sizeof(ss_xc_prev_lev));
     for (i = 0; i < MAXGRADESYNCS; i++)
     {
         ss_grade_last_trolley_tick[i] = 0;
         ss_grade_trolley_interval[i]  = 0;
         ss_grade_trolley_stall[i]     = 0;
-        ss_grade_tab_run[i]           = SS_MIN_TROLLEYS_BETWEEN_TABS;
+        ss_grade_tab_run[i]           = 0;       // 15.7.15 (see above)
         ss_grade_trolley_shrink[i]    = 0;
         ss_grade_ovr_pass[i]          = false;   // 15.7.14
+        memset(&ss_grade_rule[i], 0, sizeof(ss_grade_rule[i]));   // 15.7.15
+        ss_grade_alarm_cnt[i]         = 0;       // 15.7.15
+        ss_grade_zero_lost[i]         = false;   // 15.7.15
     }
 
     for (i = 0; i < MAXGRADESYNCS; i++)
@@ -3843,11 +3875,9 @@ void __stdcall overhead::GpSendThread(PVOID unused)
 
 //----- Check to see if there are any error messages to send
 
-        if (HOST_OK && app->send_error.send)
-        {
+        // 15.7.16: drain the whole queue (every message, in order), not one slot
+        if (HOST_OK && app->ErrQueuePending())
             app->SendError();
-            app->send_error.send = false;
-        }
 
 //----- Check to see if there are any needed settings
 
@@ -6236,38 +6266,44 @@ void overhead::DecCntrlCtrs()
 // Single-sensor zero-flag detector (ZeroFlagMode==1). Competitor controllers we
 // are replacing (CA/Trinidad) use ONE sensor per sync; the zero marker is a
 // sheet-metal tab that makes the count sensor read a DOUBLE pulse:
-//   trolley block --(~0.4*T gap)--> tab block.
-// Trolleys are on 6" centers (interval T); the tab's rising edge lands ~2.5"
-// later (~40% of T). So a confirmed count edge that arrives well inside one
-// trolley interval is the TAB (= shackle zero); otherwise it is a real trolley.
+//   flag trolley body --(~0.25..0.5 of a trolley pitch)--> tab.
+// So a confirmed count edge that arrives well inside one trolley gap is the TAB
+// (= shackle zero); otherwise it is a real trolley.
 //
-// Called exactly once per confirmed count edge for the sync. Self-calibrating:
-// it learns T from real trolley-to-trolley intervals (EMA) and scales with line
-// speed and trolley width, so no scope trace / fixed timing is needed. The tab
-// does NOT advance the trolley timebase, so the trolley after the tab still
-// measures a full T. Returns true = this edge is the zero tab, false = trolley.
+// Called exactly once per confirmed count edge for the sync. Returns true = this
+// edge is the zero tab, false = trolley. The tab does NOT advance the trolley
+// timebase, so the trolley after the tab still measures a full gap.
+//
+// 15.7.15 - MEASURED GAP, NOT A GUESSED WINDOW. The decision is SingleSensorTabRule()
+// (below), fed with the line's own most recent trolley gaps G and G2. Until 15.7.14 it
+// was "0.18..0.50 x the slow EMA interval, AND inside the host's ms rails". Two faults:
+//  - the ms rail (Pitman ZeroTabWindowMaxMs = 375) rejected the genuine tab whenever the
+//    line ran slower than ~33.6 SPM (tab = 0.42 x 30000/SPM ms), so a turkey line running
+//    slow lost its zero every revolution: counter drift, drops on the wrong trolleys;
+//  - the EMA lags a speed change by several trolleys, which is what produced the July
+//    stale-T runaway (ordinary trolleys landing inside a too-large window).
+// The ms rails (ZeroTabWindowMinMs/MaxMs) are therefore NO LONGER CONSULTED. The shm
+// fields and the host push stay as they are (struct layout and wire unchanged); the
+// controller simply ignores the values.
+//
+// UNCHANGED from 15.7.14: the EMA `interval` and its oversized-gap stall re-seed and
+// undersized-gap shrink re-seed (they keep `interval` sane for the stall test), and the
+// return / timebase semantics. Bookkeeping added (SSTabRuleState): G/G2 advance at every
+// timebase advance; `tabRun` now counts EVERY trolley-classified edge (it used to skip
+// the oversized-gap edges, and a rejected in-window edge reset it to 0) so the revolution
+// gate sees the true number of trolleys since the last tab; boot confirmation
+// (SS_BOOT_CONFIRM) decides the first tab after boot.
 //--------------------------------------------------------
 
-bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval, int &stall, int &tabRun, int &shrink)
+bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval, int &stall, int &tabRun, int &shrink,
+                                     SSTabRuleState &rs)
 {
-    // App_Timer_Main (and thus ss_scan_tick) runs every 5 ms; convert the
-    // host-configured ms tab window to scan ticks. Defaults apply until the host
-    // pushes values (0) so the feature still works on first connect.
-    const __int64 SCAN_MS = 5;
-    // Defaults are deliberately WIDE: since the geometric 0.18-0.40*T test below is
-    // now the real discriminator, these are only coarse rails. A tight default max
-    // (was 250 ms) silently blocks every zero on a slow-running line -- at 14 SPM
-    // the genuine tab gap is ~580 ms, so 250 ms threw away a perfectly good flag.
-    int minMs = (pShm->ZeroTabWindowMinMs > 0) ? pShm->ZeroTabWindowMinMs : 20;
-    int maxMs = (pShm->ZeroTabWindowMaxMs > 0) ? pShm->ZeroTabWindowMaxMs : 3000;
-    __int64 minTicks = minMs / SCAN_MS;
-    __int64 maxTicks = maxMs / SCAN_MS;
-
-    __int64 now = ss_scan_tick;
+    __int64 now = ss_scan_tick;          // App_Timer_Main: one tick per 5 ms scan
 
     if (lastTrolleyTick == 0)            // very first edge: start the timebase
     {
         lastTrolleyTick = now;
+        SingleSensorTrolleyEdge(tabRun, rs);
         return false;                    // can't classify yet -> trolley
     }
 
@@ -6275,8 +6311,11 @@ bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval
 
     if (interval <= 0)                   // second edge: seed the running interval
     {
-        interval = delta;
+        interval        = delta;
+        rs.gapPrev      = rs.gap;
+        rs.gap          = delta;
         lastTrolleyTick = now;
+        SingleSensorTrolleyEdge(tabRun, rs);
         return false;                    // -> trolley
     }
 
@@ -6284,89 +6323,52 @@ bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval
     {
         // A real line stop is a one-off big gap, then normal trolleys resume. But if
         // oversized gaps PERSIST, the learned T has been corrupted SMALL (a bad seed
-        // from a stop/start), so every real trolley now reads as "stopped", T never
-        // grows, and the zero tab can NEVER fire -> the line silently stops zeroing
-        // until a power cycle. Self-heal: after a few consecutive oversized gaps,
-        // re-seed T from the actual trolley interval so detection recovers on its own.
+        // from a stop/start), so every real trolley now reads as "stopped" and T never
+        // grows. Self-heal: after a few consecutive oversized gaps, re-seed T from the
+        // actual trolley interval. (15.7.15: the tab rule uses the measured gaps G/G2, not
+        // this EMA; its gap-agreement test (b) keeps the trolleys right after a stop from
+        // qualifying a tab.)
         if (++stall >= 4)
         {
             interval = delta;            // adopt the real trolley gap as the new T
             stall = 0;
         }
-        shrink = 0;                      // 15.7.12: oversized run breaks any undersized run
+        shrink          = 0;             // 15.7.12: oversized run breaks any undersized run
+        rs.gapPrev      = rs.gap;        // 15.7.15
+        rs.gap          = delta;
         lastTrolleyTick = now;
+        SingleSensorTrolleyEdge(tabRun, rs);   // 15.7.15: a trolley all the same
         return false;                    // -> trolley (do not pollute the EMA)
     }
     stall = 0;                           // a normally-spaced edge arrived: not stalled
 
-    // TAB if the gap is a sane FRACTION of the learned trolley interval, and also
-    // inside the configured ms rails.
-    //
-    // The fraction test is the one that decides, because the tab's position is
-    // GEOMETRY and therefore speed-independent: the flag is a fixed distance of
-    // travel (Pitman = 5/8" block + 1" notch = 1.625") against fixed 6" trolley
-    // centers, i.e. always ~0.27*T no matter how fast the chain runs.
-    //
-    // An absolute ms window CANNOT do this job. Measured at Pitman: at 14 SPM the
-    // trolley interval T is ~2140 ms and the real tab gap ~580 ms; at 50 SPM the
-    // same flag gives T ~600 ms and a tab gap of ~162 ms. Any fixed ms bracket wide
-    // enough to catch the tab at production speed is, at crawl speed, wider than
-    // half a trolley -- so it stops constraining anything and ordinary gaps start
-    // reading as zeros (observed: a false zero at shackle 11 of 1189). Conversely a
-    // bracket tight enough for crawl speed misses the tab entirely once the line
-    // speeds up. The ms values stay as coarse outer rails only.
-    __int64 relMin = interval * 18 / 100;   // 0.18*T
-    __int64 relMax = interval * 50 / 100;   // 0.50*T -- the SPEC puts the tab at ~0.40*T
-                                            // (2.5" after the trolley on 6" centers), so an
-                                            // 0.40 ceiling sat exactly on a correct flag and
-                                            // would reject it. Pitman's flag is ~0.27*T.
-
-    if (delta >= relMin  && delta <= relMax  &&
-        delta >= minTicks && delta <= maxTicks &&
-        delta * 2 < interval)
+    // 15.7.15 tab decision. Steady state (a tab already accepted since boot): the full rule,
+    // revolution gate included. Boot: the gate is replaced by boot confirmation - a tab-shaped
+    // edge is accepted only one revolution after an earlier tab-shaped edge, otherwise it is
+    // remembered as a candidate and counted as a trolley (nothing drops before the first zero).
+    // (SS_BOOT_CONFIRM 0: the first tab-shaped edge after boot is accepted outright.)
+    if (SingleSensorTabRule(delta, rs.gap, rs.gapPrev, tabRun, rs.confirmed ? SingleSensorRevGate() : 0))
     {
-        // PHYSICAL INVARIANT: the zero tab occurs ONCE PER CHAIN REVOLUTION -- hundreds of
-        // trolleys apart (Pitman: 304 shackles x2 trolleys = ~608). So a "tab" arriving only
-        // a few trolleys after the last one CANNOT be the flag: it means the learned T is
-        // STALE-LARGE (the line sped up, or T was seeded while crawling) and ordinary
-        // trolleys are now landing inside the window. Left unguarded this latches and every
-        // trolley reads as a zero; the EMA below cannot rescue it because it only folds in
-        // gaps >= 0.7*T, so T can grow but never shrink.
-        //
-        // NOTE a "two in a row" test is NOT enough -- it just rejects every second edge and
-        // you still get a false zero on every shackle (observed at Pitman 2026-07-25).
-        // Require a real run of trolleys since the last tab. SS_MIN_TROLLEYS_BETWEEN_TABS is
-        // far below any real chain (shortest plausible is ~100 trolleys) and far above the
-        // runaway, so it can never reject a genuine flag.
-        if (tabRun < SS_MIN_TROLLEYS_BETWEEN_TABS)
+        if (rs.confirmed || !SS_BOOT_CONFIRM || SingleSensorBootConfirm(rs))
         {
-            // 15.7.12: this used to do `interval = delta` outright, letting ONE short
-            // gap redefine T. A single tab edge or noise blip could therefore throw the
-            // timebase to ~0.4*T and force a multi-edge recovery. Require the same
-            // consecutive run the trolley path below now requires: if trolleys really
-            // are landing in the tab window (the stale-LARGE case this guard exists
-            // for), they arrive in a continuous run and T is adopted after SS_SHRINK_RUN
-            // of them -- same recovery, but no single observation can move T.
-            if (++shrink >= SS_SHRINK_RUN)
-            {
-                interval = delta;        // sustained run: adopt the real trolley gap
-                shrink   = 0;
-            }
-            tabRun          = 0;
-            lastTrolleyTick = now;
-            return false;                // -> trolley
+            rs.confirmed = true;         // from now on: the revolution gate
+            rs.haveCand  = false;
+            tabRun       = 0;            // accepted: restart the trolley run
+            shrink       = 0;
+            return true;                 // ZERO; keep timebase and G/G2 (don't advance)
         }
-        tabRun = 0;                      // accepted: restart the trolley run
-        shrink = 0;
-        return true;                     // ZERO; keep timebase (don't advance)
+        // boot: remember this candidate by its trolley position
+        rs.cand[(rs.bootPos % SS_BOOT_RING) >> 3] |= (unsigned char) (1u << (rs.bootPos & 7));
+        rs.haveCand = true;
+        rs.lastCand = rs.bootPos;
     }
 
-    if (tabRun < 1000000) tabRun++;      // count trolleys since the last accepted tab
+    SingleSensorTrolleyEdge(tabRun, rs);     // count trolleys since the last accepted tab
 
     // Normal trolley. Advance the timebase, but only fold delta into the running
     // interval if it is a PLAUSIBLE full-trolley gap (>= 0.7*T). This stops a
-    // misclassified tab (short gap) or noise from corrupting T and death-spiralling
-    // the window check. Outliers advance the timebase without polluting the EMA.
+    // misclassified tab (short gap) or noise from corrupting T. Outliers advance the
+    // timebase without polluting the EMA.
     if (delta * 10 >= interval * 7)
     {
         interval = (interval * 3 + delta) / 4;
@@ -6376,50 +6378,617 @@ bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval
     {
         // --- 15.7.12: SYMMETRIC DOWNWARD SELF-HEAL -------------------------------
         // The EMA above folds a gap ONLY when it is >= 0.7*T, and the stall re-seed
-        // above fires ONLY above 3*T. So before this, T could GROW but never SHRINK:
-        // once T was latched stale-large every real trolley gap was simultaneously
-        // too small to fold (< 0.7*T) and too small to stall (< 3*T), and the real
-        // tab then fell BELOW relMin (0.18*T) and was counted as a trolley forever.
-        // That is a PERMANENT lockout -- the sync never zeroes again until the
-        // controller restarts. Measured at Pitman 2026-07-26: both drop syncs dead
-        // for 4+ hours ("Zero Flag NOT Detected ... shackle 306 expected 304" every
-        // revolution) while Scale 1, whose T happened not to latch, ran clean. The
-        // trigger is a line stop/start ramp: the stall re-seed above adopts a
-        // crawl-speed gap, and nothing could ever bring T back down.
-        //
-        // This is the exact mirror of that stall re-seed. SS_SHRINK_RUN consecutive
-        // undersized gaps -- a real speed-up gives hundreds -- adopt the new T. An
-        // ISOLATED short gap cannot: the zero tab is one short gap per revolution
-        // and noise blips are isolated, and any full-size gap resets the run above.
-        // Recovery is bounded at SS_SHRINK_RUN trolleys (~1.7 s at 70 SPM) no matter
-        // how badly T was latched -- verified in simulation against the real captured
-        // edge streams from all three Pitman heads at 2.35x .. 14x stale.
+        // above fires ONLY above 3*T, so without this T could GROW but never SHRINK
+        // (Pitman 2026-07-26: both drop syncs dead for 4+ hours after a stop/start
+        // ramp). SS_SHRINK_RUN consecutive undersized gaps -- a real speed-up gives
+        // hundreds -- adopt the new T. An ISOLATED short gap (the zero tab, a noise
+        // blip, a tab the rule rejected) cannot: any full-size gap resets the run.
         if (++shrink >= SS_SHRINK_RUN)
         {
             interval = delta;
             shrink   = 0;
         }
     }
+    rs.gapPrev      = rs.gap;            // 15.7.15: measured-gap history for the tab rule
+    rs.gap          = delta;
     lastTrolleyTick = now;
     return false;
 }
 
 //--------------------------------------------------------
-//  SingleSensorWarnOk
+//  SingleSensorTabRule  (15.7.15)
 //
-// Throttle for the "Zero Flag NOT Detected" warning in single-sensor mode. The
-// tab timing can be imperfect during tuning, and an unthrottled per-sync warning
-// floods the host UI (it overran memory and crashed the browser during bring-up).
-// Standard mode is unchanged (always returns true). Single-sensor allows at most
-// one send per ~30 s across all syncs; the safety RESET still happens every time.
+// THE tab decision, isolated so the rule and its constants (overheadconst.h,
+// SS_TAB_BAND_* / SS_GAP_AGREE_* / SS_GATE_MARGIN) can be audited and retuned on
+// their own. Pure: no state is read or written here.
+//   delta   = scan ticks since the last trolley-classified edge
+//   gap     = G,  the most recent trolley-to-trolley gap (ticks)
+//   gapPrev = G2, the trolley gap before G
+//   tabRun  = trolley-classified edges since the last accepted tab
+//   revGate = Rg (SingleSensorRevGate); 0 while boot confirmation decides instead
+// TAB only if ALL of:
+//   (a) the edge sits 0.20..0.65 of the measured trolley gap after the last trolley;
+//   (b) G and G2 agree within 0.70..1.43 (the line is not accelerating, so G is a
+//       trustworthy measure of the current pitch - this replaces the lagging EMA);
+//   (c) at least Rg trolleys have passed since the last accepted tab (the flag comes
+//       once per chain revolution).
 //--------------------------------------------------------
-bool overhead::SingleSensorWarnOk()
+bool overhead::SingleSensorTabRule(__int64 delta, __int64 gap, __int64 gapPrev, int tabRun, int revGate)
+{
+    if (gap <= 0 || gapPrev <= 0)
+        return false;                                            // no two measured trolley gaps yet
+    if (delta * 1000 < gap * SS_TAB_BAND_LO_PERMIL ||
+        delta * 1000 > gap * SS_TAB_BAND_HI_PERMIL)
+        return false;                                            // (a)
+    if (gap * 100 < gapPrev * SS_GAP_AGREE_LO_PCT ||
+        gap * 100 > gapPrev * SS_GAP_AGREE_HI_PCT)
+        return false;                                            // (b)
+    if (tabRun < revGate)
+        return false;                                            // (c)
+    return true;
+}
+
+//--------------------------------------------------------
+//  SingleSensorRevTrolleys / SingleSensorRevGate  (15.7.15)
+//
+// R  = Shackles * (SkipTrollies+1), the trolleys per chain revolution (the same
+//      sys_set fields ProcessSyncs counts with). Read live, so a Shackles /
+//      SkipTrollies change takes effect on the next edge; tabRun is a plain trolley
+//      count and needs no adjusting. Negative settings are treated as 0.
+// Rg = R - SS_GATE_MARGIN, the trolleys that must pass between two accepted tabs,
+//      never below SS_MIN_TROLLEYS_BETWEEN_TABS (R small or 0, e.g. before the host has
+//      pushed Shackles, falls back to that floor).
+//--------------------------------------------------------
+int overhead::SingleSensorRevTrolleys()
+{
+    long long shk  = pShm->sys_set.Shackles;
+    long long skip = pShm->sys_set.SkipTrollies;
+    if (shk  < 0) shk  = 0;
+    if (skip < 0) skip = 0;
+    long long R = shk * (skip + 1);
+    if (R > SS_TAB_RUN_MAX) R = SS_TAB_RUN_MAX;
+    return (int) R;
+}
+
+int overhead::SingleSensorRevGate()
+{
+    int gate = SingleSensorRevTrolleys() - SS_GATE_MARGIN;
+    if (gate < SS_MIN_TROLLEYS_BETWEEN_TABS)
+        gate = SS_MIN_TROLLEYS_BETWEEN_TABS;
+    return gate;
+}
+
+//--------------------------------------------------------
+//  SingleSensorBootConfirm  (15.7.15, SS_BOOT_CONFIRM)
+//
+// Boot only: true when a tab-shaped edge was seen exactly one chain revolution ago -
+// R+1 trolleys (that earlier edge was itself counted as a trolley), within
+// +/- SS_GATE_MARGIN. Never confirms while R is too small to tell a revolution from
+// the margin (settings not pushed yet), or too large for the ring.
+//--------------------------------------------------------
+bool overhead::SingleSensorBootConfirm(SSTabRuleState &rs)
+{
+    int R = SingleSensorRevTrolleys();
+    if (R <= 2 * SS_GATE_MARGIN || R + 1 + SS_GATE_MARGIN >= SS_BOOT_RING)
+        return false;
+    for (int d = -SS_GATE_MARGIN; d <= SS_GATE_MARGIN; d++)
+    {
+        unsigned int p = (rs.bootPos - (unsigned int) (R + 1) + (unsigned int) d) % SS_BOOT_RING;
+        if (rs.cand[p >> 3] & (1u << (p & 7)))
+            return true;
+    }
+    return false;
+}
+
+//--------------------------------------------------------
+//  SingleSensorBootPending  (15.7.15, SS_BOOT_CONFIRM)
+//
+// True while boot confirmation is waiting for the second flag: not yet confirmed, and a
+// tab-shaped edge was seen within the last revolution + margin. The count necessarily
+// overruns once in that wait; SingleSensorAlarmOk does not raise it as a missing zero.
+//--------------------------------------------------------
+bool overhead::SingleSensorBootPending(const SSTabRuleState &rs)
+{
+    if (!SS_BOOT_CONFIRM || rs.confirmed || !rs.haveCand)
+        return false;
+    return (rs.bootPos - rs.lastCand) <= (unsigned int) (SingleSensorRevTrolleys() + 1 + SS_GATE_MARGIN);
+}
+
+//--------------------------------------------------------
+//  SingleSensorTrolleyEdge  (15.7.15)
+//
+// Bookkeeping for every edge classified as a TROLLEY: count it in tabRun (trolleys since
+// the last accepted tab, or since boot); before the first zero also advance the boot
+// position and clear the ring slot it enters (that slot last held a position a whole
+// ring ago), so every set bit is a tab-shaped edge from the last SS_BOOT_RING trolleys.
+//--------------------------------------------------------
+void overhead::SingleSensorTrolleyEdge(int &tabRun, SSTabRuleState &rs)
+{
+    if (tabRun < SS_TAB_RUN_MAX) tabRun++;
+    if (!rs.confirmed)
+    {
+        rs.bootPos++;
+        unsigned int p = rs.bootPos % SS_BOOT_RING;
+        rs.cand[p >> 3] &= (unsigned char) ~(1u << (p & 7));
+    }
+}
+
+//--------------------------------------------------------
+//  SingleSensorAlarmTick / SingleSensorAlarmOk  (15.7.15)
+//
+// The owner's zero-flag alarm rule, single-sensor mode only, PER SYNC (each drop /
+// scale sync and each grade sync has its own counter):
+//   "when the line is first powered up there should be no alarm until the shackle
+//    count reaches the preset shackle count then alarm once until that count is hit
+//    again. and continue in that manner. Once the line has seen the zero then the
+//    same rule applies. If the zero is missed use the same zero rules as exists today."
+// cnt = this sync's shackle counts since its last zero-flag alarm (since boot at first).
+// SingleSensorAlarmTick is called wherever the sync's count advances; zeros and the
+// missed-zero overrun reset do NOT reset cnt. SingleSensorAlarmOk gates "Zero Flag NOT
+// Detected", "Early Zero Flag Detected", "Late Zero Flag Detected" and "Zero Flag position
+// mismatch": it allows one only once cnt has reached Shackles+1 (the single-sensor
+// revolution: the flag trolley's body pulse is counted before its tab) and then restarts
+// cnt. So: nothing until a revolution has been counted after boot, then at most one
+// zero-flag alarm per revolution of that sync's count, whether the zero is missing,
+// early, late or misplaced - a false-zero runaway can no longer flood the host. The
+// counting itself (overrun -> shackleno 1, true count keeps running, the next zero ->
+// Late / Early, then reset) is untouched; only the message is gated. "Initial Zero Flag
+// Detected" (informational) is not gated.
+// Boot confirmation (SS_BOOT_CONFIRM) needs a SECOND flag before the first zero, so the
+// count always overruns once on the way: while a first flag is waiting for its
+// confirmation (SingleSensorBootPending) the threshold is two revolutions (2*(Shackles+1)+1).
+// A start-up with a working flag raises no alarm; a start-up with no flag at all alarms
+// after the first revolution as usual.
+// Replaces SingleSensorWarnOk (<= 1 send per 30 s GLOBAL across all syncs, which
+// swallowed one sync's alarm whenever another sync had alarmed in the last 30 s).
+// Standard mode (ZeroFlagMode != 1): no counting, every alarm sent, exactly as before.
+//--------------------------------------------------------
+void overhead::SingleSensorAlarmTick(int &cnt)
+{
+    if (pShm->ZeroFlagMode == 1 && cnt < SS_TAB_RUN_MAX)
+        cnt++;
+}
+
+bool overhead::SingleSensorAlarmOk(int &cnt, const SSTabRuleState &rs)
 {
     if (pShm->ZeroFlagMode != 1)
         return true;                        // standard mode: byte-for-byte unchanged
-    if (ss_scan_tick - ss_last_warn_tick < 6000)   // 6000 scans * 5 ms = 30 s
+    int rev = pShm->sys_set.Shackles + 1;   // a single-sensor revolution of counts
+    if (SingleSensorBootPending(rs))
+        rev = 2 * rev + 1;                  // boot: the confirmation overrun is expected
+    if (cnt < rev)
         return false;
-    ss_last_warn_tick = ss_scan_tick;
+    cnt = 0;
+    return true;
+}
+
+//--------------------------------------------------------
+//  SingleSensorXC*  (15.7.16, SS_CROSSCHECK) - cross-sync count check, single-sensor only
+//
+// Owner (2026-10-06): "once the initial zero happens we should never allow the line to run a
+// full revolution with the wrong shackle count." Until 15.7.15 a sync's count was corrected
+// only at its next zero flag. All count syncs sit on one chain, so their positions agree with
+// each other through a learned offset; a miscount moves one sync a whole trolley against the
+// others and is corrected within a few trolleys. Rules and constants: overheadconst.h
+// (SS_XC_*). Pairs [a][b], a < b, hold the tracked offset d = P_a - P_b.
+//
+// PITMAN CAPTURES 2026-10-05 drove three choices the bare idea does not have:
+//  - the offset is a function of chain position (+/-0.2 trolley, uneven pitch), repeatable to
+//    sd 0.02, so it is tracked (fractional part only) instead of being a constant;
+//  - every miscount was an EXTRA count (a rollback at a stop re-passes a body; any pass of a
+//    body in either direction is an edge), so a sync is only ever corrected DOWN;
+//  - two of six were two sensors at one stop, so after a line stop the lower of two levels is
+//    taken as right (P2) - a 2-of-3 vote would have moved the one good sync.
+// Nothing here runs in standard mode (ZeroFlagMode != 1); every caller is gated on it.
+//--------------------------------------------------------
+static inline double ssxc_abs(double x)   { return x < 0 ? -x : x; }
+static inline int    ssxc_round(double x) { return x >= 0 ? (int) (x + 0.5) : -(int) (-x + 0.5); }
+
+// wrap to (-R/2, R/2], R = trolleys per chain revolution
+double overhead::SingleSensorXCWrap(double x)
+{
+    double R = (double) SingleSensorRevTrolleys();
+    if (R < 2)
+        return x;
+    for (int n = 0; n < 8 && x > R / 2; n++)   x -= R;
+    for (int n = 0; n < 8 && x <= -R / 2; n++) x += R;
+    return x;
+}
+
+// P_i: trolleys since sync i's last zero, phase-accurate. T counts exactly as ProcessSyncs does
+// ((shackleno-1)*(SkipTrollies+1) + trolly_counters: the tab sets 1/0 = trolley 0, the flag body
+// before it reads Shackles+1/0 = R, the same trolley mod R); frac = scan ticks since the last
+// counted trolley edge over G, the detector's measured gap (tabs never move either), below 1.
+double overhead::SingleSensorXCPos(int i)
+{
+    int skip = pShm->sys_set.SkipTrollies;
+    if (skip < 0) skip = 0;
+    double  T = (double) (pShm->SyncStatus[i].shackleno - 1) * (double) (skip + 1) + (double) trolly_counters[i];
+    __int64 g = ss_rule[i].gap;
+    double  frac = 0;
+    if (g > 0)
+    {
+        frac = (double) (ss_scan_tick - ss_last_trolley_tick[i]) / (double) g;
+        if (frac < 0)     frac = 0;
+        if (frac > 0.999) frac = 0.999;
+    }
+    return T + frac;
+}
+
+// a count sync that can take part: in this line's sync range, zeroed, tab rule confirmed, gaps measured
+bool overhead::SingleSensorXCEligible(int i, int numSyncs)
+{
+    return (i >= 0) && (i < numSyncs) && (i < MAXSYNCS) &&
+           pShm->SyncStatus[i].zeroed && ss_rule[i].confirmed &&
+           (ss_rule[i].gap > 0) && (ss_last_trolley_tick[i] > 0);
+}
+
+// steady: SS_XC_STEADY_GAPS normal gaps in a row, and not slowing / stopped now (open gap <= 115% G)
+bool overhead::SingleSensorXCSteady(int i)
+{
+    __int64 g = ss_rule[i].gap;
+    return (ss_xc_steady[i] >= SS_XC_STEADY_GAPS) && (g > 0) &&
+           ((ss_scan_tick - ss_last_trolley_tick[i]) * 100 <= g * SS_XC_OPEN_GAP_PCT);
+}
+
+// e_ab = P_a - P_b - d_ab (either order), wrapped
+double overhead::SingleSensorXCOffset(int a, int b)
+{
+    int lo = a < b ? a : b, hi = a < b ? b : a;
+    double e = SingleSensorXCWrap(SingleSensorXCPos(lo) - SingleSensorXCPos(hi) - ss_xc_pair[lo][hi].d);
+    return (a < b) ? e : -e;
+}
+
+// every edge ProcessSyncs counts as a trolley (SingleSensorIsZeroTab returned false; G/G2 just moved)
+void overhead::SingleSensorXCGapEdge(int i)
+{
+    ss_xc_edges[i]++;
+    __int64 g = ss_rule[i].gap, g2 = ss_rule[i].gapPrev;
+    bool normal = (g > 0) && (g2 > 0) &&
+                  (g * 100 >= g2 * SS_XC_GAP_LO_PCT) && (g * 100 <= g2 * SS_XC_GAP_HI_PCT);
+    if (normal)
+    {
+        if (ss_xc_steady[i] < SS_TAB_RUN_MAX) ss_xc_steady[i]++;
+        if (ss_xc_steady[i] >= SS_XC_STEADY_GAPS) ss_xc_refgap[i] = g;   // yardstick for a line stop
+    }
+    else
+    {
+        ss_xc_steady[i] = 0;          // a stop, a restart, an extra or a missing edge
+        ss_xc_anchor[i] = false;      // the count may have moved since the zero
+    }
+}
+
+// sync i's count can no longer be trusted for learning: drop its unconfirmed candidates
+void overhead::SingleSensorXCDrop(int i)
+{
+    ss_xc_clean[i]  = false;
+    ss_xc_anchor[i] = false;
+    ss_xc_vcnt[i]   = 0;
+    for (int j = 0; j < MAXSYNCS; j++)
+    {
+        if (j == i) continue;
+        SSXCPair &p = ss_xc_pair[i < j ? i : j][i < j ? j : i];
+        if (p.state == 1) p.state = 0;
+    }
+}
+
+// an accepted tab on sync i (after the counter reset). exact = the 15.7.15 exact-count check
+// passed (the flag body counted Shackles+1 / trolley 0). Learns from clean samples only.
+void overhead::SingleSensorXCZero(int i, bool exact, int numSyncs)
+{
+    if (ss_xc_dist_open) ss_xc_dist_zero = true;     // a zero moved a count during a disturbance
+    ss_xc_pat_rezero |= 1u << i;                     // its level now comes from the physical flag
+    if (!exact)
+    {
+        SingleSensorXCDrop(i);
+        ss_xc_anchor[i] = true;                      // realigned to the physical flag all the same
+        return;
+    }
+    ss_xc_clean[i]  = true;
+    ss_xc_anchor[i] = true;
+    ss_xc_vcnt[i]   = 0;
+    if (!SingleSensorXCSteady(i))
+        return;                                      // learn only in steady running
+    for (int j = 0; j < numSyncs && j < MAXSYNCS; j++)
+    {
+        if (j == i || !SingleSensorXCEligible(j, numSyncs) || !ss_xc_clean[j] || !SingleSensorXCSteady(j))
+            continue;
+        int lo = i < j ? i : j, hi = i < j ? j : i;
+        SSXCPair &p = ss_xc_pair[lo][hi];
+        double s = SingleSensorXCWrap(SingleSensorXCPos(lo) - SingleSensorXCPos(hi));
+        double r = SingleSensorXCWrap(s - p.d);
+        if (p.state == 0)
+        {
+            p.state = 1;                             // candidate, tracked from now on
+            p.d     = s;
+        }
+        else if (p.state == 1)
+        {
+            if (ssxc_abs(r) * 1000 < SS_XC_CONFIRM_TOL_PERMIL)
+                p.state = 2;                         // confirmed by a second clean sample: armed
+            else
+                p.state = 0;                         // one of the two samples was wrong: start over
+        }
+        else
+        {
+            double f = r - ssxc_round(r);
+            if (ssxc_abs(f) * 1000 >= SS_XC_RELEARN_TOL_PERMIL)
+                p.state = 0;                         // lost track of the offset: learn it again
+            // a whole-trolley r means sync j is off now (i just proved exact): the check owns that
+        }
+    }
+}
+
+// the "Zero Flag NOT Detected" overrun reset on sync i moved its count to a guess
+void overhead::SingleSensorXCOverrun(int i)
+{
+    if (ss_xc_dist_open) ss_xc_dist_zero = true;
+    SingleSensorXCDrop(i);
+}
+
+// At each counted trolley edge of sync i, after the count (and any overrun) moved: track the
+// offsets, judge, raise the disagreement alarm. Returns the shift to apply (-1 = one trolley
+// back) once the verdict has held SS_XC_HYST_EDGES edges, else 0. See overheadconst.h.
+int overhead::SingleSensorXCCheck(int i, int numSyncs)
+{
+    if ((pShm->ZeroFlagMode != 1) || !SingleSensorXCEligible(i, numSyncs))
+    {
+        ss_xc_vcnt[i] = 0;
+        return 0;
+    }
+    int R = SingleSensorRevTrolleys();
+    if (R <= 2 * SS_GATE_MARGIN)
+        return 0;                                    // settings not pushed yet
+    if (numSyncs > MAXSYNCS) numSyncs = MAXSYNCS;
+
+    bool iSteady = SingleSensorXCSteady(i);
+
+    //--- track: fold the fractional residual of every learned pair of i (integer part never moves)
+    __int64 gi = ss_rule[i].gap, gi2 = ss_rule[i].gapPrev;
+    bool iFlat = iSteady && (gi * 100 >= gi2 * (100 - SS_XC_TRACK_GAP_PCT)) && (gi * 100 <= gi2 * (100 + SS_XC_TRACK_GAP_PCT));
+    for (int j = 0; j < numSyncs && iFlat; j++)
+    {
+        if (j == i || !SingleSensorXCEligible(j, numSyncs) || !SingleSensorXCSteady(j)) continue;
+        int lo = i < j ? i : j, hi = i < j ? j : i;
+        SSXCPair &p = ss_xc_pair[lo][hi];
+        if (p.state == 0) continue;
+        __int64 gj = ss_rule[j].gap, gj2 = ss_rule[j].gapPrev;
+        if ((gj * 100 < gj2 * (100 - SS_XC_TRACK_GAP_PCT)) || (gj * 100 > gj2 * (100 + SS_XC_TRACK_GAP_PCT))) continue;
+        double e = SingleSensorXCOffset(lo, hi);
+        double f = e - ssxc_round(e);
+        if (ssxc_abs(f) * 1000 < SS_XC_TRACK_TOL_PERMIL)
+            p.d = SingleSensorXCWrap(p.d + f / SS_XC_TRACK_GAIN);
+    }
+
+    //--- the vote: eligible syncs whose pairs are all armed (drop the worst-connected until they are)
+    int  v[MAXSYNCS], n = 0;
+    for (int j = 0; j < numSyncs; j++)
+        if (SingleSensorXCEligible(j, numSyncs)) v[n++] = j;
+    for (;;)
+    {
+        int worst = -1, worstMiss = 0;
+        for (int a = 0; a < n; a++)
+        {
+            int miss = 0;
+            for (int b = 0; b < n; b++)
+                if (a != b && ss_xc_pair[v[a] < v[b] ? v[a] : v[b]][v[a] < v[b] ? v[b] : v[a]].state != 2) miss++;
+            if (miss > 0 && miss >= worstMiss) { worst = a; worstMiss = miss; }
+        }
+        if (worst < 0) break;
+        for (int a = worst; a + 1 < n; a++) v[a] = v[a + 1];
+        n--;
+    }
+    bool inVote = false;
+    for (int a = 0; a < n; a++) if (v[a] == i) inVote = true;
+    if (!inVote || n < 2)
+    {
+        ss_xc_vcnt[i] = 0;
+        return 0;
+    }
+
+    //--- a LINE STOP (opens the P2 window): a sync whose open gap, or last gap, is over
+    //    SS_XC_LINESTOP_PCT % of its last STEADY gap has seen the chain stop (against the last steady
+    //    gap, not the previous one: a jog in the middle of a stop splits the gap - DS2 at Pitman
+    //    16:48:48). A missing body is 2 x, jitter far less, so neither can open it; every sync of
+    //    the vote must have seen the stop for P2.
+    unsigned int unsteady = 0, stopped = 0, all = 0;
+    for (int a = 0; a < n; a++)
+    {
+        int j = v[a];
+        __int64 ref = ss_xc_refgap[j];
+        all |= 1u << j;
+        if (!SingleSensorXCSteady(j)) unsteady |= 1u << j;
+        if (ref > 0 && ((ss_scan_tick - ss_last_trolley_tick[j]) * 100 > ref * SS_XC_LINESTOP_PCT ||
+                        ss_rule[j].gap * 100 > ref * SS_XC_LINESTOP_PCT))
+            stopped |= 1u << j;
+    }
+    if (stopped)
+    {
+        if (!ss_xc_dist_open)
+        {
+            ss_xc_dist_open   = true;
+            ss_xc_dist_pre_ok = ss_xc_line_ok;       // as last seen steady, before the stop
+            ss_xc_dist_zero   = false;
+            ss_xc_dist_evals  = 0;
+            ss_xc_dist_mask   = 0;
+        }
+        ss_xc_dist_mask |= stopped;
+    }
+    if (unsteady)
+    {
+        ss_xc_vcnt[i] = 0;
+        return 0;
+    }
+
+    //--- integer offsets of every pair in the vote
+    int  o[MAXSYNCS][MAXSYNCS];
+    bool allInt = true, all0 = true;
+    for (int a = 0; a < n; a++)
+        for (int b = a + 1; b < n; b++)
+        {
+            double e = SingleSensorXCOffset(v[a], v[b]);
+            int    k = ssxc_round(e);
+            o[v[a]][v[b]] = k;
+            o[v[b]][v[a]] = -k;
+            if (ssxc_abs(e - k) * 1000 >= SS_XC_K_TOL_PERMIL) allInt = false;
+            if (k != 0 || ssxc_abs(e) * 1000 >= SS_XC_AGREE_TOL_PERMIL) all0 = false;
+        }
+    //--- line-state bookkeeping takes a reading only when the NEXT steady check reads the same:
+    //    a sync rolled back onto the previous body at the start of a stop counts it at a normal-
+    //    looking moment, and that one reading is garbage. (The verdict has its own 2-edge hysteresis.)
+    int  lev[MAXSYNCS];
+    for (int a = 0; a < n; a++) lev[v[a]] = (a == 0) ? 0 : o[v[a]][v[0]];
+    bool agree = ss_xc_prev_valid && (ss_xc_prev_int == allInt) && (ss_xc_prev_vmask == all);
+    for (int a = 0; a < n && agree && allInt; a++) if (ss_xc_prev_lev[v[a]] != lev[v[a]]) agree = false;
+    ss_xc_prev_valid = true;
+    ss_xc_prev_int   = allInt;
+    ss_xc_prev_vmask = all;
+    for (int a = 0; a < n; a++) ss_xc_prev_lev[v[a]] = lev[v[a]];
+    if (agree) ss_xc_line_ok = all0;
+    if (ss_xc_dist_open && ((agree && all0) || ++ss_xc_dist_evals > SS_XC_DIST_EVALS))
+        ss_xc_dist_open = false;                     // resolved (or given up: no P2 any more)
+
+    //--- how did the inconsistency arise? Only one that appeared in ONE step from every pair at 0
+    //    may be corrected; its level pattern may change afterwards only by our own corrections
+    //    (SingleSensorXCApply moves the stored level too). A second change while inconsistent -
+    //    e.g. two lost counts on two syncs at different times, which would leave the one good
+    //    sync looking "ahead" - makes it unattributable until every pair reads 0 again.
+    if (!agree)
+        ;                                            // wait for a second reading
+    else if (all0)
+    {
+        ss_xc_ok_before = true;
+        ss_xc_pat_valid = false;
+    }
+    else if (allInt)
+    {
+        if (!ss_xc_pat_valid)
+        {
+            ss_xc_pat_valid = true;                  // onset: ok_before tells whether all were at 0 just before
+            ss_xc_pat_vmask = all;
+            for (int a = 0; a < n; a++) ss_xc_pat_lev[v[a]] = lev[v[a]];
+        }
+        else
+        {
+            // a sync that zeroed since was moved by its flag, not by a miscount: take its new level
+            for (int a = 0; a < n; a++)
+                if (ss_xc_pat_rezero & (1u << v[a])) ss_xc_pat_lev[v[a]] = lev[v[a]] - lev[v[0]] + ss_xc_pat_lev[v[0]];
+            bool same = (ss_xc_pat_vmask == all);
+            for (int a = 0; a < n && same; a++) if (ss_xc_pat_lev[v[a]] - ss_xc_pat_lev[v[0]] != lev[v[a]]) same = false;
+            if (!same) ss_xc_ok_before = false;
+        }
+        ss_xc_pat_rezero = 0;                        // consumed by an agreed reading
+    }
+    if (agree && all0) ss_xc_pat_rezero = 0;
+
+    //--- verdict: is sync i one trolley AHEAD?
+    bool ahead = false;
+    if (allInt && (n >= SS_XC_MIN_SYNCS) && !ss_xc_anchor[i] && ss_xc_ok_before)
+    {
+        // P1: i is +1 against every other sync, and the others agree with each other
+        bool p1 = true;
+        for (int a = 0; a < n && p1; a++)
+        {
+            if (v[a] == i) continue;
+            if (o[i][v[a]] != 1) p1 = false;
+            for (int b = a + 1; b < n && p1; b++)
+                if (v[b] != i && o[v[a]][v[b]] != 0) p1 = false;
+        }
+        // P2: after a LINE stop that began with every pair at 0 and saw no zero / overrun: two
+        // levels a trolley apart, i in the upper one, no upper-level sync anchored by its zero
+        bool p2 = false;
+        if (!p1 && ss_xc_dist_open && ss_xc_dist_pre_ok && !ss_xc_dist_zero && ((ss_xc_dist_mask & all) == all))
+        {
+            bool lower = false;
+            p2 = true;
+            for (int a = 0; a < n && p2; a++)
+            {
+                int j = v[a];
+                if (j == i) continue;
+                if (o[i][j] == 1) lower = true;
+                else if (o[i][j] == 0) { if (ss_xc_anchor[j]) p2 = false; }
+                else p2 = false;
+                for (int b = 0; b < n && p2; b++)
+                    if (v[b] != i && v[b] != j && o[j][v[b]] != o[i][v[b]] - o[i][j]) p2 = false;
+            }
+            p2 = p2 && lower;
+        }
+        ahead = p1 || p2;
+    }
+    if (ahead) { if (ss_xc_vcnt[i] < SS_TAB_RUN_MAX) ss_xc_vcnt[i]++; }
+    else       ss_xc_vcnt[i] = 0;
+
+    //--- disagreement alarm (pairs whose lower sync is i): a whole-trolley offset that persists
+    for (int b = 0; b < n; b++)
+    {
+        int j = v[b];
+        if (j <= i) continue;
+        SSXCPair &p = ss_xc_pair[i][j];
+        double e = SingleSensorXCOffset(i, j);
+        int    k = ssxc_round(e);
+        if (k == 0 || k > SS_XC_MAX_K || k < -SS_XC_MAX_K || ssxc_abs(e - k) * 1000 >= SS_XC_K_TOL_PERMIL)
+        {
+            p.persist = 0;
+            continue;
+        }
+        if (k != p.persistK) { p.persistK = k; p.persist = 0; }
+        if (++p.persist >= SS_XC_ALARM_EDGES && (!p.alarmed || ss_xc_edges[i] - p.alarmEdge >= R))
+        {
+            p.alarmed   = true;
+            p.alarmEdge = ss_xc_edges[i];
+            sprintf(app_err_buf, "Count disagreement: %s vs %s by %+d trolley\n", sync_desc[i], sync_desc[j], k);
+            GenError(warning, app_err_buf);
+        }
+    }
+
+    return (ss_xc_vcnt[i] >= SS_XC_HYST_EDGES) ? -1 : 0;
+}
+
+// Shift sync i's count by `shift` trolleys (production: -1 only). Applied by ProcessSyncs at the
+// counted edge BEFORE its scale / drop pass. Refused (false, verdict kept for the next edge) unless
+// the corrected count lands on a shackle trolley (trolley counter 0) strictly inside the
+// revolution: the zero tab and the overrun own trolley 0 / Shackles+1. ProcessSyncs then skips
+// this edge's drop / missed-bird pass (that count already ran, one trolley early, at the previous
+// counted edge); the scale re-labels and re-weighs the shackle really on it when SkipTrollies >= 1
+// (the early weighment is still averaging and is replaced) and skips its pass when SkipTrollies is 0
+// (the early weighment has completed and been assigned - no slot is assigned twice).
+bool overhead::SingleSensorXCApply(int i, int shift, int numSyncs)
+{
+    TSyncStatus* ps = &pShm->SyncStatus[i];
+    int skip = pShm->sys_set.SkipTrollies;
+    if (skip < 0) skip = 0;
+    long long S1 = skip + 1;
+    long long T  = (long long) (ps->shackleno - 1) * S1 + trolly_counters[i];
+    long long T2 = T + shift;
+    if (T2 < 1 || T2 > SingleSensorRevTrolleys() || (T2 % S1) != 0)
+        return false;
+    int shk2 = (int) (T2 / S1) + 1;
+    int was  = ps->shackleno, wasTc = trolly_counters[i];
+    true_shackle_count[i] += shk2 - ps->shackleno;
+    if (true_shackle_count[i] < 1) true_shackle_count[i] = 1;
+    ps->shackleno      = shk2;
+    trolly_counters[i] = 0;
+    ss_tab_run[i] += shift;
+    if (ss_tab_run[i] < 0) ss_tab_run[i] = 0;
+    SingleSensorXCDrop(i);                           // not clean until its next exact zero
+    if (ss_xc_pat_valid) ss_xc_pat_lev[i] += shift;  // our own move does not make the pattern "new"
+    ss_xc_prev_valid = false;                        // ...and the next reading starts a fresh pair
+
+    char others[MAXSYNCS * (MAX_DBG_DESC + 2) + 4];
+    others[0] = 0;
+    for (int j = 0; j < numSyncs && j < MAXSYNCS; j++)
+    {
+        if (j == i || !SingleSensorXCEligible(j, numSyncs) || ss_xc_pair[i < j ? i : j][i < j ? j : i].state != 2) continue;
+        if (others[0]) strcat(others, ", ");
+        strncat(others, sync_desc[j], MAX_DBG_DESC);
+    }
+    sprintf(app_err_buf, "Count corrected: %s %+d trolley (cross-check with %s)\n", sync_desc[i], shift, others);
+    GenError(warning, app_err_buf);
+    if ( (!trc[MAINBUFID].buffer_full) && (TraceMask & _ZEROS_ ) )
+    {
+        sprintf((char*) &tmp_trc_buf[MAINBUFID],"XC\t%d\tshift\t%d\tShk\t%d/%d\t->\t%d/0\n", i, shift, was, wasTc, shk2);
+        strcat((char*) &trc_buf[MAINBUFID],(char*) &tmp_trc_buf[MAINBUFID] );
+    }
     return true;
 }
 
@@ -6576,7 +7145,8 @@ void overhead::GradeSyncs()
 			// Standard mode reads the grade zero bit; single-sensor mode derives
 			// the grade zero from the double-pulse timing on the grade count bit.
 			bool grade_zero_detected = (pShm->ZeroFlagMode == 1)
-				? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex], ss_grade_tab_run[GradeSyncIndex], ss_grade_trolley_shrink[GradeSyncIndex])
+				? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex], ss_grade_tab_run[GradeSyncIndex], ss_grade_trolley_shrink[GradeSyncIndex],
+									ss_grade_rule[GradeSyncIndex])
 				: BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]);
 
 			if ( grade_zero_detected )
@@ -6585,22 +7155,50 @@ void overhead::GradeSyncs()
 				syncCapEventAccum = 0x40 | 0x20 | (pShm->ZeroFlagMode == 1 ? 0x80 : 0) | (GradeSyncIndex & 0x07);
 
 				//RtPrintf("Grade zero\n");
+				bool ssMisplaced = false;	// 15.7.15: exact-count check failed on this zero
 				//GLC added 2/15/05
 				if ((pShm->grade_shackle[GradeSyncIndex] < true_grade_shackle_count[GradeSyncIndex]) &&
 					(true_grade_shackle_count[GradeSyncIndex] > pShm->sys_set.Shackles) &&
 					grade_zeroed[GradeSyncIndex] )
                 {
+                    if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))	// 15.7.15: owner's rule (single-sensor)
+                    {
                     sprintf(app_err_buf,"Late Zero Flag Detected. Grade Sync %d late count %ld\n",
 						GradeSyncIndex + 1, (long) (true_grade_shackle_count[GradeSyncIndex] - pShm->sys_set.Shackles));
                     GenError(warning, app_err_buf);
+                    }
 
                 }
                 else if ((pShm->grade_shackle[GradeSyncIndex] < pShm->sys_set.Shackles) && grade_zeroed[GradeSyncIndex] )
                 {
+                    if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))	// 15.7.15
+                    {
                     sprintf(app_err_buf,"Early Zero Flag Detected. Grade Sync %d shkl %d expected shkl %d\n",
 						GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], pShm->sys_set.Shackles);
                     GenError(warning, app_err_buf);
+                    }
 					true_grade_shackle_count[GradeSyncIndex] = 1;
+                }
+                // 15.7.15 exact-count check (single-sensor only) - see ProcessSyncs.
+                else if ((pShm->ZeroFlagMode == 1) && grade_zeroed[GradeSyncIndex] &&
+                         !((pShm->grade_shackle[GradeSyncIndex] == pShm->sys_set.Shackles + 1) &&
+                           (trolly_counters[MAXSYNCS] == 0)))
+                {
+                    ssMisplaced = true;
+                    if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))
+                    {
+                    sprintf(app_err_buf,"Zero Flag position mismatch. Grade Sync %d count %d trolley %d expected %d/0\n",
+						GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], trolly_counters[MAXSYNCS], pShm->sys_set.Shackles + 1);
+                    GenError(warning, app_err_buf);
+                    ss_grade_zero_lost[GradeSyncIndex] = true;
+                    }
+                }
+                // 15.7.15 (single-sensor, informational): announce the recovery - see ProcessSyncs.
+                if ((pShm->ZeroFlagMode == 1) && grade_zeroed[GradeSyncIndex] && ss_grade_zero_lost[GradeSyncIndex] && !ssMisplaced)
+                {
+                    sprintf(app_err_buf,"Zero Flag re-acquired. Grade Sync %d\n", GradeSyncIndex + 1);
+                    GenError(informational, app_err_buf);
+                    ss_grade_zero_lost[GradeSyncIndex] = false;
                 }
 
 				//GLC 2/15/05 clear sync shackle counters to avoid late zero errors on syncs after
@@ -6610,6 +7208,7 @@ void overhead::GradeSyncs()
                     sprintf(app_err_buf,"Initial Zero Flag Detected. Grade Sync %d\n",
 						GradeSyncIndex + 1);
                     GenError(informational, app_err_buf);
+                    ss_grade_zero_lost[GradeSyncIndex] = false;	// 15.7.15
 
 
 					for (i = 0; i< MAXSYNCS; i++)
@@ -6652,6 +7251,7 @@ void overhead::GradeSyncs()
 					{
  						pShm->grade_shackle[GradeSyncIndex]++;
 						true_grade_shackle_count[GradeSyncIndex]++; //GLC added 2/14/05
+						SingleSensorAlarmTick(ss_grade_alarm_cnt[GradeSyncIndex]);	// 15.7.15
 						trolly_counters[MAXSYNCS] = 0;
 
 						// special, the grade sync counter is tacked on to the end of regular syncs.
@@ -6663,6 +7263,7 @@ void overhead::GradeSyncs()
 				{
 					pShm->grade_shackle[GradeSyncIndex]++;
 					true_grade_shackle_count[GradeSyncIndex]++; //GLC added 2/14/05
+					SingleSensorAlarmTick(ss_grade_alarm_cnt[GradeSyncIndex]);	// 15.7.15
 					// special, the grade sync counter is tacked on to the end of regular syncs.
 					pShm->sys_stat.dbg_sync[SYNC_ON][MAXSYNCS - 1]++;
 					pShm->sys_stat.dbg_sync[ZERO_ON][MAXSYNCS - 1]++;
@@ -6676,10 +7277,11 @@ void overhead::GradeSyncs()
 				trolly_counters[MAXSYNCS] = 0;
 				pShm->grade_shackle[GradeSyncIndex] = 1;
 
-				if (SingleSensorWarnOk())
+				if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))	// 15.7.15: was SingleSensorWarnOk()
 				{
 					sprintf(app_err_buf,"Zero Flag NOT Detected. Grade Sync %d shackle %d expected %d\n", GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], pShm->sys_set.Shackles); //GLC added 2/14/05
 					GenError(warning, app_err_buf);
+					if (pShm->ZeroFlagMode == 1) ss_grade_zero_lost[GradeSyncIndex] = true;	// 15.7.15
 				}
 			}
 
@@ -6746,7 +7348,8 @@ void overhead::GradeSyncs()
 				// Standard mode reads the grade zero bit; single-sensor mode derives
 				// the grade zero from the double-pulse timing on the grade count bit.
 				bool grade_zero_detected = (pShm->ZeroFlagMode == 1)
-					? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex], ss_grade_tab_run[GradeSyncIndex], ss_grade_trolley_shrink[GradeSyncIndex])
+					? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex], ss_grade_tab_run[GradeSyncIndex], ss_grade_trolley_shrink[GradeSyncIndex],
+									ss_grade_rule[GradeSyncIndex])
 					: BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]);
 
 				if ( grade_zero_detected )
@@ -6754,21 +7357,49 @@ void overhead::GradeSyncs()
 					// Sensor Scope: mark a grade zero/tab for the scope overlay
 					syncCapEventAccum = 0x40 | 0x20 | (pShm->ZeroFlagMode == 1 ? 0x80 : 0) | (GradeSyncIndex & 0x07);
 
+					bool ssMisplaced = false;	// 15.7.15: exact-count check failed on this zero
 					//GLC added 2/15/05
 					if ((pShm->grade_shackle[GradeSyncIndex] < true_grade_shackle_count[GradeSyncIndex]) &&
 						(true_grade_shackle_count[GradeSyncIndex] > pShm->sys_set.Shackles) &&
 						grade_zeroed[GradeSyncIndex] )
 					{
+						if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))	// 15.7.15: owner's rule (single-sensor)
+						{
 						sprintf(app_err_buf,"Late Zero Flag Detected. Grade Sync %d late count %ld\n",
 							GradeSyncIndex + 1, (long) (true_grade_shackle_count - pShm->sys_set.Shackles));
 						GenError(warning, app_err_buf);
+						}
 
 					}
 					else if ((pShm->grade_shackle[GradeSyncIndex] < pShm->sys_set.Shackles) && grade_zeroed[GradeSyncIndex])
 					{
+						if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))	// 15.7.15
+						{
 						sprintf(app_err_buf,"Early Zero Flag Detected. Grade Sync %d shkl %d expected shkl %d\n",
 							GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], pShm->sys_set.Shackles);
 						GenError(warning, app_err_buf);
+						}
+					}
+					// 15.7.15 exact-count check (single-sensor only) - see ProcessSyncs.
+					else if ((pShm->ZeroFlagMode == 1) && grade_zeroed[GradeSyncIndex] &&
+							 !((pShm->grade_shackle[GradeSyncIndex] == pShm->sys_set.Shackles + 1) &&
+							   (trolly_counters[MAXSYNCS + GradeSyncIndex] == 0)))
+					{
+						ssMisplaced = true;
+						if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))
+						{
+						sprintf(app_err_buf,"Zero Flag position mismatch. Grade Sync %d count %d trolley %d expected %d/0\n",
+							GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], trolly_counters[MAXSYNCS + GradeSyncIndex], pShm->sys_set.Shackles + 1);
+						GenError(warning, app_err_buf);
+						ss_grade_zero_lost[GradeSyncIndex] = true;
+						}
+					}
+					// 15.7.15 (single-sensor, informational): announce the recovery - see ProcessSyncs.
+					if ((pShm->ZeroFlagMode == 1) && grade_zeroed[GradeSyncIndex] && ss_grade_zero_lost[GradeSyncIndex] && !ssMisplaced)
+					{
+						sprintf(app_err_buf,"Zero Flag re-acquired. Grade Sync %d\n", GradeSyncIndex + 1);
+						GenError(informational, app_err_buf);
+						ss_grade_zero_lost[GradeSyncIndex] = false;
 					}
 
 					//GLC 2/15/05 clear sync shackle counters to avoid late zero errors on syncs after
@@ -6778,6 +7409,7 @@ void overhead::GradeSyncs()
 						sprintf(app_err_buf,"Initial Zero Flag Detected. Grade Sync %d\n",
 							GradeSyncIndex + 1);
 						GenError(informational, app_err_buf);
+						ss_grade_zero_lost[GradeSyncIndex] = false;	// 15.7.15
 
 						for (i = 0; i< MAXSYNCS; i++)
 						{
@@ -6818,6 +7450,7 @@ void overhead::GradeSyncs()
 						{
 							true_grade_shackle_count[GradeSyncIndex]++;
  							pShm->grade_shackle[GradeSyncIndex]++;
+							SingleSensorAlarmTick(ss_grade_alarm_cnt[GradeSyncIndex]);	// 15.7.15
 							trolly_counters[MAXSYNCS + GradeSyncIndex] = 0;
 
 							// special, the grade sync counter is tacked on to the end of regular syncs.
@@ -6829,6 +7462,7 @@ void overhead::GradeSyncs()
 					{
 						pShm->grade_shackle[GradeSyncIndex]++;
 						true_grade_shackle_count[GradeSyncIndex]++;
+						SingleSensorAlarmTick(ss_grade_alarm_cnt[GradeSyncIndex]);	// 15.7.15
 						// special, the grade sync counter is tacked on to the end of regular syncs.
 						pShm->sys_stat.dbg_sync[SYNC_ON][MAXSYNCS + GradeSyncIndex - 1]++;
 						pShm->sys_stat.dbg_sync[ZERO_ON][MAXSYNCS + GradeSyncIndex - 1]++;
@@ -6842,11 +7476,12 @@ void overhead::GradeSyncs()
 					trolly_counters[MAXSYNCS + GradeSyncIndex]   = 0;
 					pShm->grade_shackle[GradeSyncIndex]         = 1;
 
-					if (SingleSensorWarnOk())
+					if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))	// 15.7.15: was SingleSensorWarnOk()
 					{
 						sprintf(app_err_buf,"Zero Flag NOT Detected. Grade Sync %d shackle %d expected %d\n",
 							GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], pShm->sys_set.Shackles); //GLC added 2/14/05
 						GenError(warning, app_err_buf);
+						if (pShm->ZeroFlagMode == 1) ss_grade_zero_lost[GradeSyncIndex] = true;	// 15.7.15
 					}
 				}
 
@@ -11122,8 +11757,26 @@ void overhead::GenError(int sev, char* txt)
         default:             api_sev = 0; break; // Info
     }
 
-    send_error.sev      = api_sev;
-    send_error.err_addr = txt;
+    // 15.7.16: queue a COPY of the message. It used to be ONE slot pointing at the caller's buffer:
+    // a second GenError before GpSendThread's next pass (<= 50 ms) overwrote the first, and the
+    // shared app_err_buf could be rewritten before it was sent. Lock-free, so no caller ever waits
+    // (the 5 ms scan included, every thread is SCHED_FIFO): an atomic ticket picks the slot, the
+    // slot's seq is cleared, the text copied, the seq published. A full ring overwrites its oldest
+    // entry; SendError notices the gap and reports it.
+    if (txt == NULL) txt = (char*) "";
+    unsigned long long t = __atomic_fetch_add(&errq_head, 1ULL, __ATOMIC_ACQ_REL);
+    ErrQEntry &e = errq[t % ERRQ_LEN];
+    __atomic_store_n(&e.seq, 0ULL, __ATOMIC_RELAXED);         // being written
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    size_t len = strnlen(txt, MAXERRMBUFSIZE);
+    e.sev = api_sev;
+    e.len = (int) len;
+    if (len < MAXERRMBUFSIZE) memcpy(e.txt, txt, len + 1);
+    else                      e.txt[0] = 0;                    // too long: SendError logs it, as before
+    __atomic_store_n(&e.seq, t + 1, __ATOMIC_RELEASE);        // published
+
+    send_error.sev      = api_sev;                             // kept: the latest message
+    send_error.err_addr = e.txt;
     send_error.send     = true;
 
     if (sev == critical)
@@ -11139,32 +11792,91 @@ void overhead::GenError(int sev, char* txt)
 //  SendError
 //--------------------------------------------------------
 
+// 15.7.16: drains the GenError queue IN ORDER - every message, each with the same HOST_OK gate,
+// mutex and SendHostMsg(ERROR_MSG, sev, text) as before. Single consumer (GpSendThread). A message
+// the host or the mutex cannot take now stays queued for the next pass. An entry overwritten by a
+// full ring (or while being copied) is counted, and once the survivors are delivered one
+// "N controller messages dropped (queue full)" is sent. A text of MAXERRMBUFSIZE or more is not
+// sent, with the same log line as before.
 void overhead::SendError()
 {
     // Guard: skip if pShm is invalid (HOST_OK dereferences pShm)
     if (!isPShmValid()) return;
 
-    int len = strlen(send_error.err_addr);
-
-    if (len >= MAXERRMBUFSIZE)
+    bool stalled = false;
+    for (;;)
     {
-        RtPrintf("Error file %s, line %d\n", _FILE_, __LINE__);
-        return;
+        unsigned long long head = __atomic_load_n(&errq_head, __ATOMIC_ACQUIRE);
+        if (errq_tail == head) break;                                  // empty
+        if (head - errq_tail > ERRQ_LEN)                               // lapped: the oldest were overwritten
+        {
+            errq_dropped += (unsigned int) (head - ERRQ_LEN - errq_tail);
+            errq_tail     = head - ERRQ_LEN;
+        }
+        ErrQEntry &e = errq[errq_tail % ERRQ_LEN];
+        unsigned long long s1 = __atomic_load_n(&e.seq, __ATOMIC_ACQUIRE);
+        if (s1 != errq_tail + 1)
+        {
+            if (s1 > errq_tail + 1) { errq_dropped++; errq_tail++; continue; }   // overwritten by a newer one
+            break;                                                     // still being written: next pass
+        }
+        int  sev = e.sev, len = e.len;
+        char buf[MAXERRMBUFSIZE];
+        if (len < MAXERRMBUFSIZE) memcpy(buf, e.txt, len + 1);
+        else                      buf[0] = 0;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&e.seq, __ATOMIC_RELAXED) != s1) { errq_dropped++; errq_tail++; continue; }   // overwritten while copied
+
+        if (len >= MAXERRMBUFSIZE)
+        {
+            RtPrintf("Error file %s, line %d\n", _FILE_, __LINE__);  // too long: not sent, as before
+            errq_tail++;
+            continue;
+        }
+        if (!SendErrorMsg(sev, buf)) { stalled = true; break; }        // keep it for the next pass
+        errq_tail++;
     }
+
+    if (errq_dropped && !stalled)
+    {
+        char buf[80];
+        sprintf(buf, "%u controller messages dropped (queue full)\n", errq_dropped);
+        RtPrintf("GenError: %s", buf);
+        if (SendErrorMsg(1 /* API Warning */, buf))
+            errq_dropped = 0;
+    }
+
+    if (!ErrQueuePending())
+    {
+        send_error.sev      = 0;
+        send_error.err_addr = NULL;
+        send_error.send     = false;
+    }
+}
+
+// 15.7.16: one message to the host - the body SendError always had. false = not sent (host not
+// connected, or the send mutex timed out), so the caller keeps the message.
+bool overhead::SendErrorMsg(int sev, char* txt)
+{
+    if (!(HOST_OK))
+        return false;
     // Request Mutex for send
     if(RtWaitForSingleObject(trc[GPBUFID].mutex, WAIT100MS) != WAIT_OBJECT_0)
-        RtPrintf("Wait failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
-    else
     {
-        if HOST_OK
-            SendHostMsg( ERROR_MSG, send_error.sev, (BYTE*) send_error.err_addr, strlen(send_error.err_addr));
-
-        if(!RtReleaseMutex(trc[GPBUFID].mutex))
-            RtPrintf("Release failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
+        RtPrintf("Wait failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
+        return false;
     }
+    SendHostMsg( ERROR_MSG, sev, (BYTE*) txt, strlen(txt));
 
-    send_error.sev      = 0;
-    send_error.err_addr = NULL;
+    if(!RtReleaseMutex(trc[GPBUFID].mutex))
+        RtPrintf("Release failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
+    return true;
+}
+
+// 15.7.16: a queued message, or an overflow summary, waits to be sent (consumer side only)
+bool overhead::ErrQueuePending()
+{
+    return (errq_tail != __atomic_load_n(&errq_head, __ATOMIC_ACQUIRE)) || (errq_dropped != 0);
 }
 
 //--------------------------------------------------------
@@ -11607,8 +12319,13 @@ void overhead::ProcessSyncs()
 				 // (ZeroFlagMode==1) ignores the zero bit and derives zero from the
 				 // double-pulse timing on this even count bit (self-calibrating).
                  bool zero_detected = (pShm->ZeroFlagMode == 1)
-                     ? SingleSensorIsZeroTab(ss_last_trolley_tick[i], ss_trolley_interval[i], ss_trolley_stall[i], ss_tab_run[i], ss_trolley_shrink[i])
+                     ? SingleSensorIsZeroTab(ss_last_trolley_tick[i], ss_trolley_interval[i], ss_trolley_stall[i], ss_tab_run[i], ss_trolley_shrink[i],
+                                             ss_rule[i])
                      : BITSET(sync_zero[byte], i);
+#if SS_CROSSCHECK
+                 if ((pShm->ZeroFlagMode == 1) && !zero_detected)
+                     SingleSensorXCGapEdge(i);      // 15.7.16: steadiness of this sync (trolley gap)
+#endif
 
  				 // Only zero the sync if the grade syncs have already zeroed. This is to prevent misgrading
 				 // in the time period between a scale sync zero and grade sync zero (if the zero flag passes
@@ -11618,28 +12335,68 @@ void overhead::ProcessSyncs()
                      // Sensor Scope: mark a zero/tab on this sync for the scope overlay
                      syncCapEventAccum = 0x40 | (pShm->ZeroFlagMode == 1 ? 0x80 : 0) | (i & 0x07);
 
+					 bool ssMisplaced = false;	// 15.7.15: exact-count check failed on this zero
+					 // 15.7.16: the same exact-count test, kept for the cross-sync check (a clean zero)
+					 bool ssExact = (pShm->ZeroFlagMode == 1) && pSyncStat->zeroed &&
+					                (pSyncStat->shackleno == pShm->sys_set.Shackles + 1) && (trolly_counters[i] == 0);
 					 // GLC 2/14/05
 					 // If this sync has already zeroed before, show late or early zero flag if applicable
 					if ((pSyncStat->shackleno < true_shackle_count[i]) &&
 						(true_shackle_count[i] > pShm->sys_set.Shackles) &&
 						pSyncStat->zeroed)
                     {
+                        if (SingleSensorAlarmOk(ss_alarm_cnt[i], ss_rule[i]))   // 15.7.15: owner's rule (single-sensor)
+                        {
                         sprintf(app_err_buf,"Late Zero Flag Detected. %s late count %ld\n",
 							sync_desc[i], (long) (true_shackle_count[i] - pShm->sys_set.Shackles));
                         GenError(warning, app_err_buf);
+                        }
 
                     }
                     else if ((pSyncStat->shackleno < pShm->sys_set.Shackles) && pSyncStat->zeroed)
                     {
+                        if (SingleSensorAlarmOk(ss_alarm_cnt[i], ss_rule[i]))   // 15.7.15
+                        {
                         sprintf(app_err_buf,"Early Zero Flag Detected. %s shkl %d expected shkl %d\n",
 							sync_desc[i], pSyncStat->shackleno, pShm->sys_set.Shackles);
                         GenError(warning, app_err_buf);
+                        }
+                    }
+                    // 15.7.15 EXACT-COUNT CHECK (single-sensor only). The flag trolley's body pulse
+                    // counts the sync to exactly Shackles+1 with the skip parity at 0 (02bf814: the
+                    // overshoot ProcessSyncs tolerates), so that is what an accepted tab must find.
+                    // Anything else that Late / Early cannot see - e.g. SkipTrollies 1, a missed tab
+                    // then a false zero one trolley later (Shackles+1 with trolly_counters 1) - would
+                    // run the whole revolution half a shackle off in silence. Counting is unchanged:
+                    // the sync zeroes below exactly as before; this only raises the alarm, under the
+                    // same once-per-revolution-per-sync rule. Not before the first zero (Initial).
+                    else if ((pShm->ZeroFlagMode == 1) && pSyncStat->zeroed &&
+                             !((pSyncStat->shackleno == pShm->sys_set.Shackles + 1) && (trolly_counters[i] == 0)))
+                    {
+                        ssMisplaced = true;
+                        if (SingleSensorAlarmOk(ss_alarm_cnt[i], ss_rule[i]))
+                        {
+                        sprintf(app_err_buf,"Zero Flag position mismatch. %s count %d trolley %d expected %d/0\n",
+							sync_desc[i], pSyncStat->shackleno, trolly_counters[i], pShm->sys_set.Shackles + 1);
+                        GenError(warning, app_err_buf);
+                        ss_zero_lost[i] = true;
+                        }
+                    }
+                    // 15.7.15 (single-sensor, informational): the once-per-revolution rule usually
+                    // swallows the "Late" that follows a "NOT Detected", so announce the recovery
+                    // once - on the first zero that is not itself misplaced.
+                    if ((pShm->ZeroFlagMode == 1) && pSyncStat->zeroed && ss_zero_lost[i] && !ssMisplaced)
+                    {
+                        sprintf(app_err_buf,"Zero Flag re-acquired. %s\n", sync_desc[i]);
+                        GenError(informational, app_err_buf);
+                        ss_zero_lost[i] = false;
                     }
 
 					//GLC added 2/15/05
 					// Show informational message the first time the sync is zeroed
 					if (!pSyncStat->zeroed)
 					{
+						ss_zero_lost[i] = false;	// 15.7.15: "Initial" already says it
 						sprintf(app_err_buf,"Initial Zero Flag Detected. %s\n", sync_desc[i]);
 						GenError(informational, app_err_buf);
 					}
@@ -11680,6 +12437,9 @@ void overhead::ProcessSyncs()
                     {
                         ssTab    = true;
                         ssTabDup = ss_ovr_pass[i];
+#if SS_CROSSCHECK
+                        SingleSensorXCZero(i, ssExact, NumSyncs);   // 15.7.16: anchor + learn offsets
+#endif
 
                         if ( ssTabDup && (!trc[MAINBUFID].buffer_full) && (TraceMask & _ZEROS_ ) )
                         {
@@ -11705,6 +12465,7 @@ void overhead::ProcessSyncs()
 						   //RtPrintf("**ProcessSync: trolly_counters[i] > pShm->sys_set.SkipTrollies\n");
 							pSyncStat->shackleno++;
 		                    true_shackle_count[i]++; //GLC added 2/14/05
+							SingleSensorAlarmTick(ss_alarm_cnt[i]);   // 15.7.15
 							pShm->sys_stat.dbg_sync[SYNC_ON][i]++;
 							pShm->sys_stat.dbg_sync[ZERO_ON][i]++;
                            trolly_counters[i] = 0;
@@ -11721,6 +12482,7 @@ void overhead::ProcessSyncs()
 						*/
 						pSyncStat->shackleno++;
 		                true_shackle_count[i]++; //GLC added 2/14/05
+						SingleSensorAlarmTick(ss_alarm_cnt[i]);   // 15.7.15
 						pShm->sys_stat.dbg_sync[SYNC_ON][i]++;
 						pShm->sys_stat.dbg_sync[ZERO_ON][i]++;
 					}
@@ -11741,22 +12503,60 @@ void overhead::ProcessSyncs()
                 int shackleLimit = pShm->sys_set.Shackles + (pShm->ZeroFlagMode == 1 ? 1 : 0);
 				if ((pSyncStat->shackleno > shackleLimit) && grade_zeroed[0] && grade_zeroed[1])
                 {
-                     // Single-sensor: throttle these warnings (>= ~30s apart across all
-                     // syncs) so imperfect tab timing can never flood the host UI.
-                     if (SingleSensorWarnOk())
+                     // Single-sensor: at most one zero-flag alarm per revolution of THIS
+                     // sync's count (15.7.15 owner's rule; was a GLOBAL 30 s throttle).
+                     if (SingleSensorAlarmOk(ss_alarm_cnt[i], ss_rule[i]))
                      {
                         sprintf(app_err_buf,"Zero Flag NOT Detected. %s shackle %d expected %d\n",
 							sync_desc[i], pSyncStat->shackleno, pShm->sys_set.Shackles); //GLC added 2/14/05
                         GenError(warning, app_err_buf);
+                        if (pShm->ZeroFlagMode == 1) ss_zero_lost[i] = true;   // 15.7.15: announce the recovery
                      }
 					//RtPrintf("**ProcessSync: Trolly counter reset to 0\n");
                     trolly_counters[i]   = 0;
                     pSyncStat->shackleno = 1;
+#if SS_CROSSCHECK
+                    if (pShm->ZeroFlagMode == 1)
+                        SingleSensorXCOverrun(i);   // 15.7.16: the reset is a guess, not the flag
+#endif
                 }
+
+//----- 15.7.16: cross-sync count check (single-sensor, counted trolley edges only)
+
+                // A count that has slipped a whole trolley against the other count syncs is moved
+                // back here, BEFORE this edge's scale / drop pass (SingleSensorXCApply). The count
+                // it lands on already ran its drop / missed-bird pass at the previous counted edge
+                // (one trolley early, as every pass did while the count was ahead), so that pass is
+                // not repeated (xcSuppress). The scale: with SkipTrollies >= 1 the weighment started
+                // under that count one trolley ago is still averaging, so the scale re-labels and
+                // re-weighs the shackle really on it (capture / average re-armed, previousShackle = -1)
+                // and that weighment simply replaces the early one. With SkipTrollies 0 the early
+                // weighment (a whole shackle ago) has completed and been assigned, so the scale pass
+                // is skipped too (xcSuppressScale): no slot is weighed and assigned twice. Either way
+                // the shackle-to-shackle timing restarts. Standard mode: never set.
+                bool xcSuppress      = false;
+                bool xcSuppressScale = false;
+#if SS_CROSSCHECK
+                if ((pShm->ZeroFlagMode == 1) && !ssTab)
+                {
+                    int xcShift = SingleSensorXCCheck(i, NumSyncs);
+                    if (xcShift && SingleSensorXCApply(i, xcShift, NumSyncs))
+                    {
+                        xcSuppress      = true;
+                        xcSuppressScale = (pShm->sys_set.SkipTrollies <= 0);
+                        if (i == SCALE1SYNCBIT) app->cur_shk2shk_ticks = 0;
+                        if (!xcSuppressScale)
+                        {
+                            if (i == SCALE1SYNCBIT) app->previousShackle1 = -1;
+                            if (i == SCALE2SYNCBIT) app->previousShackle2 = -1;
+                        }
+                    }
+                }
+#endif
 
 //----- Reset status at scale 1 and trigger weighing
 
-                if ( SYNC_OK && (i == SCALE1SYNCBIT))
+                if ( SYNC_OK && (i == SCALE1SYNCBIT) && !xcSuppressScale)   // 15.7.16 (see above)
                 {
                     // clear drop & weight at scale 1
                     pShm->ShackleStatus[pSyncStat->shackleno].drop[0]   = 0;
@@ -11789,7 +12589,7 @@ void overhead::ProcessSyncs()
                 }
 
                 // trigger weighing for scale 2
-                if ( SYNC_OK && dual_scale && (i == SCALE2SYNCBIT) )
+                if ( SYNC_OK && dual_scale && (i == SCALE2SYNCBIT) && !xcSuppressScale )   // 15.7.16
                 {
                     pShm->ShackleStatus[pSyncStat->shackleno].drop[1]   = 0;
 					pShm->ShackleStatus[pSyncStat->shackleno].weight[1] = 0;
@@ -11925,7 +12725,8 @@ void overhead::ProcessSyncs()
                     (!dual_scale              &&
                     (i != SCALE2SYNCBIT)))    &&
                     (pShm->OpMode == ModeRun) &&
-                    !ssTabDup )               // 15.7.14: tab repeating the body pulse's pass
+                    !ssTabDup &&              // 15.7.14: tab repeating the body pulse's pass
+                    !xcSuppress )             // 15.7.16: count moved back onto an already-run pass
                 {
                     ssPassRan = true;         // 15.7.14: arms ss_ovr_pass[i] at the end of the edge
 
