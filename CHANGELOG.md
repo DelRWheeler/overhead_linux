@@ -55,6 +55,10 @@ shm layout are unchanged.
 - Tests on the merged tree (same results as on each branch): `sszero_tab_dup_test` 354/354,
   `sszero_window_test` 7765/7765, `sszero_crosscheck_test` 1720/1720, `errqueue_test` 38/38,
   `batchlabel_slots_test` 62/62.
+- Merged into `master`, which brings in `e6fd009`: `linux_port/interface/dch-server-gui.service`
+  (`Restart=always` + `StartLimitIntervalSec=0`). This is interface/provisioning only, not the
+  `overhead` binary. It is the reference copy of the policy that `commission-stack.sh` already
+  applies in place to each box's unit.
 
 `APP_VER3` 16 -> 17 (mainline 14 -> 17).
 
