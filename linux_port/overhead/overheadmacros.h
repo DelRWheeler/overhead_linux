@@ -1,10 +1,17 @@
 #pragma once
 
 // save drop records, clear outputs and shutdown
+//
+// 15.7.13: clear the outputs FIRST, then do the record bookkeeping. The old
+// order slept 500 ms with the scan still running and outputs still up before
+// clearing them, which is the same hole that left drops energized on the
+// ShutdownHandler path. ClearOutputs() arms the outputs-disabled interlock, so
+// once the first line below has run nothing can re-energize an output while the
+// rest of this shutdown completes.
 #define EXCEPTION_SHUTDOWN \
+app->ClearOutputs(); \
 app->saveDrpRecs = true; \
 Sleep(500); \
-app->ClearOutputs(); \
 if (isPShmValid()) { logAppFlagsChange("EXCEPTION_SHUTDOWN macro"); app->pShm->AppFlags = 0; }
 
 #define SYNC_OK     (pSyncStat->zeroed) && (trolly_counters[i] == syncOffset) //jdc
@@ -57,7 +64,10 @@ if ((pShm->sys_set.DropSettings[idx].Active) && DBG_DROP(idx, pShm))\
 
 
 
+// 15.7.14: ReleaseCutShortLabel first, while batch_number/Batched still hold the
+// old batch - frees its label slot if the batch never completed (no-op otherwise).
 #define  CLEAR_DROP_BATCH(drp, pShm) \
+app->ReleaseCutShortLabel(drp); \
 pShm->sys_stat.ScheduleStatus[drp].BchActCnt = 0; \
 pShm->sys_stat.ScheduleStatus[drp].BchActWt  = 0; \
 pShm->sys_stat.DropStatus[drp].Batched       = 0; \
@@ -124,24 +134,22 @@ if (DBG_DROP(drop, pShm))  \
 
 //----- Check mode and assign a new batch number. Limit to F423F 999999 (6 digits)
 //      add line number in upper nibble
+//      15.7.14: NextBatchNumber() = the old nxt_lbl_seqnum + line_mult / wrap at
+//      MAXBCHLBLNUM, but skips a number still open on a drop or held in a label slot.
 
 #define APPLY_BATCH_NUMBER(drp, drop_master) \
 { \
-	UINT line_mult; \
 	if ( ((drop_master == this_lineid) || (drop_master == NOT_AN_ISYS_DROP)) && \
 		 (pShm->sys_stat.DropStatus[drp].batch_number == 0) ) \
 	{ \
-		line_mult = this_lineid << LINE_SHIFT; \
 		switch(pShm->Schedule[drp].DistMode) \
 		{ \
 			case mode_3_batch: \
 			case mode_5_batch_rate: \
 			case mode_6_batch_alt_rate: \
 			case mode_7_batch_alt_rate: \
-				pShm->sys_stat.DropStatus[drp].batch_number = sav_drp_rec_file_info.nxt_lbl_seqnum + line_mult; \
+				pShm->sys_stat.DropStatus[drp].batch_number = app->NextBatchNumber(); \
 				if (HOST_OK) {LABEL_INFO(drp)} \
-				if(++sav_drp_rec_file_info.nxt_lbl_seqnum >= MAXBCHLBLNUM) \
-				   sav_drp_rec_file_info.nxt_lbl_seqnum = 1; \
 				break; \
 			default: \
 				break; \
@@ -280,6 +288,9 @@ if ISYS_ENABLE \
 }
 
 //----- Populate data for batch labels
+//      15.7.14: the slot comes from GetLabelSlot(), which reuses a finished slot
+//      when the table is full and reports to the host instead of silently
+//      dropping the batch (the old loop simply found nothing and sent no 310).
 
 #define LABEL_INFO(drp) \
 { \
@@ -288,12 +299,12 @@ if ISYS_ENABLE \
     struct  tm *ptime; \
     time( &long_time ); \
     ptime = localtime( &long_time ); \
-    for (lp = 0; lp < MAXBCHLABELS; lp++) \
+    lp = app->GetLabelSlot(drp); \
+    if (lp >= 0) \
     { \
-        if (app->batch_label.info[lp].seq_num == 0) \
-        { \
             memcpy(&app->batch_label.info[lp].time, ptime, sizeof(tm)); \
             app->batch_label.info[lp].label_step    = 0; \
+            app->batch_label.info[lp].pre_label_step = 0; \
             app->batch_label.info[lp].drop          = drp+1; \
             app->batch_label.info[lp].cnt           = 0; \
             app->batch_label.info[lp].wt            = 0; \
@@ -304,8 +315,6 @@ if ISYS_ENABLE \
                          app->batch_label.info[lp].seq_num & BATCH_MASK, drp+1, lp); \
                 strcat((char*) &trc_buf[MAINBUFID],(char*) &tmp_trc_buf[MAINBUFID] ); \
             } \
-            break; \
-        } \
     } \
 }
 
@@ -361,7 +370,12 @@ RtPrintf("DrecSavBuf\t%d//%d//%d %d:%d seq\t%x\tshkl\t%d\n",  \
 
 #define HOST_OK (app->pShm->IsysLineStatus.connected[HOST_INDEX] != 0)
 
+// 15.7.14: release the label slot of every batch the memset below cuts short.
 #define CLEAR_TOTALS \
+{ \
+	for (int x = 0; x < MAXDROPS; x++) \
+		app->ReleaseCutShortLabel(x); \
+} \
 pShm->sys_stat.TotalCount       = 0; \
 pShm->sys_stat.TotalWeight      = 0; \
 memset(&pShm->sys_stat.MissedDropInfo, 0, sizeof(pShm->sys_stat.MissedDropInfo)); \

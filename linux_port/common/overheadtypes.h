@@ -154,7 +154,7 @@ typedef struct
 typedef struct 
 {
      byte   GradeIndex    [MAXSCALES];
-	 byte   spare         [2];
+	 byte   OmitFromDrop;   byte   spare [1];   /* SandCat: OmitFromDrop=1 => dead-zone/Auto-Span reference trolley, never distributed or recorded as a bird (repurposed from spare[0]; struct size unchanged, interface parity preserved) */
      int    dropped       [MAXSCALES];
      int    drop          [MAXSCALES];
      __int64 weight       [MAXSCALES];
@@ -512,7 +512,7 @@ typedef struct
 /*079*/        TShackleStatus       ShackleStatus[MAXPENDANT];     // self explanatory
 /*080*/        DBOOL                WeighZero[MAXSCALES];          // zeroed status of scale, set when zero flag passes
                char                 spare[2];                      // for 4 byte alignment
-/*081*/        int                  spare_int;                     // nothing
+/*081*/        int                  ZeroFlagMode;                  // was spare_int (RTSS keeps spare_int): 0=standard two-sensor zero, 1=single-sensor double-pulse zero. Same shmID 81/offset, host-pushed.
 /*082*/        int                  WeighShackle[MAXSCALES];       // shackle number just weighed
 /*083*/        int                  grade_shackle[MAXGRADESYNCS];	// shackle number at grade detect
 // Some group Ids (84-89) already defined. The stuff below was added later.
@@ -521,6 +521,40 @@ typedef struct
 /*091*/        mbx_state            mbx_status[MBX_STATUSES];      // mailbox status
 /*092*/        char                 app_ver[MAXVERINFO];        // version information for this application
 /*093*/        char                 comm_ver[MAXVERINFO];       // version information for communications
+
+               // --- Auto-Shutdown Settings (ported from EPM-19 overhead.rtss) ---
+               // Appended at struct end so existing offsets do not shift. The
+               // controller reads these; the host (Go API) writes them via the
+               // interface. Zero-initialized => feature OFF by default.
+               BOOL                 AutoShutdownEnabled;
+               int                  ShutdownDelaySecs;
+
+               // --- Single-sensor zero-flag tab window (host-pushed, ms). A second
+               // count edge whose gap after the trolley edge falls in
+               // [ZeroTabWindowMinMs, ZeroTabWindowMaxMs] is the zero TAB. Appended
+               // at struct end so existing offsets do not shift. SandCat/Linux only.
+               int                  ZeroTabWindowMinMs;
+               int                  ZeroTabWindowMaxMs;
+
+               // --- Scale sync offset (host-pushed, signed, normally 0/-1/-2/-3). The
+               // trolleys between the scale sync sensor and the weigh deck. Added into
+               // the drop/grade/missed-bird fire offsets so drop offsets are counted
+               // from 0 instead of baked-in. 0 = legacy (offsets carry it themselves).
+               // Appended at struct end so existing offsets do not shift. SandCat only. ---
+               int                  ScaleSyncOffset;
+
+               // --- Auto Calculate Span (continuous span verify vs a permanent welded
+               // known weight on the reference shackle = trolley 1 = shackleno 2).
+               // SandCat/Linux only; competitor-parity, deletes the morning Auto Span.
+               // Appended at struct end so existing offsets do not shift. Host-pushed
+               // fields (Enable/KnownWeight/ClampPpt) ride spare shmIDs 100/101/102;
+               // the rest are controller-owned state. See docs/AUTO_SPANIBRATION.md. ---
+               int                  AutoSpanEnable;                 // 0=off (Auto Span normal), 1=on (per line)
+               int                  AutoSpanRefShackle;             // reference shackle no (pinned by observation, 0=>default 2). Monitored for span + OMITTED from drop assignment.
+               __int64              AutoSpanKnownWeight;            // expected final_ref in internal weight units (host converts lbs)
+               int                  AutoSpanClampPpt;               // max |SpanBias - baseline| allowed, parts-per-thousand (default 20 = 2%)
+               __int64              AutoSpanSpanBaseline[MAXSCALES];// SpanBias captured at AutoTare; clamp reference (controller-owned)
+               int                  AutoSpanAlarm[MAXSCALES];       // 0=ok 1=held(clamp) 2=zero-bias-off 3=weight-missing (controller-owned)
 } SHARE_MEMORY;
 
 typedef struct

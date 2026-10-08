@@ -34,6 +34,13 @@
 #define TCP_KEEPALIVE_ENABLE    1       // Enable TCP keepalive
 #define TCP_NODELAY_ENABLE      1       // Disable Nagle algorithm for low latency
 
+// Aggressive keepalive timing: detect a dead/half-open peer (hard reboot or
+// power loss with no FIN sent) in ~25s instead of the ~2h Linux default, so a
+// ghost connection is reaped long before it can pile up to Max Clients.
+#define TCP_KEEPIDLE_SEC        10      // Begin probing after 10s of idle
+#define TCP_KEEPINTVL_SEC       5       // Probe every 5s thereafter
+#define TCP_KEEPCNT             3       // Declare dead after 3 missed probes (~25s)
+
 // Configuration structure for remote hosts
 // This replaces the pipe_path strings in IsysLineSettings
 // The IP addresses will be stored in shared memory similar to pipe paths

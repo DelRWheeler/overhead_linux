@@ -4,6 +4,11 @@
 
 #include "types.h"
 #include "telnetsrv.h"
+#include "BatchLabelSlots.h"   // 15.7.14 - pure slot bookkeeping, see "Batch label slots"
+#include <sys/socket.h>   // controller derives its line id from its own IP
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
 #ifdef _LC_SIM_
 #include "hbm_sim.h"
 #include "ispd_sim.h"
@@ -13,6 +18,36 @@
 
 #undef  _FILE_
 #define _FILE_      "overhead.cpp"
+
+// ControllerLineIdFromIP returns the line id implied by THIS box's controller-subnet
+// address on 192.168.100.0/24: .11->1, .12->2, .13->3, .14->4, and the spare parking
+// IP .15->5. Returns 0 when no 192.168.100.11-.15 address is present, so the caller
+// falls back to the stored this_line_id. This makes a controller's identity follow the
+// physical slot it is plugged into rather than whatever was baked into a cloned SSD:
+// a freshly-cloned spare on the parking IP .15 comes up as line 5 -- a line the host
+// does not route (host path already special-cases srcLineId==5) -- so it can never
+// collide with a running line on power-up. Re-IP restarts the controller, which
+// re-derives.
+static int ControllerLineIdFromIP()
+{
+    struct ifaddrs* ifs = NULL;
+    if (getifaddrs(&ifs) != 0)
+        return 0;
+    int lineid = 0;
+    for (struct ifaddrs* p = ifs; p != NULL; p = p->ifa_next)
+    {
+        if (p->ifa_addr == NULL || p->ifa_addr->sa_family != AF_INET)
+            continue;
+        unsigned long a = ntohl(((struct sockaddr_in*) p->ifa_addr)->sin_addr.s_addr);
+        if ((a & 0xFFFFFF00UL) == 0xC0A86400UL)          // 192.168.100.0/24
+        {
+            int last = (int)(a & 0xFF);
+            if (last >= 11 && last <= 15) { lineid = last - 10; break; }
+        }
+    }
+    freeifaddrs(ifs);
+    return lineid;
+}
 
 //////////////////////////////////////////////////////////////////////
 // Global object pointers/handles
@@ -59,6 +94,94 @@ HANDLE          hSimTimer = NULL;
 HANDLE          hFstTimer = NULL;
 HANDLE          hShutdown = NULL;
 HANDLE          hInterfaceThreadsOk = NULL;
+
+// 15.7.13 - universal outputs-disabled interlock. See overheadext.h for the
+// rationale. Set on every shutdown/clear path, never cleared: once we have
+// decided to bring the outputs down, nothing may bring them back up.
+volatile sig_atomic_t g_outputs_disabled = 0;
+
+// 15.7.13 - serializes the read-modify-write of output_byte[] in SetOutput().
+//
+// output_byte[] is a shared bitmap touched from two different timer threads:
+// App_Timer_Main (5 ms - production drops via ProcessSyncs, DecCntrlCtrs
+// turn-off, test fire) and Gp_Timer_Main (500 ms - BatchResetStation's batched
+// station lamps). SETBIT/CLRBIT is a read-modify-write and the port write that
+// follows publishes the whole byte, so an interleave between the two threads
+// could lose a bit - including losing a turn-OFF, i.e. an output stuck on.
+//
+// On RTX this could not happen: RTSS serialized these callbacks by construction
+// (single timer dispatch, priority-ordered, non-preemptible against each other).
+// The Linux port runs them as genuinely concurrent SCHED_RR pthreads, so the
+// serialization has to be explicit. Locked ONLY inside SetOutput() so that
+// ClearOutputs() - which is called from signal-handler context and writes the
+// ports directly, never through SetOutput() - can never block on it.
+static pthread_mutex_t output_byte_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+//--------------------------------------------------------
+// 15.7.13 - logical drop number -> physical output pin map ("pin shift")
+//
+// WHY: an output driver on the card can die. Pitman Farms channel 11 is proven
+// dead at the latch - the controller's command lands correctly in the output
+// byte, but the signal never leaves the card. Rather than rewire the station or
+// renumber the schedule, re-point drop 11 at a spare physical pin.
+//
+// WHERE: applied inside SetOutput(), which is the ONE place a logical drop
+// number becomes a physical byte+bit. Every caller inherits it automatically -
+// production fire from ProcessSyncs(), the DecCntrlCtrs() turn-off pass, the
+// manual test fire, test-fire-at-zero, and BatchResetStation()'s station lamps.
+// There is no second path to the pins, so there is no way to end up with an
+// output that turns on through one route and cannot be turned off through
+// another.
+//
+// SWAP SEMANTICS: an entry "11=23" means 11 -> 23 AND 23 -> 11. Keeping the map
+// a bijection over pin space matters: a plain one-way redirect would let two
+// logical drops land on one physical pin, and then one of them could never be
+// shut off. The swap partner should be a number that can never be scheduled -
+// at Pitman NumDrops is 12, so pin 23 is unreachable by FindDrops() and the
+// fact that "drop 23" now points at the dead pin 11 is inert.
+//
+// DEFAULT IS IDENTITY. No file, empty file, or unreadable file leaves
+// OutputMap[i] == i for every i, which is bit-for-bit the pre-15.7.13
+// behaviour. No box changes behaviour unless someone deliberately places a file
+// on that box.
+//
+// Range is 1..24: the three PCM-3724 primary output ports (A1/B1/C1 at
+// 0x304/0x305/0x306). The VSBC6 secondary bytes are a different card with a
+// different write path and are deliberately out of scope.
+//--------------------------------------------------------
+
+#define OUTMAP_MIN_PIN   1
+#define OUTMAP_MAX_PIN   24
+
+static unsigned char OutputMap[OUTMAP_MAX_PIN + 1];   // 1-based; [0] unused
+static bool          OutputMapActive = false;         // true = a file changed something
+
+//--------------------------------------------------------
+//  InitOutputMap - reset the map to identity (no remapping)
+//--------------------------------------------------------
+
+static void InitOutputMap()
+{
+    for (int i = 0; i <= OUTMAP_MAX_PIN; i++)
+        OutputMap[i] = (unsigned char) i;
+
+    OutputMapActive = false;
+}
+
+//--------------------------------------------------------
+//  MapOutputPin - logical drop number -> physical output pin
+//
+// Hot path: called on every output transition. One compare and out unless a
+// valid map file was loaded at startup.
+//--------------------------------------------------------
+
+static inline int MapOutputPin(int num)
+{
+    if (!OutputMapActive)                              return num;
+    if (num < OUTMAP_MIN_PIN || num > OUTMAP_MAX_PIN)  return num;
+
+    return (int) OutputMap[num];
+}
 
 ser_typ::UCB   ucbList[COM_MAX_PORTS] = {
 
@@ -195,11 +318,11 @@ ser_typ::UCB   ucbList[COM_MAX_PORTS] = {
 	1						   //1 - RS422 option
 	},
 	{
-	COM4,                      //COM port
-	(PUCHAR)COM4_BADDR,        //base address
-	Serial::COM4Isr,           // isr handle
+	COM2,                      //COM port
+	(PUCHAR)COM2_BADDR,        //base address
+	Serial::COM2Isr,           // isr handle
 	0,                         //interrupt vector address
-	COM4_IRQ,                  //IRQ
+	COM2_IRQ,                  //IRQ
 	NULL,                      //pointer to input ring buff
 	NULL,                      //pointer to output ring buff
 	DEFAULT_FIFO_MASK,         //default FIFO mask
@@ -510,6 +633,29 @@ const int  nxt_cap_buf[2] = {1,0};
 overhead::overhead()
 {
 	syncOffset = 0;// offset from the scale sync to the scale.
+
+	// Power-loss auto-shutdown (ported from EPM-19) -- default OFF / safe.
+	System_Power_Status = false;   // false = power ON
+	AutoShutdown        = false;
+	PowerDownSecs       = 0;
+}
+
+//--------------------------------------------------------
+//  PostShutdownMessage  (ported from EPM-19; Linux version)
+//
+//  Called when the power-loss countdown expires. On the SandCat
+//  (Linux) the controller runs as root, so trigger a graceful OS
+//  shutdown directly. PRODUCTION: -h (poweroff) so the box parks
+//  safely before the UPS battery dies; it stays off until mains
+//  returns and someone powers it back on.
+//  (A test rig may use -r instead so the box self-recovers.)
+//--------------------------------------------------------
+void overhead::PostShutdownMessage()
+{
+    RtPrintf("PostShutdownMessage: triggering graceful shutdown (power lost).\n");
+    int rc = system("/sbin/shutdown -h now");   // PRODUCTION: -h (poweroff)
+    if (rc != 0)
+        RtPrintf("PostShutdownMessage: shutdown command returned %d\n", rc);
 }
 
 overhead::~overhead()
@@ -670,6 +816,14 @@ void overhead::initialize()
     RtPrintf("  Calling ReadConfiguration()...\n");
     ReadConfiguration();
     RtPrintf("  ReadConfiguration complete\n");
+
+//----- 15.7.13: optional logical drop -> physical output pin map.
+//      Must be loaded before InitIO()/the timers so the very first output
+//      transition already goes to the right pin. Absent file = identity.
+
+    RtPrintf("  Calling LoadOutputMap()...\n");
+    LoadOutputMap();
+    RtPrintf("  LoadOutputMap complete\n");
 
 //----- Set initial InterSystem fastest indices for each drop
 
@@ -1272,6 +1426,7 @@ void overhead::ReadConfiguration()
             fsave_grp_tbl[i].loaded = true;
     }
 
+
 //----- Read totals.
 
     len = sizeof(totals_info);
@@ -1712,6 +1867,10 @@ void overhead::InitLocals()
     app->sendBlockGranted        = false;
     app->configGroupCheck        = false;
     app->send_error.send         = false;
+    memset(app->errq, 0, sizeof(app->errq));   // 15.7.16: controller -> host message queue empty
+    app->errq_head               = 0;
+    app->errq_tail               = 0;
+    app->errq_dropped            = 0;
     app->saveTotals              = false;
     app->saveDrpRecs             = false;
     app->drp_rec_count           = 0;
@@ -1740,11 +1899,76 @@ void overhead::InitLocals()
         sync_debounce[i] = pShm->sys_set.SyncOn;
     }
 
+    // Single-sensor zero-flag detector timebase (ZeroFlagMode==1 only)
+    ss_scan_tick = 0;
+
+    // Sensor Scope capture off until the host enables it
+    syncCapMode = 0;
+    syncCapTriggerSync = -1;
+    syncCapPre = 200;
+    syncCapPost = 200;
+    syncCapHead = 0;
+    syncCapCount = 0;
+    syncCapPostLeft = 0;
+    syncCapTriggered = false;
+    syncCapEventAccum = 0;
+    for (i = 0; i < MAXSYNCS; i++)
+    {
+        ss_last_trolley_tick[i] = 0;
+        ss_trolley_interval[i]  = 0;
+        ss_trolley_stall[i]     = 0;
+        ss_tab_run[i]           = 0;       // 15.7.15: trolleys since boot (boot confirmation decides
+                                           // the first tab; see SingleSensorIsZeroTab)
+        ss_trolley_shrink[i]    = 0;
+        ss_ovr_pass[i]          = false;   // 15.7.14: single-sensor duplicate-pass guard
+        memset(&ss_rule[i], 0, sizeof(ss_rule[i]));   // 15.7.15: no gaps measured, not confirmed
+        ss_alarm_cnt[i]         = 0;       // 15.7.15: no zero-flag alarm until a revolution is counted
+        ss_zero_lost[i]         = false;   // 15.7.15
+        ss_xc_steady[i]         = 0;       // 15.7.16: cross-sync count check - nothing learned
+        ss_xc_refgap[i]         = 0;
+        ss_xc_clean[i]          = false;
+        ss_xc_anchor[i]         = false;
+        ss_xc_edges[i]          = 0;
+        ss_xc_vcnt[i]           = 0;
+    }
+    memset(ss_xc_pair, 0, sizeof(ss_xc_pair));   // 15.7.16
+    ss_xc_line_ok     = false;
+    ss_xc_dist_open   = false;
+    ss_xc_dist_pre_ok = false;
+    ss_xc_dist_zero   = false;
+    ss_xc_dist_evals  = 0;
+    ss_xc_dist_mask   = 0;
+    ss_xc_ok_before   = false;
+    ss_xc_pat_valid   = false;
+    ss_xc_pat_vmask   = 0;
+    ss_xc_pat_rezero  = 0;
+    memset(ss_xc_pat_lev, 0, sizeof(ss_xc_pat_lev));
+    ss_xc_prev_valid  = false;
+    ss_xc_prev_int    = false;
+    ss_xc_prev_vmask  = 0;
+    memset(ss_xc_prev_lev, 0, sizeof(ss_xc_prev_lev));
+    for (i = 0; i < MAXGRADESYNCS; i++)
+    {
+        ss_grade_last_trolley_tick[i] = 0;
+        ss_grade_trolley_interval[i]  = 0;
+        ss_grade_trolley_stall[i]     = 0;
+        ss_grade_tab_run[i]           = 0;       // 15.7.15 (see above)
+        ss_grade_trolley_shrink[i]    = 0;
+        ss_grade_ovr_pass[i]          = false;   // 15.7.14
+        memset(&ss_grade_rule[i], 0, sizeof(ss_grade_rule[i]));   // 15.7.15
+        ss_grade_alarm_cnt[i]         = 0;       // 15.7.15
+        ss_grade_zero_lost[i]         = false;   // 15.7.15
+    }
+
     for (i = 0; i < MAXGRADESYNCS; i++)
     {
         grade_armed[i]  = false;
         grade_zeroed[i] = false;
+        grade_debounce[i] = pShm->sys_set.SyncOn;
     }
+
+    cap_slowdown      = CAPTURE_SPEED;
+    capt_avg_slowdown = CAPTURE_SPEED;
 
 //----- Weight stuff
 
@@ -1803,6 +2027,15 @@ void overhead::InitLocals()
     for (i = 0; i < MAXBCHLABELS; i++)
         slave_batch[i]   = 0;
 
+    // 15.7.14 - slot bookkeeping (see "Batch label slots")
+    memset(label_alloc_seq, 0, sizeof(label_alloc_seq));
+    memset(label_err_buf,   0, sizeof(label_err_buf));
+    label_alloc_ctr        = 0;
+    label_reclaims         = 0;
+    label_unreported       = 0;
+    label_reclaim_msg_time = 0;
+    label_nofree_msg_time  = 0;
+
 #ifdef _SIMULATION_MODE_
 
     simulation_mode = true;
@@ -1833,6 +2066,12 @@ void overhead::SetDefaults()
 
 // There is no need to set anything in shared memory (pShm->) to
 // zero or false, it is cleared after allocated.
+
+//----- Auto Power On/Off Settings (ported from EPM-19)
+    System_Power_Status = false;            // assume external power present at startup
+    AutoShutdown        = pShm->AutoShutdownEnabled ? true : false;
+    PowerDownSecs       = pShm->ShutdownDelaySecs;
+    RtPrintf("Auto-shutdown enabled: %d, shutdown delay (secs): %d\n", AutoShutdown, PowerDownSecs);
 
 //----- Grading stuff. See "The Rest" for schedule grades.
 
@@ -2588,6 +2827,156 @@ void overhead::SendLabelInfo()
 }
 
 //--------------------------------------------------------
+//  Batch label slots (15.7.14)
+//
+//  batch_label.info[] holds one slot per numbered batch until the host has
+//  answered both PRN_BCH_REQ (310 -> 311) and PRN_BCH_PRE_REQ (320 -> 321).
+//  320 is only sent when the batch's last bird drops, so a batch cleared
+//  before it completed (operator RESET_BATCH, mode change, clear totals) held
+//  its slot until CLEAR_BATCH_RECS or a restart, and once all MAXBCHLABELS
+//  were held LABEL_INFO silently sent no 310 for any new batch. And after a
+//  319 / RESET_BCH_NUMS restarted the numbering, a new batch could take the
+//  number of one still open on another drop. The pure logic and the reasons
+//  each choice is invisible to both hosts are in BatchLabelSlots.h.
+//
+//  These run from several threads (timer scan, host mailbox, drop manager,
+//  intersystems), like every other batch_label access, so they trace with
+//  the thread-safe DebugTrace rather than a per-thread trc buffer.
+//--------------------------------------------------------
+
+#define LABEL_MSG_SECS  60      // at most one host ERROR_MSG of each kind per minute (a clock step back re-arms it)
+
+//----- Next batch number (line bits included), skipping numbers still in use.
+
+UINT overhead::NextBatchNumber()
+{
+    UINT open[MAXDROPS];
+    UINT was = sav_drp_rec_file_info.nxt_lbl_seqnum;
+    UINT num;
+    int  skipped = 0;
+
+    for (int d = 0; d < MAXDROPS; d++)
+        open[d] = pShm->sys_stat.DropStatus[d].batch_number;
+
+    num = BLS_NextBatchNumber(&sav_drp_rec_file_info.nxt_lbl_seqnum,
+                              (UINT) this_lineid << LINE_SHIFT, MAXBCHLBLNUM,
+                              open, MAXDROPS, batch_label.info, MAXBCHLABELS, &skipped);
+
+    if (skipped > 0)
+        DebugTrace(_LABELS_, "Lbl\tskip\t%d\tbch# from\t%u\tto\t%u\t(still open or queued)\n",
+                   skipped, was, num & BATCH_MASK);
+
+    return num;
+}
+
+//----- A slot for a new batch on drop drp. If the table is full, reuse the
+//      oldest slot the host has already opened (311 received) whose batch is no
+//      longer any drop's current batch. Never silent: both cases raise a
+//      rate-limited ERROR_MSG to the host.
+
+int overhead::GetLabelSlot(int drp)
+{
+    UINT   open[MAXDROPS];
+    UINT   new_bch = pShm->sys_stat.DropStatus[drp].batch_number;
+    int    idx;
+    time_t now;
+
+    idx = BLS_FindFree(batch_label.info, MAXBCHLABELS);
+
+    if (idx < 0)
+    {
+        for (int d = 0; d < MAXDROPS; d++)
+            open[d] = pShm->sys_stat.DropStatus[d].batch_number;
+
+        idx = BLS_PickReclaim(batch_label.info, MAXBCHLABELS, label_alloc_seq, open, MAXDROPS);
+        time(&now);
+
+        if (idx >= 0)
+        {
+            DebugTrace(_LABELS_, "Lbl\treclaim\tbch#\t%u\tdrop\t%d\tindx\t%d\tpre\t%d\tfor bch#\t%u\tdrop\t%d\n",
+                       batch_label.info[idx].seq_num & BATCH_MASK, batch_label.info[idx].drop, idx,
+                       batch_label.info[idx].pre_label_step, new_bch & BATCH_MASK, drp + 1);
+
+            label_reclaims++;
+            if ( (label_reclaim_msg_time == 0) || (now < label_reclaim_msg_time) ||
+                 ((now - label_reclaim_msg_time) >= LABEL_MSG_SECS) )
+            {
+                snprintf(label_err_buf[0], MAXERRMBUFSIZE,
+                         "Batch label table full (%d): reused the slot of batch %u (drop %d, already sent to host) "
+                         "for batch %u (drop %d). %u reuse(s) since last report.\n",
+                         MAXBCHLABELS, batch_label.info[idx].seq_num & BATCH_MASK, batch_label.info[idx].drop,
+                         new_bch & BATCH_MASK, drp + 1, label_reclaims);
+                GenError(informational, label_err_buf[0]);
+                label_reclaim_msg_time = now;
+                label_reclaims         = 0;
+            }
+
+            memset(&batch_label.info[idx], 0, sizeof(print_info));
+        }
+        else
+        {
+            DebugTrace(_LABELS_, "Lbl\tnoslot\tbch#\t%u\tdrop\t%d\t(all %d slots await PRN_BCH_RESP)\n",
+                       new_bch & BATCH_MASK, drp + 1, MAXBCHLABELS);
+
+            label_unreported++;
+            if ( (label_nofree_msg_time == 0) || (now < label_nofree_msg_time) ||
+                 ((now - label_nofree_msg_time) >= LABEL_MSG_SECS) )
+            {
+                snprintf(label_err_buf[1], MAXERRMBUFSIZE,
+                         "Batch %u (drop %d) NOT sent to host: all %d batch label slots are waiting for the "
+                         "host to answer PRN_BCH_REQ. %u batch(es) not sent since last report.\n",
+                         new_bch & BATCH_MASK, drp + 1, MAXBCHLABELS, label_unreported);
+                GenError(warning, label_err_buf[1]);
+                label_nofree_msg_time = now;
+                label_unreported      = 0;
+            }
+            return -1;
+        }
+    }
+
+    label_alloc_seq[idx] = ++label_alloc_ctr;
+    return idx;
+}
+
+//----- Drop drp's batch is about to be cleared (CLEAR_DROP_BATCH / CLEAR_TOTALS).
+//      If it never completed, no last-in-batch bird exists and no 320 will ever
+//      be sent for it: finish its slot now, or as soon as the host's 311 arrives.
+
+void overhead::ReleaseCutShortLabel(int drp)
+{
+    UINT bch;
+    int  idx, rc;
+
+    if ( (drp < 0) || (drp >= MAXDROPS) )
+        return;
+
+    bch = pShm->sys_stat.DropStatus[drp].batch_number;
+
+    // Not numbered, an InterSystems slave's temporary number, or another line's
+    // number (InterSystems: the slot lives on the master line only).
+    if ( (bch == 0) || (bch == TEMP_BATCH_NUM) || ((int) (bch >> LINE_SHIFT) != this_lineid) )
+        return;
+
+    // Completed: the shackle of its last bird still carries last_in_batch and
+    // will send the 320 when it drops. Leave the normal path alone.
+    if (pShm->sys_stat.DropStatus[drp].Batched)
+        return;
+
+    idx = BLS_FindSlot(batch_label.info, MAXBCHLABELS, bch);
+    rc  = BLS_MarkCutShort(batch_label.info, idx);
+
+    if ( (rc != BLS_FREE_NOW) && (rc != BLS_FREE_ON_ACK) )
+        return;
+
+    DebugTrace(_LABELS_, "Lbl\tcutshort\tbch#\t%u\tdrop\t%d\tindx\t%d\t%s\n",
+               bch & BATCH_MASK, drp + 1, idx,
+               (rc == BLS_FREE_NOW) ? "freed" : "frees on PRN_BCH_RESP");
+
+    if (rc == BLS_FREE_NOW)
+        memset(&batch_label.info[idx], 0, sizeof(print_info));
+}
+
+//--------------------------------------------------------
 //  UpdateHost: Send id update to host
 //--------------------------------------------------------
 
@@ -3068,6 +3457,53 @@ void __stdcall overhead::Gp_Timer_Main(PVOID addr)
         }
     }
 
+//================= Power-loss auto-shutdown ================= (ported from EPM-19)
+    {
+        static bool bPreviousPowerStatus = false;   // false = power ON at startup
+        static bool bShutdownWarningSent = false;
+        static int  nShutdownCountdown   = -1;      // -1 = inactive
+
+        // Refresh config from SHM each tick so a live UI toggle takes effect.
+        app->AutoShutdown  = app->pShm->AutoShutdownEnabled ? true : false;
+        app->PowerDownSecs = app->pShm->ShutdownDelaySecs;
+
+        // Power LOST (ON -> OFF)
+        if (app->System_Power_Status == true && bPreviousPowerStatus == false)
+        {
+            if (app->AutoShutdown && !bShutdownWarningSent)
+            {
+                RtPrintf("Power Interrupted. Auto-shutdown initiated.\n");
+                sprintf(app_err_buf, "Power Interrupted. Shutting down in %d secs.\n", app->PowerDownSecs);
+                app->GenError(warning, app_err_buf);
+                nShutdownCountdown   = app->PowerDownSecs * 2;  // Gp_Timer runs every 0.5s
+                bShutdownWarningSent = true;
+            }
+        }
+        // Power RESTORED (OFF -> ON)
+        else if (app->System_Power_Status == false && bPreviousPowerStatus == true)
+        {
+            RtPrintf("Power Restored.\n");
+            sprintf(app_err_buf, "Power Restored.\n");
+            app->GenError(informational, app_err_buf);
+            bShutdownWarningSent = false;
+            nShutdownCountdown   = -1;
+        }
+        bPreviousPowerStatus = app->System_Power_Status;
+
+        // Process the countdown
+        if (nShutdownCountdown > 0)
+        {
+            nShutdownCountdown--;
+            if (nShutdownCountdown == 0)
+            {
+                RtPrintf("Auto-shutdown countdown expired -- shutting down now.\n");
+                app->PostShutdownMessage();
+                nShutdownCountdown = -1;
+            }
+        }
+    }
+//================= end Power-loss auto-shutdown =================
+
 //----- Every hour, print the time for a time reference in the rtx log
 
     time( &long_time );
@@ -3112,7 +3548,13 @@ void __stdcall overhead::Gp_Timer_Main(PVOID addr)
             sec30_OK  = (((app->pShm->sys_stat.PPMTimer % 30 ) == 0 ) ? true  : false);
         }
 
-        app->this_lineid  =    app->pShm->sys_set.IsysLineSettings.this_line_id;
+        // Identity follows the physical slot: derive this line id from the box's own
+        // controller-subnet IP (.11-.14 -> line 1-4, spare parking .15 -> line 5) so a
+        // cloned spare can never announce a running line's number. Computed once (re-IP
+        // restarts the controller). Falls back to the stored setting off the .11-.15 range.
+        static int ip_lineid = ControllerLineIdFromIP();
+        app->this_lineid  =    (ip_lineid > 0) ? ip_lineid
+                                               : app->pShm->sys_set.IsysLineSettings.this_line_id;
         app->dual_scale   = (((app->pShm->scl_set.NumScales )      == 2 ) ? true  : false);
 
 //----- Show any change in host comm status
@@ -3433,11 +3875,9 @@ void __stdcall overhead::GpSendThread(PVOID unused)
 
 //----- Check to see if there are any error messages to send
 
-        if (HOST_OK && app->send_error.send)
-        {
+        // 15.7.16: drain the whole queue (every message, in order), not one slot
+        if (HOST_OK && app->ErrQueuePending())
             app->SendError();
-            app->send_error.send = false;
-        }
 
 //----- Check to see if there are any needed settings
 
@@ -3681,6 +4121,10 @@ void __stdcall overhead::App_Timer_Main(PVOID addr)
     // Guard: skip if pShm is invalid (prevents SIGSEGV in timer callback)
     if (!isPShmValid()) return;
 
+    // Monotonic scan counter for the single-sensor zero-flag detector (5 ms/tick).
+    // GradeSyncs() and ProcessSyncs() below share this value within one scan.
+    app->ss_scan_tick++;
+
     // Figure out how many ticks between shackles 1 & 2. It is used
     // to stop the weigh average routine in time to calculate average
     // weight before the next shackle.
@@ -3792,12 +4236,66 @@ void __stdcall overhead::App_Timer_Main(PVOID addr)
     // Decrement output counters and turn off output
     app->DecCntrlCtrs();
 
+    // Sensor Scope: clear this scan's detector-event flags before sync processing
+    // sets them, so SyncCaptureScan (after ProcessSyncs) records a fresh value.
+    app->syncCapEventAccum = 0;
+
     //grade sync and count error handling
     if (app->pShm->sys_set.Grading) app->GradeSyncs();
 
     //  Main sync processing routine
     //  Keep ProcessSyncs before switch statement
     app->ProcessSyncs();
+
+    // Sensor Scope: append this scan's raw inputs + event flags (no-op when off)
+    app->SyncCaptureScan();
+
+    // Test Fire Drops (Delphi FireDrops): fire the kicker here — AFTER
+    // DecCntrlCtrs() and in the same part of the scan as production drops
+    // (SetOutput at the tail of ProcessSyncs), so the kick timer isn't
+    // decremented in the same pass. RTX did this in DebugThread, but on Linux
+    // iopl() is per-thread so a DebugThread outb() is silently lost — the main
+    // scan thread holds the port privilege.
+    //
+    // Hold the paddle open ~5 s (1000 ticks * 5 ms App timer) like the RTSS test
+    // fire, not the normal ~250 ms (DropOn) kick: long enough to watch on the line
+    // and verify the cylinder. THIS IS WHY TEST FIRE MUST NEVER RUN DURING
+    // PRODUCTION — a 5 s open paddle will catch the next bird and bend the cylinder.
+    if (app->pShm->dbg_set.dbg_output)
+    {
+        int testDrop = app->pShm->dbg_set.dbg_output;
+
+        // 15.7.13: WARNING ONLY - always perform the fire.
+        //
+        // An earlier cut of this change refused the request while
+        // OpMode == ModeRun, borrowing the LC_REINIT guard's idiom. That is
+        // WRONG here and was caught before it shipped: OpMode sits at ModeRun
+        // during normal operation whether or not the chain is turning. Pitman
+        // ran ModeRun all afternoon on 2026-07-26 with the chain physically
+        // stopped while dozens of manual test fires were performed - that is
+        // the standard commissioning workflow and has been for 25 years. A
+        // refusal on ModeRun would block every legitimate test fire.
+        //
+        // So: log it and fire it. The pre-15.7.13 behaviour is preserved
+        // exactly; the only addition is a breadcrumb in the log.
+        //
+        // A real "the chain is actually moving" guard needs sync/SPM activity,
+        // not OpMode. Deferred to 15.7.14 as a daylight item - it is the guard
+        // the hazard comment above actually wants, and getting it wrong in
+        // either direction is costly.
+        if (app->pShm->OpMode == ModeRun)
+        {
+            RtPrintf("Test Fire drop %d: 5 s hold while OpMode=ModeRun. "
+                     "Confirm the chain is stopped - a 5 s open paddle will "
+                     "catch a bird and bend the cylinder.\n", testDrop);
+        }
+
+        app->SetOutput(testDrop, true);
+        if (testDrop >= 1 && testDrop <= MAXOUTPUTBYTS * 8)
+            app->output_timer[testDrop - 1] = 1000;   // ~5 s hold (1000 * 5 ms)
+
+        app->pShm->dbg_set.dbg_output = 0;
+    }
 
     switch(app->pShm->OpMode)
     {
@@ -4015,6 +4513,13 @@ void overhead::AverageWeight(int scale)
                     if ( (capt_wt.mode  == prod_capt) && (capt_wt.scale == scale + 1) )
                     {
                         w_avg[scale].capt_hold = true;
+                        // Capture EVERY averaging sample on the plateau (matches the RTSS
+                        // reference).  The previous 1-per-CAPTURE_SPEED subsampling via
+                        // capt_avg_slowdown collapsed the plateau to ~3 held steps on the
+                        // HBM lines, so the timing waveform showed a staircase instead of
+                        // the analog trace and could not be used to set the weighment
+                        // position.  The weighment average (w_avg) is unaffected by this;
+                        // it only restores display resolution to match lines 2-4 / RTSS.
                         CAPTURE_WT = wt;
                         capt_wt.curr_index++;
                     }
@@ -4176,7 +4681,10 @@ void overhead::AverageWeight(int scale)
 
 void overhead::CaptureLcData()
 {
-    static int cap_slowdown = CAPTURE_SPEED;
+    // cap_slowdown is now a member, re-phased to CAPTURE_SPEED at each shackle sync
+    // (ProcessSyncs) so the number of lead-in samples before the bird arrives is the
+    // same every frame -- the free-running static used to drift it +/-1, which slid
+    // the whole waveform back and forth relative to the fixed measurement lines.
 
 //----- Reset variables if mode changed to no capture.
 
@@ -4189,6 +4697,12 @@ void overhead::CaptureLcData()
 
 //----- Reading weights, slow down because the load cell card can't convert as
 //      fast as the app timer.
+//
+//      RTSS-EXACT: unconditional, both load-cell types. An earlier change here
+//      gated this to LOADCELL_TYPE_1510 only, on the theory that the HBM had no
+//      such limit. That was a deviation from the authority and it did NOT cure the
+//      stair-stepping (RTSS runs this thinning and its waveform is correct), so it
+//      has been reverted per Del 2026-07-25: replicate RTSS, do not reinterpret.
 
     if (--cap_slowdown > 0) return;
     else  cap_slowdown = CAPTURE_SPEED;
@@ -4710,6 +5224,33 @@ void overhead::ProcessMbxMsg()
             }
             break;
 
+        case SET_SYNC_CAPTURE:           // Sensor Scope: {mode, triggerSync, pre, post}
+            {
+                int *p = (int*) &MbMsg->gen.data;
+                SetSyncCapture(p[0], p[1], p[2], p[3]);
+            }
+            break;
+
+        case LC_REINIT:                  // Manual HBM re-init: recover a frozen load cell w/o restart
+            {
+                // Payload: int32 scale (1-based; 0 = all configured scales). Only allowed
+                // when the line is STOPPED (OpMode != ModeRun) so serial comms are never
+                // re-initialized mid-production. Preserves zero (init_adc touches only ADC
+                // comms, never the shackle zero/AutoBias). Runs on the LC worker thread.
+                int scale = *((int*) &MbMsg->gen.data);
+                if (pShm->OpMode == ModeRun)
+                {
+                    GenError(warning, (char*)"Load Cell re-init ignored - stop the line first.\n");
+                }
+                else
+                {
+                    if ((scale == 0 || scale == 1) && HBMLc)  HBMLc->RequestReinit();
+                    if ((scale == 0 || scale == 2) && HBMLc2) HBMLc2->RequestReinit();
+                    RtPrintf("LC_REINIT requested (scale=%d) - worker thread will re-run init_adc.\n", scale);
+                }
+            }
+            break;
+
 //----- These cases below are for testing without a host. The messages can be redirected
 //      to self and responses will be generated here.
 
@@ -5024,6 +5565,205 @@ int __stdcall overhead::MbxEventHandler(PVOID unused)
 }
 
 //--------------------------------------------------------
+//  LoadOutputMap - read the optional logical->physical output pin map
+//
+// File (absent on every box unless deliberately placed):
+//     <dchservices>/data/settings/output_map.cfg
+//
+// Format - one mapping per line, '#' starts a comment, blank lines ignored:
+//     11=23          # drop 11 fires physical pin 23 (and pin 23 <- drop 23 -> 11)
+//
+// Each line is a SWAP, so pin space always stays one-to-one. See the OutputMap
+// block at the top of this file for why.
+//
+// Validation is strict and ALL-OR-NOTHING: any bad line rejects the whole file
+// and leaves the map at identity. A half-applied map would be far more
+// dangerous than no map - a drop could fire on one pin and clear on another.
+//--------------------------------------------------------
+
+void overhead::LoadOutputMap()
+{
+    int i;
+
+    InitOutputMap();                       // identity unless a good file says otherwise
+
+    FILE* fp = fopen(OUTMAP_FILE_PATH, "r");
+
+    if (fp == NULL)
+    {
+        // The normal case for the whole fleet. Not an error, but say so out loud
+        // so the log always states which regime this box is in.
+        RtPrintf("OUTPUT MAP: no %s - outputs are 1:1 (drop N fires pin N).\n",
+                 OUTMAP_FILE_PATH);
+        return;
+    }
+
+    unsigned char tmp     [OUTMAP_MAX_PIN + 1];
+    bool          assigned[OUTMAP_MAX_PIN + 1];
+
+    for (i = 0; i <= OUTMAP_MAX_PIN; i++)
+    {
+        tmp[i]      = (unsigned char) i;
+        assigned[i] = false;
+    }
+
+    char line[256];
+    int  lineno  = 0;
+    int  entries = 0;
+    bool bad     = false;
+
+    while (fgets(line, sizeof(line), fp) != NULL)
+    {
+        lineno++;
+
+        // strip comment
+        char* hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+
+        // skip blank / whitespace-only
+        char* p = line;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p == '\0') continue;
+
+        int  logical = 0, physical = 0;
+        char trailing = 0;
+
+        // Exactly two numbers and nothing else. The leading space before %c
+        // eats the newline, so a clean line returns 2 and any trailing junk
+        // returns 3.
+        if (sscanf(p, " %d = %d %c", &logical, &physical, &trailing) != 2)
+        {
+            RtPrintf("OUTPUT MAP ERROR: %s line %d: expected 'logical=physical', got: %s\n",
+                     OUTMAP_FILE_PATH, lineno, p);
+            bad = true;
+            break;
+        }
+
+        if (logical  < OUTMAP_MIN_PIN || logical  > OUTMAP_MAX_PIN ||
+            physical < OUTMAP_MIN_PIN || physical > OUTMAP_MAX_PIN)
+        {
+            RtPrintf("OUTPUT MAP ERROR: %s line %d: '%d=%d' - both numbers must be %d..%d "
+                     "(the three PCM-3724 primary output ports).\n",
+                     OUTMAP_FILE_PATH, lineno, logical, physical,
+                     OUTMAP_MIN_PIN, OUTMAP_MAX_PIN);
+            bad = true;
+            break;
+        }
+
+        if (assigned[logical] || assigned[physical])
+        {
+            RtPrintf("OUTPUT MAP ERROR: %s line %d: '%d=%d' - output %d is already used by an "
+                     "earlier line. Each output number may appear only once, on either side.\n",
+                     OUTMAP_FILE_PATH, lineno, logical, physical,
+                     assigned[logical] ? logical : physical);
+            bad = true;
+            break;
+        }
+
+        // Swap - keeps the map a bijection over pin space.
+        tmp[logical]  = (unsigned char) physical;
+        tmp[physical] = (unsigned char) logical;
+
+        assigned[logical]  = true;
+        assigned[physical] = true;
+
+        if (logical != physical) entries++;
+    }
+
+    fclose(fp);
+
+    // Belt and braces: prove the result really is one-to-one before we trust it
+    // with the outputs. Cheap, and it can only ever fire on a logic error above.
+    if (!bad)
+    {
+        bool seen[OUTMAP_MAX_PIN + 1];
+
+        for (i = 0; i <= OUTMAP_MAX_PIN; i++) seen[i] = false;
+
+        for (i = OUTMAP_MIN_PIN; i <= OUTMAP_MAX_PIN; i++)
+        {
+            int v = tmp[i];
+
+            if (v < OUTMAP_MIN_PIN || v > OUTMAP_MAX_PIN || seen[v])
+            {
+                RtPrintf("OUTPUT MAP ERROR: %s does not produce a one-to-one map "
+                         "(output %d is reached more than once).\n", OUTMAP_FILE_PATH, v);
+                bad = true;
+                break;
+            }
+            seen[v] = true;
+        }
+    }
+
+    if (bad)
+    {
+        InitOutputMap();                   // back to identity - reject the WHOLE file
+
+        RtPrintf("***************************************************************\n");
+        RtPrintf("*** OUTPUT MAP REJECTED - %s ignored.\n", OUTMAP_FILE_PATH);
+        RtPrintf("*** Outputs are 1:1 (drop N fires pin N). Fix the file and restart.\n");
+        RtPrintf("***************************************************************\n");
+
+        sprintf(app_err_buf,
+                "Output map file invalid - ignored, outputs are 1:1\n");
+        GenError(warning, app_err_buf);
+        return;
+    }
+
+    if (entries == 0)
+    {
+        RtPrintf("OUTPUT MAP: %s present but contains no mappings - outputs are 1:1.\n",
+                 OUTMAP_FILE_PATH);
+        return;
+    }
+
+    memcpy(OutputMap, tmp, sizeof(OutputMap));
+    OutputMapActive = true;
+
+    // Loud on purpose. This is the answer for the next technician who meters a
+    // pin, finds nothing, and has no idea the box is remapped.
+    RtPrintf("***************************************************************\n");
+    RtPrintf("*** OUTPUT MAP ACTIVE - physical pins do NOT match drop numbers\n");
+    RtPrintf("*** Source: %s\n", OUTMAP_FILE_PATH);
+
+    for (i = OUTMAP_MIN_PIN; i <= OUTMAP_MAX_PIN; i++)
+    {
+        // print each swapped pair once, from the lower number
+        if ((int) OutputMap[i] > i)
+            RtPrintf("*** OUTPUT MAP: drop %d -> pin %d (and %d -> %d)\n",
+                     i, (int) OutputMap[i], (int) OutputMap[i], i);
+    }
+
+    RtPrintf("*** All other outputs are 1:1.\n");
+
+    // Boaz mode drives logical outputs 13..16 as the per-station "batched"
+    // lamps (BatchResetStation). Those are real consumers of pin space, so a
+    // map that touches 13..16 while Boaz is enabled will send a lamp to the
+    // swapped pin and put a drop on the lamp's wiring. Warn loudly rather than
+    // reject: the map may still be exactly what the site wants, but nobody
+    // should discover this by watching a lamp stop working.
+    if (pShm->sys_set.MiscFeatures.EnableBoazMode)
+    {
+        for (i = 13; i <= 16; i++)
+        {
+            if ((int) OutputMap[i] != i)
+            {
+                RtPrintf("*** WARNING: Boaz mode is ENABLED and output %d is remapped.\n", i);
+                RtPrintf("***          Outputs 13-16 are the Boaz batched-station lamps;\n");
+                RtPrintf("***          station %d's lamp now drives pin %d. Verify the wiring.\n",
+                         i - 12, (int) OutputMap[i]);
+
+                sprintf(app_err_buf,
+                        "Output map remaps output %d while Boaz mode is on - check station wiring\n", i);
+                GenError(warning, app_err_buf);
+            }
+        }
+    }
+
+    RtPrintf("***************************************************************\n");
+}
+
+//--------------------------------------------------------
 //  ClearOutputs
 //--------------------------------------------------------
 
@@ -5031,6 +5771,22 @@ void overhead::ClearOutputs()
 {
     const PUCHAR out_port[MAXOUTPUTBYTS-2] = {PCM_3724_1_PORT_A1,PCM_3724_1_PORT_B1,
                                               PCM_3724_1_PORT_C1};
+
+//----- 15.7.13: arm the interlock BEFORE the first port write.
+//
+//      Every caller of ClearOutputs() is a shutdown path, and every one of them
+//      previously had the same hole: the clear happened, then the still-running
+//      scan put outputs straight back up. Setting the flag here makes that
+//      impossible for every caller at once, including the EXCEPTION_SHUTDOWN
+//      macro paths in DropManager.cpp / InterSystems.cpp.
+//
+//      Deliberately NOT taking output_byte_mutex: this function runs from
+//      signal-handler context (ShutdownHandler) and must never be able to block
+//      on a lock held by a thread we are about to stop. The interlock above plus
+//      the settle delay the callers apply after cancelling the timers is what
+//      closes the race, not the mutex.
+
+    g_outputs_disabled = 1;
 
 //----- primary i/o
 
@@ -5221,7 +5977,7 @@ void overhead::Check_Adc_Settings(int scale)
 				}
 				else
 				{
-					app->ld_cel[scale]->set_adc_mode(scale, app->pShm->scl_set.AdcMode[0]);
+					app->ld_cel[scale]->set_adc_mode(0, app->pShm->scl_set.AdcMode[0]);
 				}
 
                 if(!RtReleaseMutex(load_cell_mutex[GPBUFID]))
@@ -5505,6 +6261,838 @@ void overhead::DecCntrlCtrs()
 }
 
 //--------------------------------------------------------
+//  SingleSensorIsZeroTab
+//
+// Single-sensor zero-flag detector (ZeroFlagMode==1). Competitor controllers we
+// are replacing (CA/Trinidad) use ONE sensor per sync; the zero marker is a
+// sheet-metal tab that makes the count sensor read a DOUBLE pulse:
+//   flag trolley body --(~0.25..0.5 of a trolley pitch)--> tab.
+// So a confirmed count edge that arrives well inside one trolley gap is the TAB
+// (= shackle zero); otherwise it is a real trolley.
+//
+// Called exactly once per confirmed count edge for the sync. Returns true = this
+// edge is the zero tab, false = trolley. The tab does NOT advance the trolley
+// timebase, so the trolley after the tab still measures a full gap.
+//
+// 15.7.15 - MEASURED GAP, NOT A GUESSED WINDOW. The decision is SingleSensorTabRule()
+// (below), fed with the line's own most recent trolley gaps G and G2. Until 15.7.14 it
+// was "0.18..0.50 x the slow EMA interval, AND inside the host's ms rails". Two faults:
+//  - the ms rail (Pitman ZeroTabWindowMaxMs = 375) rejected the genuine tab whenever the
+//    line ran slower than ~33.6 SPM (tab = 0.42 x 30000/SPM ms), so a turkey line running
+//    slow lost its zero every revolution: counter drift, drops on the wrong trolleys;
+//  - the EMA lags a speed change by several trolleys, which is what produced the July
+//    stale-T runaway (ordinary trolleys landing inside a too-large window).
+// The ms rails (ZeroTabWindowMinMs/MaxMs) are therefore NO LONGER CONSULTED. The shm
+// fields and the host push stay as they are (struct layout and wire unchanged); the
+// controller simply ignores the values.
+//
+// UNCHANGED from 15.7.14: the EMA `interval` and its oversized-gap stall re-seed and
+// undersized-gap shrink re-seed (they keep `interval` sane for the stall test), and the
+// return / timebase semantics. Bookkeeping added (SSTabRuleState): G/G2 advance at every
+// timebase advance; `tabRun` now counts EVERY trolley-classified edge (it used to skip
+// the oversized-gap edges, and a rejected in-window edge reset it to 0) so the revolution
+// gate sees the true number of trolleys since the last tab; boot confirmation
+// (SS_BOOT_CONFIRM) decides the first tab after boot.
+//--------------------------------------------------------
+
+bool overhead::SingleSensorIsZeroTab(__int64 &lastTrolleyTick, __int64 &interval, int &stall, int &tabRun, int &shrink,
+                                     SSTabRuleState &rs)
+{
+    __int64 now = ss_scan_tick;          // App_Timer_Main: one tick per 5 ms scan
+
+    if (lastTrolleyTick == 0)            // very first edge: start the timebase
+    {
+        lastTrolleyTick = now;
+        SingleSensorTrolleyEdge(tabRun, rs);
+        return false;                    // can't classify yet -> trolley
+    }
+
+    __int64 delta = now - lastTrolleyTick;
+
+    if (interval <= 0)                   // second edge: seed the running interval
+    {
+        interval        = delta;
+        rs.gapPrev      = rs.gap;
+        rs.gap          = delta;
+        lastTrolleyTick = now;
+        SingleSensorTrolleyEdge(tabRun, rs);
+        return false;                    // -> trolley
+    }
+
+    if (delta > interval * 3)            // oversized gap: genuine stop OR corrupt-small T
+    {
+        // A real line stop is a one-off big gap, then normal trolleys resume. But if
+        // oversized gaps PERSIST, the learned T has been corrupted SMALL (a bad seed
+        // from a stop/start), so every real trolley now reads as "stopped" and T never
+        // grows. Self-heal: after a few consecutive oversized gaps, re-seed T from the
+        // actual trolley interval. (15.7.15: the tab rule uses the measured gaps G/G2, not
+        // this EMA; its gap-agreement test (b) keeps the trolleys right after a stop from
+        // qualifying a tab.)
+        if (++stall >= 4)
+        {
+            interval = delta;            // adopt the real trolley gap as the new T
+            stall = 0;
+        }
+        shrink          = 0;             // 15.7.12: oversized run breaks any undersized run
+        rs.gapPrev      = rs.gap;        // 15.7.15
+        rs.gap          = delta;
+        lastTrolleyTick = now;
+        SingleSensorTrolleyEdge(tabRun, rs);   // 15.7.15: a trolley all the same
+        return false;                    // -> trolley (do not pollute the EMA)
+    }
+    stall = 0;                           // a normally-spaced edge arrived: not stalled
+
+    // 15.7.15 tab decision. Steady state (a tab already accepted since boot): the full rule,
+    // revolution gate included. Boot: the gate is replaced by boot confirmation - a tab-shaped
+    // edge is accepted only one revolution after an earlier tab-shaped edge, otherwise it is
+    // remembered as a candidate and counted as a trolley (nothing drops before the first zero).
+    // (SS_BOOT_CONFIRM 0: the first tab-shaped edge after boot is accepted outright.)
+    if (SingleSensorTabRule(delta, rs.gap, rs.gapPrev, tabRun, rs.confirmed ? SingleSensorRevGate() : 0))
+    {
+        if (rs.confirmed || !SS_BOOT_CONFIRM || SingleSensorBootConfirm(rs))
+        {
+            rs.confirmed = true;         // from now on: the revolution gate
+            rs.haveCand  = false;
+            tabRun       = 0;            // accepted: restart the trolley run
+            shrink       = 0;
+            return true;                 // ZERO; keep timebase and G/G2 (don't advance)
+        }
+        // boot: remember this candidate by its trolley position
+        rs.cand[(rs.bootPos % SS_BOOT_RING) >> 3] |= (unsigned char) (1u << (rs.bootPos & 7));
+        rs.haveCand = true;
+        rs.lastCand = rs.bootPos;
+    }
+
+    SingleSensorTrolleyEdge(tabRun, rs);     // count trolleys since the last accepted tab
+
+    // Normal trolley. Advance the timebase, but only fold delta into the running
+    // interval if it is a PLAUSIBLE full-trolley gap (>= 0.7*T). This stops a
+    // misclassified tab (short gap) or noise from corrupting T. Outliers advance the
+    // timebase without polluting the EMA.
+    if (delta * 10 >= interval * 7)
+    {
+        interval = (interval * 3 + delta) / 4;
+        shrink   = 0;                    // a full-size gap breaks the undersized run
+    }
+    else
+    {
+        // --- 15.7.12: SYMMETRIC DOWNWARD SELF-HEAL -------------------------------
+        // The EMA above folds a gap ONLY when it is >= 0.7*T, and the stall re-seed
+        // above fires ONLY above 3*T, so without this T could GROW but never SHRINK
+        // (Pitman 2026-07-26: both drop syncs dead for 4+ hours after a stop/start
+        // ramp). SS_SHRINK_RUN consecutive undersized gaps -- a real speed-up gives
+        // hundreds -- adopt the new T. An ISOLATED short gap (the zero tab, a noise
+        // blip, a tab the rule rejected) cannot: any full-size gap resets the run.
+        if (++shrink >= SS_SHRINK_RUN)
+        {
+            interval = delta;
+            shrink   = 0;
+        }
+    }
+    rs.gapPrev      = rs.gap;            // 15.7.15: measured-gap history for the tab rule
+    rs.gap          = delta;
+    lastTrolleyTick = now;
+    return false;
+}
+
+//--------------------------------------------------------
+//  SingleSensorTabRule  (15.7.15)
+//
+// THE tab decision, isolated so the rule and its constants (overheadconst.h,
+// SS_TAB_BAND_* / SS_GAP_AGREE_* / SS_GATE_MARGIN) can be audited and retuned on
+// their own. Pure: no state is read or written here.
+//   delta   = scan ticks since the last trolley-classified edge
+//   gap     = G,  the most recent trolley-to-trolley gap (ticks)
+//   gapPrev = G2, the trolley gap before G
+//   tabRun  = trolley-classified edges since the last accepted tab
+//   revGate = Rg (SingleSensorRevGate); 0 while boot confirmation decides instead
+// TAB only if ALL of:
+//   (a) the edge sits 0.20..0.65 of the measured trolley gap after the last trolley;
+//   (b) G and G2 agree within 0.70..1.43 (the line is not accelerating, so G is a
+//       trustworthy measure of the current pitch - this replaces the lagging EMA);
+//   (c) at least Rg trolleys have passed since the last accepted tab (the flag comes
+//       once per chain revolution).
+//--------------------------------------------------------
+bool overhead::SingleSensorTabRule(__int64 delta, __int64 gap, __int64 gapPrev, int tabRun, int revGate)
+{
+    if (gap <= 0 || gapPrev <= 0)
+        return false;                                            // no two measured trolley gaps yet
+    if (delta * 1000 < gap * SS_TAB_BAND_LO_PERMIL ||
+        delta * 1000 > gap * SS_TAB_BAND_HI_PERMIL)
+        return false;                                            // (a)
+    if (gap * 100 < gapPrev * SS_GAP_AGREE_LO_PCT ||
+        gap * 100 > gapPrev * SS_GAP_AGREE_HI_PCT)
+        return false;                                            // (b)
+    if (tabRun < revGate)
+        return false;                                            // (c)
+    return true;
+}
+
+//--------------------------------------------------------
+//  SingleSensorRevTrolleys / SingleSensorRevGate  (15.7.15)
+//
+// R  = Shackles * (SkipTrollies+1), the trolleys per chain revolution (the same
+//      sys_set fields ProcessSyncs counts with). Read live, so a Shackles /
+//      SkipTrollies change takes effect on the next edge; tabRun is a plain trolley
+//      count and needs no adjusting. Negative settings are treated as 0.
+// Rg = R - SS_GATE_MARGIN, the trolleys that must pass between two accepted tabs,
+//      never below SS_MIN_TROLLEYS_BETWEEN_TABS (R small or 0, e.g. before the host has
+//      pushed Shackles, falls back to that floor).
+//--------------------------------------------------------
+int overhead::SingleSensorRevTrolleys()
+{
+    long long shk  = pShm->sys_set.Shackles;
+    long long skip = pShm->sys_set.SkipTrollies;
+    if (shk  < 0) shk  = 0;
+    if (skip < 0) skip = 0;
+    long long R = shk * (skip + 1);
+    if (R > SS_TAB_RUN_MAX) R = SS_TAB_RUN_MAX;
+    return (int) R;
+}
+
+int overhead::SingleSensorRevGate()
+{
+    int gate = SingleSensorRevTrolleys() - SS_GATE_MARGIN;
+    if (gate < SS_MIN_TROLLEYS_BETWEEN_TABS)
+        gate = SS_MIN_TROLLEYS_BETWEEN_TABS;
+    return gate;
+}
+
+//--------------------------------------------------------
+//  SingleSensorBootConfirm  (15.7.15, SS_BOOT_CONFIRM)
+//
+// Boot only: true when a tab-shaped edge was seen exactly one chain revolution ago -
+// R+1 trolleys (that earlier edge was itself counted as a trolley), within
+// +/- SS_GATE_MARGIN. Never confirms while R is too small to tell a revolution from
+// the margin (settings not pushed yet), or too large for the ring.
+//--------------------------------------------------------
+bool overhead::SingleSensorBootConfirm(SSTabRuleState &rs)
+{
+    int R = SingleSensorRevTrolleys();
+    if (R <= 2 * SS_GATE_MARGIN || R + 1 + SS_GATE_MARGIN >= SS_BOOT_RING)
+        return false;
+    for (int d = -SS_GATE_MARGIN; d <= SS_GATE_MARGIN; d++)
+    {
+        unsigned int p = (rs.bootPos - (unsigned int) (R + 1) + (unsigned int) d) % SS_BOOT_RING;
+        if (rs.cand[p >> 3] & (1u << (p & 7)))
+            return true;
+    }
+    return false;
+}
+
+//--------------------------------------------------------
+//  SingleSensorBootPending  (15.7.15, SS_BOOT_CONFIRM)
+//
+// True while boot confirmation is waiting for the second flag: not yet confirmed, and a
+// tab-shaped edge was seen within the last revolution + margin. The count necessarily
+// overruns once in that wait; SingleSensorAlarmOk does not raise it as a missing zero.
+//--------------------------------------------------------
+bool overhead::SingleSensorBootPending(const SSTabRuleState &rs)
+{
+    if (!SS_BOOT_CONFIRM || rs.confirmed || !rs.haveCand)
+        return false;
+    return (rs.bootPos - rs.lastCand) <= (unsigned int) (SingleSensorRevTrolleys() + 1 + SS_GATE_MARGIN);
+}
+
+//--------------------------------------------------------
+//  SingleSensorTrolleyEdge  (15.7.15)
+//
+// Bookkeeping for every edge classified as a TROLLEY: count it in tabRun (trolleys since
+// the last accepted tab, or since boot); before the first zero also advance the boot
+// position and clear the ring slot it enters (that slot last held a position a whole
+// ring ago), so every set bit is a tab-shaped edge from the last SS_BOOT_RING trolleys.
+//--------------------------------------------------------
+void overhead::SingleSensorTrolleyEdge(int &tabRun, SSTabRuleState &rs)
+{
+    if (tabRun < SS_TAB_RUN_MAX) tabRun++;
+    if (!rs.confirmed)
+    {
+        rs.bootPos++;
+        unsigned int p = rs.bootPos % SS_BOOT_RING;
+        rs.cand[p >> 3] &= (unsigned char) ~(1u << (p & 7));
+    }
+}
+
+//--------------------------------------------------------
+//  SingleSensorAlarmTick / SingleSensorAlarmOk  (15.7.15)
+//
+// The owner's zero-flag alarm rule, single-sensor mode only, PER SYNC (each drop /
+// scale sync and each grade sync has its own counter):
+//   "when the line is first powered up there should be no alarm until the shackle
+//    count reaches the preset shackle count then alarm once until that count is hit
+//    again. and continue in that manner. Once the line has seen the zero then the
+//    same rule applies. If the zero is missed use the same zero rules as exists today."
+// cnt = this sync's shackle counts since its last zero-flag alarm (since boot at first).
+// SingleSensorAlarmTick is called wherever the sync's count advances; zeros and the
+// missed-zero overrun reset do NOT reset cnt. SingleSensorAlarmOk gates "Zero Flag NOT
+// Detected", "Early Zero Flag Detected", "Late Zero Flag Detected" and "Zero Flag position
+// mismatch": it allows one only once cnt has reached Shackles+1 (the single-sensor
+// revolution: the flag trolley's body pulse is counted before its tab) and then restarts
+// cnt. So: nothing until a revolution has been counted after boot, then at most one
+// zero-flag alarm per revolution of that sync's count, whether the zero is missing,
+// early, late or misplaced - a false-zero runaway can no longer flood the host. The
+// counting itself (overrun -> shackleno 1, true count keeps running, the next zero ->
+// Late / Early, then reset) is untouched; only the message is gated. "Initial Zero Flag
+// Detected" (informational) is not gated.
+// Boot confirmation (SS_BOOT_CONFIRM) needs a SECOND flag before the first zero, so the
+// count always overruns once on the way: while a first flag is waiting for its
+// confirmation (SingleSensorBootPending) the threshold is two revolutions (2*(Shackles+1)+1).
+// A start-up with a working flag raises no alarm; a start-up with no flag at all alarms
+// after the first revolution as usual.
+// Replaces SingleSensorWarnOk (<= 1 send per 30 s GLOBAL across all syncs, which
+// swallowed one sync's alarm whenever another sync had alarmed in the last 30 s).
+// Standard mode (ZeroFlagMode != 1): no counting, every alarm sent, exactly as before.
+//--------------------------------------------------------
+void overhead::SingleSensorAlarmTick(int &cnt)
+{
+    if (pShm->ZeroFlagMode == 1 && cnt < SS_TAB_RUN_MAX)
+        cnt++;
+}
+
+bool overhead::SingleSensorAlarmOk(int &cnt, const SSTabRuleState &rs)
+{
+    if (pShm->ZeroFlagMode != 1)
+        return true;                        // standard mode: byte-for-byte unchanged
+    int rev = pShm->sys_set.Shackles + 1;   // a single-sensor revolution of counts
+    if (SingleSensorBootPending(rs))
+        rev = 2 * rev + 1;                  // boot: the confirmation overrun is expected
+    if (cnt < rev)
+        return false;
+    cnt = 0;
+    return true;
+}
+
+//--------------------------------------------------------
+//  SingleSensorXC*  (15.7.16, SS_CROSSCHECK) - cross-sync count check, single-sensor only
+//
+// Owner (2026-10-06): "once the initial zero happens we should never allow the line to run a
+// full revolution with the wrong shackle count." Until 15.7.15 a sync's count was corrected
+// only at its next zero flag. All count syncs sit on one chain, so their positions agree with
+// each other through a learned offset; a miscount moves one sync a whole trolley against the
+// others and is corrected within a few trolleys. Rules and constants: overheadconst.h
+// (SS_XC_*). Pairs [a][b], a < b, hold the tracked offset d = P_a - P_b.
+//
+// PITMAN CAPTURES 2026-10-05 drove three choices the bare idea does not have:
+//  - the offset is a function of chain position (+/-0.2 trolley, uneven pitch), repeatable to
+//    sd 0.02, so it is tracked (fractional part only) instead of being a constant;
+//  - every miscount was an EXTRA count (a rollback at a stop re-passes a body; any pass of a
+//    body in either direction is an edge), so a sync is only ever corrected DOWN;
+//  - two of six were two sensors at one stop, so after a line stop the lower of two levels is
+//    taken as right (P2) - a 2-of-3 vote would have moved the one good sync.
+// Nothing here runs in standard mode (ZeroFlagMode != 1); every caller is gated on it.
+//--------------------------------------------------------
+static inline double ssxc_abs(double x)   { return x < 0 ? -x : x; }
+static inline int    ssxc_round(double x) { return x >= 0 ? (int) (x + 0.5) : -(int) (-x + 0.5); }
+
+// wrap to (-R/2, R/2], R = trolleys per chain revolution
+double overhead::SingleSensorXCWrap(double x)
+{
+    double R = (double) SingleSensorRevTrolleys();
+    if (R < 2)
+        return x;
+    for (int n = 0; n < 8 && x > R / 2; n++)   x -= R;
+    for (int n = 0; n < 8 && x <= -R / 2; n++) x += R;
+    return x;
+}
+
+// P_i: trolleys since sync i's last zero, phase-accurate. T counts exactly as ProcessSyncs does
+// ((shackleno-1)*(SkipTrollies+1) + trolly_counters: the tab sets 1/0 = trolley 0, the flag body
+// before it reads Shackles+1/0 = R, the same trolley mod R); frac = scan ticks since the last
+// counted trolley edge over G, the detector's measured gap (tabs never move either), below 1.
+double overhead::SingleSensorXCPos(int i)
+{
+    int skip = pShm->sys_set.SkipTrollies;
+    if (skip < 0) skip = 0;
+    double  T = (double) (pShm->SyncStatus[i].shackleno - 1) * (double) (skip + 1) + (double) trolly_counters[i];
+    __int64 g = ss_rule[i].gap;
+    double  frac = 0;
+    if (g > 0)
+    {
+        frac = (double) (ss_scan_tick - ss_last_trolley_tick[i]) / (double) g;
+        if (frac < 0)     frac = 0;
+        if (frac > 0.999) frac = 0.999;
+    }
+    return T + frac;
+}
+
+// a count sync that can take part: in this line's sync range, zeroed, tab rule confirmed, gaps measured
+bool overhead::SingleSensorXCEligible(int i, int numSyncs)
+{
+    return (i >= 0) && (i < numSyncs) && (i < MAXSYNCS) &&
+           pShm->SyncStatus[i].zeroed && ss_rule[i].confirmed &&
+           (ss_rule[i].gap > 0) && (ss_last_trolley_tick[i] > 0);
+}
+
+// steady: SS_XC_STEADY_GAPS normal gaps in a row, and not slowing / stopped now (open gap <= 115% G)
+bool overhead::SingleSensorXCSteady(int i)
+{
+    __int64 g = ss_rule[i].gap;
+    return (ss_xc_steady[i] >= SS_XC_STEADY_GAPS) && (g > 0) &&
+           ((ss_scan_tick - ss_last_trolley_tick[i]) * 100 <= g * SS_XC_OPEN_GAP_PCT);
+}
+
+// e_ab = P_a - P_b - d_ab (either order), wrapped
+double overhead::SingleSensorXCOffset(int a, int b)
+{
+    int lo = a < b ? a : b, hi = a < b ? b : a;
+    double e = SingleSensorXCWrap(SingleSensorXCPos(lo) - SingleSensorXCPos(hi) - ss_xc_pair[lo][hi].d);
+    return (a < b) ? e : -e;
+}
+
+// every edge ProcessSyncs counts as a trolley (SingleSensorIsZeroTab returned false; G/G2 just moved)
+void overhead::SingleSensorXCGapEdge(int i)
+{
+    ss_xc_edges[i]++;
+    __int64 g = ss_rule[i].gap, g2 = ss_rule[i].gapPrev;
+    bool normal = (g > 0) && (g2 > 0) &&
+                  (g * 100 >= g2 * SS_XC_GAP_LO_PCT) && (g * 100 <= g2 * SS_XC_GAP_HI_PCT);
+    if (normal)
+    {
+        if (ss_xc_steady[i] < SS_TAB_RUN_MAX) ss_xc_steady[i]++;
+        if (ss_xc_steady[i] >= SS_XC_STEADY_GAPS) ss_xc_refgap[i] = g;   // yardstick for a line stop
+    }
+    else
+    {
+        ss_xc_steady[i] = 0;          // a stop, a restart, an extra or a missing edge
+        ss_xc_anchor[i] = false;      // the count may have moved since the zero
+    }
+}
+
+// sync i's count can no longer be trusted for learning: drop its unconfirmed candidates
+void overhead::SingleSensorXCDrop(int i)
+{
+    ss_xc_clean[i]  = false;
+    ss_xc_anchor[i] = false;
+    ss_xc_vcnt[i]   = 0;
+    for (int j = 0; j < MAXSYNCS; j++)
+    {
+        if (j == i) continue;
+        SSXCPair &p = ss_xc_pair[i < j ? i : j][i < j ? j : i];
+        if (p.state == 1) p.state = 0;
+    }
+}
+
+// an accepted tab on sync i (after the counter reset). exact = the 15.7.15 exact-count check
+// passed (the flag body counted Shackles+1 / trolley 0). Learns from clean samples only.
+void overhead::SingleSensorXCZero(int i, bool exact, int numSyncs)
+{
+    if (ss_xc_dist_open) ss_xc_dist_zero = true;     // a zero moved a count during a disturbance
+    ss_xc_pat_rezero |= 1u << i;                     // its level now comes from the physical flag
+    if (!exact)
+    {
+        SingleSensorXCDrop(i);
+        ss_xc_anchor[i] = true;                      // realigned to the physical flag all the same
+        return;
+    }
+    ss_xc_clean[i]  = true;
+    ss_xc_anchor[i] = true;
+    ss_xc_vcnt[i]   = 0;
+    if (!SingleSensorXCSteady(i))
+        return;                                      // learn only in steady running
+    for (int j = 0; j < numSyncs && j < MAXSYNCS; j++)
+    {
+        if (j == i || !SingleSensorXCEligible(j, numSyncs) || !ss_xc_clean[j] || !SingleSensorXCSteady(j))
+            continue;
+        int lo = i < j ? i : j, hi = i < j ? j : i;
+        SSXCPair &p = ss_xc_pair[lo][hi];
+        double s = SingleSensorXCWrap(SingleSensorXCPos(lo) - SingleSensorXCPos(hi));
+        double r = SingleSensorXCWrap(s - p.d);
+        if (p.state == 0)
+        {
+            p.state = 1;                             // candidate, tracked from now on
+            p.d     = s;
+        }
+        else if (p.state == 1)
+        {
+            if (ssxc_abs(r) * 1000 < SS_XC_CONFIRM_TOL_PERMIL)
+                p.state = 2;                         // confirmed by a second clean sample: armed
+            else
+                p.state = 0;                         // one of the two samples was wrong: start over
+        }
+        else
+        {
+            double f = r - ssxc_round(r);
+            if (ssxc_abs(f) * 1000 >= SS_XC_RELEARN_TOL_PERMIL)
+                p.state = 0;                         // lost track of the offset: learn it again
+            // a whole-trolley r means sync j is off now (i just proved exact): the check owns that
+        }
+    }
+}
+
+// the "Zero Flag NOT Detected" overrun reset on sync i moved its count to a guess
+void overhead::SingleSensorXCOverrun(int i)
+{
+    if (ss_xc_dist_open) ss_xc_dist_zero = true;
+    SingleSensorXCDrop(i);
+}
+
+// At each counted trolley edge of sync i, after the count (and any overrun) moved: track the
+// offsets, judge, raise the disagreement alarm. Returns the shift to apply (-1 = one trolley
+// back) once the verdict has held SS_XC_HYST_EDGES edges, else 0. See overheadconst.h.
+int overhead::SingleSensorXCCheck(int i, int numSyncs)
+{
+    if ((pShm->ZeroFlagMode != 1) || !SingleSensorXCEligible(i, numSyncs))
+    {
+        ss_xc_vcnt[i] = 0;
+        return 0;
+    }
+    int R = SingleSensorRevTrolleys();
+    if (R <= 2 * SS_GATE_MARGIN)
+        return 0;                                    // settings not pushed yet
+    if (numSyncs > MAXSYNCS) numSyncs = MAXSYNCS;
+
+    bool iSteady = SingleSensorXCSteady(i);
+
+    //--- track: fold the fractional residual of every learned pair of i (integer part never moves)
+    __int64 gi = ss_rule[i].gap, gi2 = ss_rule[i].gapPrev;
+    bool iFlat = iSteady && (gi * 100 >= gi2 * (100 - SS_XC_TRACK_GAP_PCT)) && (gi * 100 <= gi2 * (100 + SS_XC_TRACK_GAP_PCT));
+    for (int j = 0; j < numSyncs && iFlat; j++)
+    {
+        if (j == i || !SingleSensorXCEligible(j, numSyncs) || !SingleSensorXCSteady(j)) continue;
+        int lo = i < j ? i : j, hi = i < j ? j : i;
+        SSXCPair &p = ss_xc_pair[lo][hi];
+        if (p.state == 0) continue;
+        __int64 gj = ss_rule[j].gap, gj2 = ss_rule[j].gapPrev;
+        if ((gj * 100 < gj2 * (100 - SS_XC_TRACK_GAP_PCT)) || (gj * 100 > gj2 * (100 + SS_XC_TRACK_GAP_PCT))) continue;
+        double e = SingleSensorXCOffset(lo, hi);
+        double f = e - ssxc_round(e);
+        if (ssxc_abs(f) * 1000 < SS_XC_TRACK_TOL_PERMIL)
+            p.d = SingleSensorXCWrap(p.d + f / SS_XC_TRACK_GAIN);
+    }
+
+    //--- the vote: eligible syncs whose pairs are all armed (drop the worst-connected until they are)
+    int  v[MAXSYNCS], n = 0;
+    for (int j = 0; j < numSyncs; j++)
+        if (SingleSensorXCEligible(j, numSyncs)) v[n++] = j;
+    for (;;)
+    {
+        int worst = -1, worstMiss = 0;
+        for (int a = 0; a < n; a++)
+        {
+            int miss = 0;
+            for (int b = 0; b < n; b++)
+                if (a != b && ss_xc_pair[v[a] < v[b] ? v[a] : v[b]][v[a] < v[b] ? v[b] : v[a]].state != 2) miss++;
+            if (miss > 0 && miss >= worstMiss) { worst = a; worstMiss = miss; }
+        }
+        if (worst < 0) break;
+        for (int a = worst; a + 1 < n; a++) v[a] = v[a + 1];
+        n--;
+    }
+    bool inVote = false;
+    for (int a = 0; a < n; a++) if (v[a] == i) inVote = true;
+    if (!inVote || n < 2)
+    {
+        ss_xc_vcnt[i] = 0;
+        return 0;
+    }
+
+    //--- a LINE STOP (opens the P2 window): a sync whose open gap, or last gap, is over
+    //    SS_XC_LINESTOP_PCT % of its last STEADY gap has seen the chain stop (against the last steady
+    //    gap, not the previous one: a jog in the middle of a stop splits the gap - DS2 at Pitman
+    //    16:48:48). A missing body is 2 x, jitter far less, so neither can open it; every sync of
+    //    the vote must have seen the stop for P2.
+    unsigned int unsteady = 0, stopped = 0, all = 0;
+    for (int a = 0; a < n; a++)
+    {
+        int j = v[a];
+        __int64 ref = ss_xc_refgap[j];
+        all |= 1u << j;
+        if (!SingleSensorXCSteady(j)) unsteady |= 1u << j;
+        if (ref > 0 && ((ss_scan_tick - ss_last_trolley_tick[j]) * 100 > ref * SS_XC_LINESTOP_PCT ||
+                        ss_rule[j].gap * 100 > ref * SS_XC_LINESTOP_PCT))
+            stopped |= 1u << j;
+    }
+    if (stopped)
+    {
+        if (!ss_xc_dist_open)
+        {
+            ss_xc_dist_open   = true;
+            ss_xc_dist_pre_ok = ss_xc_line_ok;       // as last seen steady, before the stop
+            ss_xc_dist_zero   = false;
+            ss_xc_dist_evals  = 0;
+            ss_xc_dist_mask   = 0;
+        }
+        ss_xc_dist_mask |= stopped;
+    }
+    if (unsteady)
+    {
+        ss_xc_vcnt[i] = 0;
+        return 0;
+    }
+
+    //--- integer offsets of every pair in the vote
+    int  o[MAXSYNCS][MAXSYNCS];
+    bool allInt = true, all0 = true;
+    for (int a = 0; a < n; a++)
+        for (int b = a + 1; b < n; b++)
+        {
+            double e = SingleSensorXCOffset(v[a], v[b]);
+            int    k = ssxc_round(e);
+            o[v[a]][v[b]] = k;
+            o[v[b]][v[a]] = -k;
+            if (ssxc_abs(e - k) * 1000 >= SS_XC_K_TOL_PERMIL) allInt = false;
+            if (k != 0 || ssxc_abs(e) * 1000 >= SS_XC_AGREE_TOL_PERMIL) all0 = false;
+        }
+    //--- line-state bookkeeping takes a reading only when the NEXT steady check reads the same:
+    //    a sync rolled back onto the previous body at the start of a stop counts it at a normal-
+    //    looking moment, and that one reading is garbage. (The verdict has its own 2-edge hysteresis.)
+    int  lev[MAXSYNCS];
+    for (int a = 0; a < n; a++) lev[v[a]] = (a == 0) ? 0 : o[v[a]][v[0]];
+    bool agree = ss_xc_prev_valid && (ss_xc_prev_int == allInt) && (ss_xc_prev_vmask == all);
+    for (int a = 0; a < n && agree && allInt; a++) if (ss_xc_prev_lev[v[a]] != lev[v[a]]) agree = false;
+    ss_xc_prev_valid = true;
+    ss_xc_prev_int   = allInt;
+    ss_xc_prev_vmask = all;
+    for (int a = 0; a < n; a++) ss_xc_prev_lev[v[a]] = lev[v[a]];
+    if (agree) ss_xc_line_ok = all0;
+    if (ss_xc_dist_open && ((agree && all0) || ++ss_xc_dist_evals > SS_XC_DIST_EVALS))
+        ss_xc_dist_open = false;                     // resolved (or given up: no P2 any more)
+
+    //--- how did the inconsistency arise? Only one that appeared in ONE step from every pair at 0
+    //    may be corrected; its level pattern may change afterwards only by our own corrections
+    //    (SingleSensorXCApply moves the stored level too). A second change while inconsistent -
+    //    e.g. two lost counts on two syncs at different times, which would leave the one good
+    //    sync looking "ahead" - makes it unattributable until every pair reads 0 again.
+    if (!agree)
+        ;                                            // wait for a second reading
+    else if (all0)
+    {
+        ss_xc_ok_before = true;
+        ss_xc_pat_valid = false;
+    }
+    else if (allInt)
+    {
+        if (!ss_xc_pat_valid)
+        {
+            ss_xc_pat_valid = true;                  // onset: ok_before tells whether all were at 0 just before
+            ss_xc_pat_vmask = all;
+            for (int a = 0; a < n; a++) ss_xc_pat_lev[v[a]] = lev[v[a]];
+        }
+        else
+        {
+            // a sync that zeroed since was moved by its flag, not by a miscount: take its new level
+            for (int a = 0; a < n; a++)
+                if (ss_xc_pat_rezero & (1u << v[a])) ss_xc_pat_lev[v[a]] = lev[v[a]] - lev[v[0]] + ss_xc_pat_lev[v[0]];
+            bool same = (ss_xc_pat_vmask == all);
+            for (int a = 0; a < n && same; a++) if (ss_xc_pat_lev[v[a]] - ss_xc_pat_lev[v[0]] != lev[v[a]]) same = false;
+            if (!same) ss_xc_ok_before = false;
+        }
+        ss_xc_pat_rezero = 0;                        // consumed by an agreed reading
+    }
+    if (agree && all0) ss_xc_pat_rezero = 0;
+
+    //--- verdict: is sync i one trolley AHEAD?
+    bool ahead = false;
+    if (allInt && (n >= SS_XC_MIN_SYNCS) && !ss_xc_anchor[i] && ss_xc_ok_before)
+    {
+        // P1: i is +1 against every other sync, and the others agree with each other
+        bool p1 = true;
+        for (int a = 0; a < n && p1; a++)
+        {
+            if (v[a] == i) continue;
+            if (o[i][v[a]] != 1) p1 = false;
+            for (int b = a + 1; b < n && p1; b++)
+                if (v[b] != i && o[v[a]][v[b]] != 0) p1 = false;
+        }
+        // P2: after a LINE stop that began with every pair at 0 and saw no zero / overrun: two
+        // levels a trolley apart, i in the upper one, no upper-level sync anchored by its zero
+        bool p2 = false;
+        if (!p1 && ss_xc_dist_open && ss_xc_dist_pre_ok && !ss_xc_dist_zero && ((ss_xc_dist_mask & all) == all))
+        {
+            bool lower = false;
+            p2 = true;
+            for (int a = 0; a < n && p2; a++)
+            {
+                int j = v[a];
+                if (j == i) continue;
+                if (o[i][j] == 1) lower = true;
+                else if (o[i][j] == 0) { if (ss_xc_anchor[j]) p2 = false; }
+                else p2 = false;
+                for (int b = 0; b < n && p2; b++)
+                    if (v[b] != i && v[b] != j && o[j][v[b]] != o[i][v[b]] - o[i][j]) p2 = false;
+            }
+            p2 = p2 && lower;
+        }
+        ahead = p1 || p2;
+    }
+    if (ahead) { if (ss_xc_vcnt[i] < SS_TAB_RUN_MAX) ss_xc_vcnt[i]++; }
+    else       ss_xc_vcnt[i] = 0;
+
+    //--- disagreement alarm (pairs whose lower sync is i): a whole-trolley offset that persists
+    for (int b = 0; b < n; b++)
+    {
+        int j = v[b];
+        if (j <= i) continue;
+        SSXCPair &p = ss_xc_pair[i][j];
+        double e = SingleSensorXCOffset(i, j);
+        int    k = ssxc_round(e);
+        if (k == 0 || k > SS_XC_MAX_K || k < -SS_XC_MAX_K || ssxc_abs(e - k) * 1000 >= SS_XC_K_TOL_PERMIL)
+        {
+            p.persist = 0;
+            continue;
+        }
+        if (k != p.persistK) { p.persistK = k; p.persist = 0; }
+        if (++p.persist >= SS_XC_ALARM_EDGES && (!p.alarmed || ss_xc_edges[i] - p.alarmEdge >= R))
+        {
+            p.alarmed   = true;
+            p.alarmEdge = ss_xc_edges[i];
+            sprintf(app_err_buf, "Count disagreement: %s vs %s by %+d trolley\n", sync_desc[i], sync_desc[j], k);
+            GenError(warning, app_err_buf);
+        }
+    }
+
+    return (ss_xc_vcnt[i] >= SS_XC_HYST_EDGES) ? -1 : 0;
+}
+
+// Shift sync i's count by `shift` trolleys (production: -1 only). Applied by ProcessSyncs at the
+// counted edge BEFORE its scale / drop pass. Refused (false, verdict kept for the next edge) unless
+// the corrected count lands on a shackle trolley (trolley counter 0) strictly inside the
+// revolution: the zero tab and the overrun own trolley 0 / Shackles+1. ProcessSyncs then skips
+// this edge's drop / missed-bird pass (that count already ran, one trolley early, at the previous
+// counted edge); the scale re-labels and re-weighs the shackle really on it when SkipTrollies >= 1
+// (the early weighment is still averaging and is replaced) and skips its pass when SkipTrollies is 0
+// (the early weighment has completed and been assigned - no slot is assigned twice).
+bool overhead::SingleSensorXCApply(int i, int shift, int numSyncs)
+{
+    TSyncStatus* ps = &pShm->SyncStatus[i];
+    int skip = pShm->sys_set.SkipTrollies;
+    if (skip < 0) skip = 0;
+    long long S1 = skip + 1;
+    long long T  = (long long) (ps->shackleno - 1) * S1 + trolly_counters[i];
+    long long T2 = T + shift;
+    if (T2 < 1 || T2 > SingleSensorRevTrolleys() || (T2 % S1) != 0)
+        return false;
+    int shk2 = (int) (T2 / S1) + 1;
+    int was  = ps->shackleno, wasTc = trolly_counters[i];
+    true_shackle_count[i] += shk2 - ps->shackleno;
+    if (true_shackle_count[i] < 1) true_shackle_count[i] = 1;
+    ps->shackleno      = shk2;
+    trolly_counters[i] = 0;
+    ss_tab_run[i] += shift;
+    if (ss_tab_run[i] < 0) ss_tab_run[i] = 0;
+    SingleSensorXCDrop(i);                           // not clean until its next exact zero
+    if (ss_xc_pat_valid) ss_xc_pat_lev[i] += shift;  // our own move does not make the pattern "new"
+    ss_xc_prev_valid = false;                        // ...and the next reading starts a fresh pair
+
+    char others[MAXSYNCS * (MAX_DBG_DESC + 2) + 4];
+    others[0] = 0;
+    for (int j = 0; j < numSyncs && j < MAXSYNCS; j++)
+    {
+        if (j == i || !SingleSensorXCEligible(j, numSyncs) || ss_xc_pair[i < j ? i : j][i < j ? j : i].state != 2) continue;
+        if (others[0]) strcat(others, ", ");
+        strncat(others, sync_desc[j], MAX_DBG_DESC);
+    }
+    sprintf(app_err_buf, "Count corrected: %s %+d trolley (cross-check with %s)\n", sync_desc[i], shift, others);
+    GenError(warning, app_err_buf);
+    if ( (!trc[MAINBUFID].buffer_full) && (TraceMask & _ZEROS_ ) )
+    {
+        sprintf((char*) &tmp_trc_buf[MAINBUFID],"XC\t%d\tshift\t%d\tShk\t%d/%d\t->\t%d/0\n", i, shift, was, wasTc, shk2);
+        strcat((char*) &trc_buf[MAINBUFID],(char*) &tmp_trc_buf[MAINBUFID] );
+    }
+    return true;
+}
+
+//--------------------------------------------------------
+//  Sensor Scope raw-input capture (SandCat only; host arch-gated)
+//
+//  SetSyncCapture handles the SET_SYNC_CAPTURE command; SyncCaptureScan appends one
+//  5 ms sample and drives streaming; SyncCaptureSend linearizes the ring tail and
+//  emits a SYNC_CAPTURE_INFO window. All process-memory only -- no pShm/struct change,
+//  so the interface wire format and EPM-19 compatibility are untouched.
+//--------------------------------------------------------
+void overhead::SetSyncCapture(int mode, int triggerSync, int pre, int post)
+{
+    if (mode < 0 || mode > 2) mode = 0;
+    if (pre  < 1) pre  = 1;
+    if (post < 1) post = 1;
+    if (pre + post > SYNC_CAP_MAXSAMPLES) post = SYNC_CAP_MAXSAMPLES - pre;
+    syncCapMode        = mode;
+    syncCapTriggerSync = triggerSync;
+    syncCapPre         = pre;
+    syncCapPost        = post;
+    syncCapHead        = 0;
+    syncCapCount       = 0;
+    syncCapPostLeft    = 0;
+    syncCapTriggered   = false;
+}
+
+void overhead::SyncCaptureScan()
+{
+    if (syncCapMode == 0) return;
+
+    // append this scan's raw inputs + the detector's event flags for the scan
+    syncCapBuf[syncCapHead][0] = (unsigned char) sync_in[0];
+    syncCapBuf[syncCapHead][1] = (unsigned char) sync_zero[0];
+    syncCapBuf[syncCapHead][2] = (unsigned char) switch_in[0];
+    syncCapBuf[syncCapHead][3] = syncCapEventAccum;
+    syncCapHead = (syncCapHead + 1) % SYNC_CAP_MAXSAMPLES;
+    if (syncCapCount < SYNC_CAP_MAXSAMPLES) syncCapCount++;
+
+    bool zeroFired = (syncCapEventAccum & 0x40) != 0;
+    int  evtSync   = syncCapEventAccum & 0x07;
+
+    if (syncCapMode == 2)                    // trigger-on-zero
+    {
+        if (!syncCapTriggered)
+        {
+            if (zeroFired && (syncCapTriggerSync < 0 || evtSync == syncCapTriggerSync))
+            {
+                syncCapTriggered = true;
+                syncCapPostLeft  = syncCapPost;
+            }
+        }
+        else if (--syncCapPostLeft <= 0)
+        {
+            int windowLen = syncCapPre + syncCapPost;
+            if (windowLen > syncCapCount) windowLen = syncCapCount;
+            SyncCaptureSend(windowLen, windowLen - syncCapPost);  // trigger at pre offset
+            syncCapTriggered = false;
+            syncCapHead = 0; syncCapCount = 0; // re-arm fresh
+        }
+    }
+    else if (syncCapMode == 1)               // live continuous: flush ~1 s windows
+    {
+        if (syncCapCount >= 200)
+        {
+            SyncCaptureSend(syncCapCount, -1);
+            syncCapHead = 0; syncCapCount = 0;
+        }
+    }
+}
+
+void overhead::SyncCaptureSend(int windowLen, int triggerIdx)
+{
+    if (!isPShmValid() || windowLen < 1) return;
+    if (windowLen > syncCapCount) windowLen = syncCapCount;
+
+    // linearize the last windowLen samples (oldest->newest) ending at syncCapHead
+    static unsigned char out[16 + SYNC_CAP_MAXSAMPLES * SYNC_CAP_CHANS];
+    int *hdr = (int*) out;
+    hdr[0] = windowLen;
+    hdr[1] = 5;                  // sample period ms
+    hdr[2] = triggerIdx;
+    hdr[3] = SYNC_CAP_CHANS;
+    int start = (syncCapHead - windowLen + SYNC_CAP_MAXSAMPLES) % SYNC_CAP_MAXSAMPLES;
+    unsigned char *p = out + 16;
+    for (int s = 0; s < windowLen; s++)
+    {
+        int idx = (start + s) % SYNC_CAP_MAXSAMPLES;
+        for (int c = 0; c < SYNC_CAP_CHANS; c++) *p++ = syncCapBuf[idx][c];
+    }
+    int len = 16 + windowLen * SYNC_CAP_CHANS;
+
+    if(RtWaitForSingleObject(trc[GPBUFID].mutex, WAIT100MS) != WAIT_OBJECT_0)
+        RtPrintf("Wait failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
+    else
+    {
+        if HOST_OK
+            SendHostMsg( SYNC_CAPTURE_INFO, NULL, (BYTE*) out, len );
+        if(!RtReleaseMutex(trc[GPBUFID].mutex))
+            RtPrintf("Release failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
+    }
+}
+
+//--------------------------------------------------------
 //  GradeSyncs
 //
 // The following block is needed for grade sync and count error
@@ -5524,7 +7112,8 @@ void overhead::GradeSyncs()
 	if (!(app->pShm->sys_set.MiscFeatures.EnableGradeSync2))
 	{
 		//GLC for Carolina Turkeys, check that the zero sensor is triggered before the sync
-		if (app->pShm->sys_set.MiscFeatures.RequireZeroBeforeSync)
+		//Single-sensor mode has no separate zero sensor, so this gate is bypassed.
+		if (app->pShm->sys_set.MiscFeatures.RequireZeroBeforeSync && pShm->ZeroFlagMode != 1)
 		{
 			if (BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex])) //GLC added 3/9/05
 			{
@@ -5538,32 +7127,78 @@ void overhead::GradeSyncs()
 
 		if ( ( BITSET(switch_in[0], GradeSyncBit[GradeSyncIndex]) ) &&
 			grade_armed[GradeSyncIndex] &&
-			gradesync_zero_triggered[GradeSyncIndex] )
+			gradesync_zero_triggered[GradeSyncIndex] &&
+			// Debounce the grade count edge exactly like the scale syncs (ProcessSyncs):
+			// only after the bit has been high SyncOn scans is it a confirmed edge, so
+			// SingleSensorIsZeroTab gets one clean edge per pulse instead of a raw latch
+			// on every transition (which broke the single-sensor double-pulse detection).
+			( grade_debounce[GradeSyncIndex] > 0 ? (--grade_debounce[GradeSyncIndex] == 0) : true ) )
 		{
 			grade_armed[GradeSyncIndex] = false;
 			gradesync_zero_triggered[GradeSyncIndex] = false; //GLC added 3/9/05
 			//RtPrintf("Grade sync\n");
 
-			if ( BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]) )
+			// 15.7.14: single-sensor duplicate-pass guard - grade-sync mirror of ProcessSyncs.
+			bool ssGradeTabDup = false;	// accepted tab whose GradeProcess would repeat the Shackles+1 one
+			bool ssGradeRan    = false;	// this edge ran GradeProcess
+
+			// Standard mode reads the grade zero bit; single-sensor mode derives
+			// the grade zero from the double-pulse timing on the grade count bit.
+			bool grade_zero_detected = (pShm->ZeroFlagMode == 1)
+				? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex], ss_grade_tab_run[GradeSyncIndex], ss_grade_trolley_shrink[GradeSyncIndex],
+									ss_grade_rule[GradeSyncIndex])
+				: BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]);
+
+			if ( grade_zero_detected )
 			{
+				// Sensor Scope: mark a grade zero/tab for the scope overlay
+				syncCapEventAccum = 0x40 | 0x20 | (pShm->ZeroFlagMode == 1 ? 0x80 : 0) | (GradeSyncIndex & 0x07);
 
 				//RtPrintf("Grade zero\n");
+				bool ssMisplaced = false;	// 15.7.15: exact-count check failed on this zero
 				//GLC added 2/15/05
 				if ((pShm->grade_shackle[GradeSyncIndex] < true_grade_shackle_count[GradeSyncIndex]) &&
 					(true_grade_shackle_count[GradeSyncIndex] > pShm->sys_set.Shackles) &&
 					grade_zeroed[GradeSyncIndex] )
                 {
+                    if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))	// 15.7.15: owner's rule (single-sensor)
+                    {
                     sprintf(app_err_buf,"Late Zero Flag Detected. Grade Sync %d late count %ld\n",
 						GradeSyncIndex + 1, (long) (true_grade_shackle_count[GradeSyncIndex] - pShm->sys_set.Shackles));
                     GenError(warning, app_err_buf);
+                    }
 
                 }
                 else if ((pShm->grade_shackle[GradeSyncIndex] < pShm->sys_set.Shackles) && grade_zeroed[GradeSyncIndex] )
                 {
+                    if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))	// 15.7.15
+                    {
                     sprintf(app_err_buf,"Early Zero Flag Detected. Grade Sync %d shkl %d expected shkl %d\n",
 						GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], pShm->sys_set.Shackles);
                     GenError(warning, app_err_buf);
+                    }
 					true_grade_shackle_count[GradeSyncIndex] = 1;
+                }
+                // 15.7.15 exact-count check (single-sensor only) - see ProcessSyncs.
+                else if ((pShm->ZeroFlagMode == 1) && grade_zeroed[GradeSyncIndex] &&
+                         !((pShm->grade_shackle[GradeSyncIndex] == pShm->sys_set.Shackles + 1) &&
+                           (trolly_counters[MAXSYNCS] == 0)))
+                {
+                    ssMisplaced = true;
+                    if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))
+                    {
+                    sprintf(app_err_buf,"Zero Flag position mismatch. Grade Sync %d count %d trolley %d expected %d/0\n",
+						GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], trolly_counters[MAXSYNCS], pShm->sys_set.Shackles + 1);
+                    GenError(warning, app_err_buf);
+                    ss_grade_zero_lost[GradeSyncIndex] = true;
+                    }
+                }
+                // 15.7.15 (single-sensor, informational): announce the recovery - see ProcessSyncs.
+                if ((pShm->ZeroFlagMode == 1) && grade_zeroed[GradeSyncIndex] && ss_grade_zero_lost[GradeSyncIndex] && !ssMisplaced)
+                {
+                    sprintf(app_err_buf,"Zero Flag re-acquired. Grade Sync %d\n", GradeSyncIndex + 1);
+                    GenError(informational, app_err_buf);
+                    ss_grade_zero_lost[GradeSyncIndex] = false;
                 }
 
 				//GLC 2/15/05 clear sync shackle counters to avoid late zero errors on syncs after
@@ -5573,6 +7208,7 @@ void overhead::GradeSyncs()
                     sprintf(app_err_buf,"Initial Zero Flag Detected. Grade Sync %d\n",
 						GradeSyncIndex + 1);
                     GenError(informational, app_err_buf);
+                    ss_grade_zero_lost[GradeSyncIndex] = false;	// 15.7.15
 
 
 					for (i = 0; i< MAXSYNCS; i++)
@@ -5590,6 +7226,20 @@ void overhead::GradeSyncs()
 				pShm->sys_stat.dbg_sync[ZERO_ON][MAXSYNCS - 1]	= 0;
 				pShm->sys_stat.dbg_sync[SYNC_ON][MAXSYNCS - 1]++;
 
+				// 15.7.14: single-sensor double pulse - see ProcessSyncs. The grade flag trolley's
+				// body pulse was counted as Shackles+1 and already ran GradeProcess for exactly the
+				// shackles this tab maps to again (RingSub(1,x) == RingSub(Shackles+1,x)).
+				if (pShm->ZeroFlagMode == 1)
+				{
+					ssGradeTabDup = ss_grade_ovr_pass[GradeSyncIndex];
+
+					if ( ssGradeTabDup && (!trc[MAINBUFID].buffer_full) && (TraceMask & _ZEROS_ ) )
+					{
+						sprintf((char*) &tmp_trc_buf[MAINBUFID],"GrdZero\t%d\tSS tab\tdup GradeProcess skipped\tShk\t%d\n",
+								GradeSyncIndex, pShm->sys_set.Shackles + 1);
+						strcat((char*) &trc_buf[MAINBUFID],(char*) &tmp_trc_buf[MAINBUFID] );
+					}
+				}
 			}
 			else
 			{
@@ -5601,6 +7251,7 @@ void overhead::GradeSyncs()
 					{
  						pShm->grade_shackle[GradeSyncIndex]++;
 						true_grade_shackle_count[GradeSyncIndex]++; //GLC added 2/14/05
+						SingleSensorAlarmTick(ss_grade_alarm_cnt[GradeSyncIndex]);	// 15.7.15
 						trolly_counters[MAXSYNCS] = 0;
 
 						// special, the grade sync counter is tacked on to the end of regular syncs.
@@ -5612,6 +7263,7 @@ void overhead::GradeSyncs()
 				{
 					pShm->grade_shackle[GradeSyncIndex]++;
 					true_grade_shackle_count[GradeSyncIndex]++; //GLC added 2/14/05
+					SingleSensorAlarmTick(ss_grade_alarm_cnt[GradeSyncIndex]);	// 15.7.15
 					// special, the grade sync counter is tacked on to the end of regular syncs.
 					pShm->sys_stat.dbg_sync[SYNC_ON][MAXSYNCS - 1]++;
 					pShm->sys_stat.dbg_sync[ZERO_ON][MAXSYNCS - 1]++;
@@ -5619,24 +7271,35 @@ void overhead::GradeSyncs()
 				//RtPrintf("inc grade_shackle \n");
 			}
 
-			// Late zero flag
-			if ( (pShm->grade_shackle[GradeSyncIndex] > pShm->sys_set.Shackles ) )
+			// Late zero flag (single-sensor: tolerate one overshoot, see ProcessSyncs)
+			if ( (pShm->grade_shackle[GradeSyncIndex] > pShm->sys_set.Shackles + (pShm->ZeroFlagMode == 1 ? 1 : 0)) )
 			{
-                sprintf(app_err_buf,"Zero Flag NOT Detected. Grade Sync %d shackle %d expected %d\n", GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], pShm->sys_set.Shackles); //GLC added 2/14/05
-
 				trolly_counters[MAXSYNCS] = 0;
 				pShm->grade_shackle[GradeSyncIndex] = 1;
 
-				GenError(warning, app_err_buf);
+				if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))	// 15.7.15: was SingleSensorWarnOk()
+				{
+					sprintf(app_err_buf,"Zero Flag NOT Detected. Grade Sync %d shackle %d expected %d\n", GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], pShm->sys_set.Shackles); //GLC added 2/14/05
+					GenError(warning, app_err_buf);
+					if (pShm->ZeroFlagMode == 1) ss_grade_zero_lost[GradeSyncIndex] = true;	// 15.7.15
+				}
 			}
 
-			if ( (pShm->OpMode == ModeRun) && (grade_zeroed[GradeSyncIndex]) )
+			if ( (pShm->OpMode == ModeRun) && (grade_zeroed[GradeSyncIndex]) &&
+				 !ssGradeTabDup )	// 15.7.14
 			{
 				GradeProcess(GradeSyncIndex);
+				ssGradeRan = true;
 			}
 			 //else
 			 //    RtPrintf("OpMode %d grade_zeroed %d\n",
 			 //               pShm->OpMode, grade_zeroed);
+			// 15.7.14: arm / disarm the tab guard exactly as ProcessSyncs does (ss_ovr_pass).
+			if (ssGradeRan)
+				ss_grade_ovr_pass[GradeSyncIndex] = (pShm->ZeroFlagMode == 1) &&
+					(pShm->grade_shackle[GradeSyncIndex] == pShm->sys_set.Shackles + 1);
+			else if (pShm->grade_shackle[GradeSyncIndex] != pShm->sys_set.Shackles + 1)
+				ss_grade_ovr_pass[GradeSyncIndex] = false;
 
 		}
 		else
@@ -5644,6 +7307,7 @@ void overhead::GradeSyncs()
 			if ( !(BITSET(switch_in[0], GradeSyncBit[GradeSyncIndex])) )
 			{
 				grade_armed[GradeSyncIndex] = true;
+				grade_debounce[GradeSyncIndex] = pShm->sys_set.SyncOn;
 			}
 		}
 	}
@@ -5653,7 +7317,8 @@ void overhead::GradeSyncs()
 		for (GradeSyncIndex = 0; GradeSyncIndex < MAXGRADESYNCS; GradeSyncIndex++)
 		{
 			//GLC for Carolina Turkeys, check that the zero sensor is triggered before the sync
-			if (app->pShm->sys_set.MiscFeatures.RequireZeroBeforeSync)
+			//Single-sensor mode has no separate zero sensor, so this gate is bypassed.
+			if (app->pShm->sys_set.MiscFeatures.RequireZeroBeforeSync && pShm->ZeroFlagMode != 1)
 			{
 				if (BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex])) //GLC added 3/9/05
 				{
@@ -5667,30 +7332,74 @@ void overhead::GradeSyncs()
 
 			if ( ( BITSET(switch_in[0], GradeSyncBit[GradeSyncIndex]) ) &&
 				grade_armed[GradeSyncIndex] &&
-				gradesync_zero_triggered[GradeSyncIndex] ) //GLC added 3/9/05
+				gradesync_zero_triggered[GradeSyncIndex] && //GLC added 3/9/05
+				// Debounce mirror (see grade sync 1 above) so SingleSensorIsZeroTab gets
+				// one confirmed edge per pulse for grade sync 2 as well.
+				( grade_debounce[GradeSyncIndex] > 0 ? (--grade_debounce[GradeSyncIndex] == 0) : true ) )
 			{
 				grade_armed[GradeSyncIndex] = false;
 				gradesync_zero_triggered[GradeSyncIndex] = false; //GLC added 3/9/05
 				//RtPrintf("Grade sync\n");
 
-				if ( BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]) )
-				{
+				// 15.7.14: single-sensor duplicate-pass guard - grade-sync mirror of ProcessSyncs.
+				bool ssGradeTabDup = false;	// accepted tab whose GradeProcess would repeat the Shackles+1 one
+				bool ssGradeRan    = false;	// this edge ran GradeProcess
 
+				// Standard mode reads the grade zero bit; single-sensor mode derives
+				// the grade zero from the double-pulse timing on the grade count bit.
+				bool grade_zero_detected = (pShm->ZeroFlagMode == 1)
+					? SingleSensorIsZeroTab(ss_grade_last_trolley_tick[GradeSyncIndex], ss_grade_trolley_interval[GradeSyncIndex], ss_grade_trolley_stall[GradeSyncIndex], ss_grade_tab_run[GradeSyncIndex], ss_grade_trolley_shrink[GradeSyncIndex],
+									ss_grade_rule[GradeSyncIndex])
+					: BITSET(switch_in[0], GradeZeroBit[GradeSyncIndex]);
+
+				if ( grade_zero_detected )
+				{
+					// Sensor Scope: mark a grade zero/tab for the scope overlay
+					syncCapEventAccum = 0x40 | 0x20 | (pShm->ZeroFlagMode == 1 ? 0x80 : 0) | (GradeSyncIndex & 0x07);
+
+					bool ssMisplaced = false;	// 15.7.15: exact-count check failed on this zero
 					//GLC added 2/15/05
 					if ((pShm->grade_shackle[GradeSyncIndex] < true_grade_shackle_count[GradeSyncIndex]) &&
 						(true_grade_shackle_count[GradeSyncIndex] > pShm->sys_set.Shackles) &&
 						grade_zeroed[GradeSyncIndex] )
 					{
+						if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))	// 15.7.15: owner's rule (single-sensor)
+						{
 						sprintf(app_err_buf,"Late Zero Flag Detected. Grade Sync %d late count %ld\n",
 							GradeSyncIndex + 1, (long) (true_grade_shackle_count - pShm->sys_set.Shackles));
 						GenError(warning, app_err_buf);
+						}
 
 					}
 					else if ((pShm->grade_shackle[GradeSyncIndex] < pShm->sys_set.Shackles) && grade_zeroed[GradeSyncIndex])
 					{
+						if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))	// 15.7.15
+						{
 						sprintf(app_err_buf,"Early Zero Flag Detected. Grade Sync %d shkl %d expected shkl %d\n",
 							GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], pShm->sys_set.Shackles);
 						GenError(warning, app_err_buf);
+						}
+					}
+					// 15.7.15 exact-count check (single-sensor only) - see ProcessSyncs.
+					else if ((pShm->ZeroFlagMode == 1) && grade_zeroed[GradeSyncIndex] &&
+							 !((pShm->grade_shackle[GradeSyncIndex] == pShm->sys_set.Shackles + 1) &&
+							   (trolly_counters[MAXSYNCS + GradeSyncIndex] == 0)))
+					{
+						ssMisplaced = true;
+						if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))
+						{
+						sprintf(app_err_buf,"Zero Flag position mismatch. Grade Sync %d count %d trolley %d expected %d/0\n",
+							GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], trolly_counters[MAXSYNCS + GradeSyncIndex], pShm->sys_set.Shackles + 1);
+						GenError(warning, app_err_buf);
+						ss_grade_zero_lost[GradeSyncIndex] = true;
+						}
+					}
+					// 15.7.15 (single-sensor, informational): announce the recovery - see ProcessSyncs.
+					if ((pShm->ZeroFlagMode == 1) && grade_zeroed[GradeSyncIndex] && ss_grade_zero_lost[GradeSyncIndex] && !ssMisplaced)
+					{
+						sprintf(app_err_buf,"Zero Flag re-acquired. Grade Sync %d\n", GradeSyncIndex + 1);
+						GenError(informational, app_err_buf);
+						ss_grade_zero_lost[GradeSyncIndex] = false;
 					}
 
 					//GLC 2/15/05 clear sync shackle counters to avoid late zero errors on syncs after
@@ -5700,6 +7409,7 @@ void overhead::GradeSyncs()
 						sprintf(app_err_buf,"Initial Zero Flag Detected. Grade Sync %d\n",
 							GradeSyncIndex + 1);
 						GenError(informational, app_err_buf);
+						ss_grade_zero_lost[GradeSyncIndex] = false;	// 15.7.15
 
 						for (i = 0; i< MAXSYNCS; i++)
 						{
@@ -5715,6 +7425,20 @@ void overhead::GradeSyncs()
 					pShm->sys_stat.dbg_sync[ZERO_ON][MAXSYNCS + GradeSyncIndex - 1] = 0;
 					pShm->sys_stat.dbg_sync[SYNC_ON][MAXSYNCS + GradeSyncIndex - 1]++;
 
+					// 15.7.14: single-sensor double pulse - see ProcessSyncs. The grade flag trolley's
+					// body pulse was counted as Shackles+1 and already ran GradeProcess for exactly the
+					// shackles this tab maps to again (RingSub(1,x) == RingSub(Shackles+1,x)).
+					if (pShm->ZeroFlagMode == 1)
+					{
+						ssGradeTabDup = ss_grade_ovr_pass[GradeSyncIndex];
+
+						if ( ssGradeTabDup && (!trc[MAINBUFID].buffer_full) && (TraceMask & _ZEROS_ ) )
+						{
+							sprintf((char*) &tmp_trc_buf[MAINBUFID],"GrdZero\t%d\tSS tab\tdup GradeProcess skipped\tShk\t%d\n",
+									GradeSyncIndex, pShm->sys_set.Shackles + 1);
+							strcat((char*) &trc_buf[MAINBUFID],(char*) &tmp_trc_buf[MAINBUFID] );
+						}
+					}
 				}
 				else
 				{
@@ -5726,6 +7450,7 @@ void overhead::GradeSyncs()
 						{
 							true_grade_shackle_count[GradeSyncIndex]++;
  							pShm->grade_shackle[GradeSyncIndex]++;
+							SingleSensorAlarmTick(ss_grade_alarm_cnt[GradeSyncIndex]);	// 15.7.15
 							trolly_counters[MAXSYNCS + GradeSyncIndex] = 0;
 
 							// special, the grade sync counter is tacked on to the end of regular syncs.
@@ -5737,6 +7462,7 @@ void overhead::GradeSyncs()
 					{
 						pShm->grade_shackle[GradeSyncIndex]++;
 						true_grade_shackle_count[GradeSyncIndex]++;
+						SingleSensorAlarmTick(ss_grade_alarm_cnt[GradeSyncIndex]);	// 15.7.15
 						// special, the grade sync counter is tacked on to the end of regular syncs.
 						pShm->sys_stat.dbg_sync[SYNC_ON][MAXSYNCS + GradeSyncIndex - 1]++;
 						pShm->sys_stat.dbg_sync[ZERO_ON][MAXSYNCS + GradeSyncIndex - 1]++;
@@ -5744,28 +7470,39 @@ void overhead::GradeSyncs()
 					//RtPrintf("inc grade_shackle \n");
 				}
 
-				// Late zero flag
-				if ( (pShm->grade_shackle[GradeSyncIndex] > pShm->sys_set.Shackles ) )
+				// Late zero flag (single-sensor: tolerate one overshoot, see ProcessSyncs)
+				if ( (pShm->grade_shackle[GradeSyncIndex] > pShm->sys_set.Shackles + (pShm->ZeroFlagMode == 1 ? 1 : 0)) )
 				{
-	                sprintf(app_err_buf,"Zero Flag NOT Detected. Grade Sync %d shackle %d expected %d\n",
-						GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], pShm->sys_set.Shackles); //GLC added 2/14/05
-
 					trolly_counters[MAXSYNCS + GradeSyncIndex]   = 0;
 					pShm->grade_shackle[GradeSyncIndex]         = 1;
 
-					GenError(warning, app_err_buf);
+					if (SingleSensorAlarmOk(ss_grade_alarm_cnt[GradeSyncIndex], ss_grade_rule[GradeSyncIndex]))	// 15.7.15: was SingleSensorWarnOk()
+					{
+						sprintf(app_err_buf,"Zero Flag NOT Detected. Grade Sync %d shackle %d expected %d\n",
+							GradeSyncIndex + 1, pShm->grade_shackle[GradeSyncIndex], pShm->sys_set.Shackles); //GLC added 2/14/05
+						GenError(warning, app_err_buf);
+						if (pShm->ZeroFlagMode == 1) ss_grade_zero_lost[GradeSyncIndex] = true;	// 15.7.15
+					}
 				}
 
 				// Hard coded for now. We should not need more than 2 grade syncs
 				// But NEVER say NEVER
 				if ( (pShm->OpMode == ModeRun) &&
-					(grade_zeroed[0] && grade_zeroed[1]) )
+					(grade_zeroed[0] && grade_zeroed[1]) &&
+					!ssGradeTabDup )	// 15.7.14
 				{
 					GradeProcess(GradeSyncIndex);
+					ssGradeRan = true;
 				}
 				//else
 				//    RtPrintf("OpMode %d grade_zeroed %d\n",
 				//               pShm->OpMode, grade_zeroed);
+				// 15.7.14: arm / disarm the tab guard exactly as ProcessSyncs does (ss_ovr_pass).
+				if (ssGradeRan)
+					ss_grade_ovr_pass[GradeSyncIndex] = (pShm->ZeroFlagMode == 1) &&
+						(pShm->grade_shackle[GradeSyncIndex] == pShm->sys_set.Shackles + 1);
+				else if (pShm->grade_shackle[GradeSyncIndex] != pShm->sys_set.Shackles + 1)
+					ss_grade_ovr_pass[GradeSyncIndex] = false;
 
 			}
 			else
@@ -5773,6 +7510,7 @@ void overhead::GradeSyncs()
 				if ( !(BITSET(switch_in[0], GradeSyncBit[GradeSyncIndex])) )
 				{
 					grade_armed[GradeSyncIndex] = true;
+					grade_debounce[GradeSyncIndex] = pShm->sys_set.SyncOn;
 				}
 			}
 		}
@@ -5832,6 +7570,34 @@ void overhead::ProcessWeight()
 //----- Subtract auto zero.
 
             WEIGH_SHACKLE(i, pShm).weight[i] -= (__int64) pShm->AutoBias[i];
+
+            // Auto-Span: is this the reference shackle? (declared before the switch so
+            // it is in scope for both the ModeRun monitor call and the FindDrops omit.)
+            int  acRefShk = pShm->AutoSpanRefShackle > 0 ? pShm->AutoSpanRefShackle : AUTOSPAN_REF_SHACKLE;
+            bool acIsRef  = pShm->AutoSpanEnable && (pShm->WeighShackle[i] == acRefShk);
+
+            // SandCat dead-zone / reference omission. Tag the shackle HERE (WeighShackle is
+            // authoritative) so BOTH FindDrops and AddDropRecord skip it. Covers the zero
+            // trolley, the flag dead-zone (trolleys 1..N+1 for scale offset -N), and the
+            // Auto-Span reference shackle. Without this the welded known weight leaks out of
+            // AddDropRecord as a phantom drop==0 "unassigned" bird. See docs/DEAD_ZONE_AND_
+            // REFERENCE_TROLLEY.md. EPM/RTSS run different firmware and are unaffected.
+            {
+                int ws  = pShm->WeighShackle[i];          // WeighShackle 1 == trolley 0 (zero)
+                int off = pShm->ScaleSyncOffset;           // signed, e.g. -2 (0 == legacy)
+                int n   = off < 0 ? -off : off;            // magnitude
+                // Dead-zone depth is mode-gated (N = |scale offset|):
+                //   Auto-Span ON  => omit trolleys 0..N    (first bird trolley N+1) => ws <= N+1
+                //   Auto-Span OFF => omit trolleys 0..N+1  (first bird trolley N+2) => ws <= N+2
+                // The extra dead trolley in standard mode is the rubber zero-flag trolley,
+                // which is freed for a bird when Auto-Span is running. The known-weight
+                // reference (acIsRef) is always omitted wherever it rides.
+                int bound = pShm->AutoSpanEnable ? (n + 1) : (n + 2);   // WeighShackle upper bound
+                bool omitTrolley = (ws == 1)                              // trolley 0 (zero)
+                                || (off != 0 && ws >= 2 && ws <= bound)   // flag dead-zone
+                                || acIsRef;                               // known-weight reference
+                WEIGH_SHACKLE(i, pShm).OmitFromDrop = omitTrolley ? 1 : 0;
+            }
 
             switch(pShm->OpMode)
             {
@@ -5895,6 +7661,15 @@ void overhead::ProcessWeight()
                        WEIGH_SHACKLE(i, pShm).weight[i] += (__int64) spn_bias;
                    }
 
+                   // Auto Calculate Span: the reference shackle (default trolley 1 ==
+                   // WeighShackle 2) is OMITTED from FindDrops below so its known weight is
+                   // never dropped as a phantom bird. Span itself is set ONLY during
+                   // Calibrate Shackle Tares and is never trimmed here. The per-rev MONITOR
+                   // is READ-ONLY: it records the reference reading every crossing
+                   // (auto_span_log feed) and raises a drift alarm past threshold so the
+                   // operator can watch how the system is weighing — it NEVER touches span.
+                   if (acIsRef) AutoSpanMonitor(i, WEIGH_SHACKLE(i, pShm).weight[i]);
+
 //----- Find a drop
 
                    //RtPrintf("WBird Weight %ld\n", WEIGH_SHACKLE(i, pShm).weight[i] );
@@ -5908,7 +7683,11 @@ void overhead::ProcessWeight()
                        config_Ok )
                   {
                         cfg_err_sent = false;
-                        FindDrops(i+1);
+                        // SandCat: skip the zero trolley, flag dead-zone, and Auto-Span
+                        // reference shackle (all tagged above) — none carry a distributable
+                        // bird, so none may be assigned a drop.
+                        if (!WEIGH_SHACKLE(i, pShm).OmitFromDrop)
+                            FindDrops(i+1);
                   }
                   else
                   {
@@ -5971,11 +7750,43 @@ void overhead::SetOutput(int num, DBOOL active)
 
     if (simulation_mode) return;
 
-    byte = ((num - 1) / 8);
-    bit  = num - 1;
+//----- 15.7.13: universal outputs-disabled interlock.
+//
+//      Once any shutdown or clear-outputs path has run, NOTHING may drive an
+//      output again. This is the single choke point that guarantees it: the
+//      production scan, the batch-station lamps, a test fire in mid-hold and
+//      DecCntrlCtrs all funnel through here. One branch, no configuration
+//      dependence - it behaves identically for 1 line or 4, 8 drops or 32,
+//      grading on or off, EPM15/EPM19/VSBC.
+
+    if (g_outputs_disabled) return;
+
+//----- 15.7.13: logical drop number -> physical output pin.
+//
+//      This is the single choke point where a drop number becomes a byte+bit,
+//      so mapping here covers every caller at once: production fire, the
+//      DecCntrlCtrs() turn-off pass, manual test fire, test-fire-at-zero and
+//      BatchResetStation()'s station lamps. Identity unless a validated
+//      output_map.cfg was loaded at startup (see LoadOutputMap).
+//
+//      NOTE the asymmetry below and keep it: byte/bit - the HARDWARE - use the
+//      mapped pin, while output_timer[] stays indexed by the LOGICAL drop
+//      number, because that is how every other piece of code indexes it
+//      (DecCntrlCtrs walks output_timer[i] and calls SetOutput(i+1,...), the
+//      test fire writes output_timer[testDrop-1]). Mapping the timer index too
+//      would double-apply the map and a remapped drop would never turn off.
+
+    int phys = MapOutputPin(num);
+
+    byte = ((phys - 1) / 8);
+    bit  = phys - 1;
 
     if (byte < MAXOUTPUTBYTS)
     {
+        // 15.7.13: the read-modify-write below plus the port write that
+        // publishes it must be atomic against the other timer thread. See
+        // output_byte_mutex at the top of this file.
+        pthread_mutex_lock(&output_byte_mutex);
 
 //----- set/clear the output_byte bits
 
@@ -6066,6 +7877,7 @@ void overhead::SetOutput(int num, DBOOL active)
                 break;
 		} // end switch (byte)
 
+        pthread_mutex_unlock(&output_byte_mutex);   // 15.7.13
     }
     else
         RtPrintf("Error file %s, line %d \n", _FILE_, __LINE__);
@@ -6281,6 +8093,53 @@ void overhead::AddBird(int grade_idx, int drop_no, __int64 wt)
 }
 
 //--------------------------------------------------------
+//  Auto-Span Part 1 result codes
+//
+// AutoSpanMonitor (Part 2) already owns the low numbers: AutoSpanAlarm[] uses
+// 0=ok 1=held(legacy clamp) 2=zero-bias-off 3=weight-missing 5=drift-past-
+// threshold, and the AUTO_SPAN_REC flag field carries 0/2/3/5. The Part 1 codes
+// below therefore start at 6, so neither the host's Calibration Log nor the
+// alarm banner can confuse a calibration-pass rejection with a run-time drift
+// alarm (the host renders an unrecognised code as "unknown flag (n)").
+//--------------------------------------------------------
+
+#define AUTOSPAN_FLAG_CHECKWT_REJECT  6   // AUTO_SPAN_REC flag: pass failed CheckWeight, not used in cal
+#define AUTOSPAN_ALARM_PASSES_SHORT   7   // AutoSpanAlarm:      fewer accepted passes than TareTimes, span untouched
+
+//--------------------------------------------------------
+//  AutoSpanCheckWeight
+//
+// Verbatim port of the RTSS/Delphi authority,
+// references/source_extracted/OverheadADOSource/AutoSpan.pas,
+// TfrmAutoSpan.CheckWeight (~line 150):
+//
+//     CheckUnderWeight := FTestWeight - (FTestWeight div 4);
+//     CheckOverWeight  := FTestWeight + (FTestWeight div 4);
+//     if (ScaleWeight > CheckUnderWeight) and
+//        (ScaleWeight < CheckOverWeight) then
+//       Result := True else Result := False;
+//
+// +/-25% of the known (test) weight. Two details are replicated deliberately
+// and must not be "cleaned up": the band edges are built with INTEGER division
+// (Pascal `div`, truncating -- not 0.25 * weight), and both comparisons are
+// STRICTLY greater / strictly less, i.e. the band is EXCLUSIVE at both ends.
+// RTSS is the authority; do not widen this, do not make it inclusive, and do
+// not turn it into a floating-point tolerance.
+//--------------------------------------------------------
+
+static inline bool AutoSpanCheckWeight(__int64 scale_weight, __int64 test_weight)
+{
+    __int64 check_under_weight = test_weight - (test_weight / 4);
+    __int64 check_over_weight  = test_weight + (test_weight / 4);
+
+    if ((scale_weight > check_under_weight) &&
+        (scale_weight <  check_over_weight))
+        return true;
+    else
+        return false;
+}
+
+//--------------------------------------------------------
 //   AutoTare
 //
 // This routine handles storing all shackle tares during
@@ -6327,7 +8186,57 @@ void overhead::AutoTare ( int s )
 		case 3:
 		case 4:
 
-			if (pShm->AutoTareStep == 1)
+			// Auto-Span Part 1: the reference shackle (trolley 1 == shackleno 2) is
+			// NOT tared. Average its (raw - AutoBias) reading here instead, so at
+			// completion we set SpanBias from it vs the entered known weight. This
+			// folds the morning Auto Span into Calibrate Shackle Tares.
+			if (pShm->AutoSpanEnable && pShm->WeighShackle[s] == (pShm->AutoSpanRefShackle > 0 ? pShm->AutoSpanRefShackle : AUTOSPAN_REF_SHACKLE))
+			{
+				TARE_SHACKLE(s, pShm) = 0;
+
+				// Per-pass CheckWeight gate. RTSS applies CheckWeight to EVERY pass in
+				// TfrmAutoSpan.DoSpan (CyclePhase 1 and 2,3,4) BEFORE the reading is added
+				// to SpanWeight, and a failing pass does not advance the cycle -- so RTSS
+				// can only ever reach its completion arm with a full set of good readings.
+				// We were accumulating every reading unconditionally and only sanity-checking
+				// the AVERAGE at the end. That deviation from the authority is what let
+				// Holmes 2026-08-26 through: the load-cell zero was bad, the reference read
+				// 0.63x-0.71x of known, every pass was swallowed by the old 0.5x..2x average
+				// check, and span was inflated 121 -> 592 (line 1) and 69 -> 417 (line 2).
+				// Every bird then weighed ~1.5-1.8 lb heavy. A reading outside +/-25% of the
+				// known weight is now NOT accumulated and NOT counted -- but it is still
+				// reported to the host, so the Calibration Log shows the operator exactly
+				// which readings were thrown away and why.
+				__int64 kn     = pShm->AutoSpanKnownWeight;
+				bool    accept = (kn > 0) && AutoSpanCheckWeight(wt, kn);
+
+				if (pShm->AutoTareStep == 1)
+				{
+					// 1st pass: reset the accumulators whether or not this reading is good
+					autospan_ref_accum[s] = 0;
+					autospan_ref_cnt  [s] = 0;
+					autospan_ref_rej  [s] = 0;
+				}
+
+				if (accept) { autospan_ref_accum[s] += wt; autospan_ref_cnt[s]++; }
+				else        {                              autospan_ref_rej[s]++; }
+
+				// Log each calibration reading so the Calibration Log shows exactly which
+				// readings built the span bias: used-in-cal = 1 / flag 0 for an accepted
+				// pass, used-in-cal = 0 / flag AUTOSPAN_FLAG_CHECKWT_REJECT for one the
+				// CheckWeight gate rejected.
+				if (HOST_OK)
+				{
+					__int64 crec[9];
+					crec[0] = this_lineid; crec[1] = s; crec[2] = wt; crec[3] = kn;
+					crec[4] = kn > 0 ? (wt - kn) * 1000 / kn : 0;
+					crec[5] = pShm->scl_set.SpanBias[s]; crec[6] = pShm->AutoBias[s];
+					crec[7] = accept ? 1 : 0;
+					crec[8] = accept ? 0 : AUTOSPAN_FLAG_CHECKWT_REJECT;
+					SendHostMsg(AUTO_SPAN_REC, 0, (BYTE*) crec, sizeof(crec));
+				}
+			}
+			else if (pShm->AutoTareStep == 1)
 			{
 				// 1st read, just set tare = raw weight
 				TARE_SHACKLE(s, pShm) = wt;
@@ -6341,6 +8250,77 @@ void overhead::AutoTare ( int s )
 				// Done, calculate average and go back to run mode
 				if (pShm->sys_set.TareTimes == pShm->AutoTareStep)
 				{
+					if (pShm->AutoSpanEnable && pShm->WeighShackle[s] == (pShm->AutoSpanRefShackle > 0 ? pShm->AutoSpanRefShackle : AUTOSPAN_REF_SHACKLE))
+					{
+						// Set SpanBias from the averaged reference reading vs known:
+						// avg_ref * (1 + span/1000) == known => span = 1000*(known/avg_ref - 1)
+						__int64 known   = pShm->AutoSpanKnownWeight;
+						int     want    = pShm->sys_set.TareTimes;
+						__int64 avg_ref = autospan_ref_cnt[s] > 0 ? autospan_ref_accum[s] / autospan_ref_cnt[s] : 0;
+
+						// A COMPLETE set of valid passes is required. RTSS never advances
+						// CyclePhase on a pass that fails CheckWeight, so its completion arm
+						// (`SpanWeight div 4`) is only ever reached with four good readings.
+						// The equivalent here is that the number of ACCEPTED passes must equal
+						// the configured pass count. Short of that we simply do not know the
+						// reference: leave SpanBias completely untouched, raise the alarm, and
+						// make the operator re-run the calibration. Never derive a span from a
+						// partial set -- averaging one good pass with three rejected ones is how
+						// a bad zero becomes a permanent gain error (Holmes 2026-08-26).
+						if (want <= 0 || autospan_ref_cnt[s] != want)
+						{
+							pShm->AutoSpanAlarm[s] = AUTOSPAN_ALARM_PASSES_SHORT;
+							sprintf(app_err_buf, "Auto-Span scale %d: only %d of %d calibration passes were within +/-25%% of the known weight (%d rejected) -- span NOT changed, re-run the tare calibration\n",
+							        s + 1, autospan_ref_cnt[s], want, autospan_ref_rej[s]);
+							GenError(warning, app_err_buf);
+							RtPrintf("Auto-Span: scale %d ref WeighShackle %d INCOMPLETE passes accepted=%d rejected=%d required=%d known=%lld -> SpanBias UNCHANGED (%lld)\n", s, pShm->WeighShackle[s], autospan_ref_cnt[s], autospan_ref_rej[s], want, (long long)known, (long long)pShm->scl_set.SpanBias[s]);
+						}
+						// Sanity band, belt and braces -- the per-pass gate above should already
+						// guarantee this. A genuine gain drift is small, so the averaged reference
+						// reading must land inside the same +/-25% CheckWeight band the authority
+						// uses per pass (RTSS AutoSpan.pas, TfrmAutoSpan.CheckWeight). If the ref
+						// shackle is misaligned / not seeing the known weight, avg_ref is a tiny
+						// fraction of known and span = 1000*(known/avg_ref - 1) EXPLODES into a garbage
+						// SpanBias that then amplifies every weight (2026-07-16: avg_ref=43 counts,
+						// known=346500 -> SpanBias 8,057,140, weights bounced, persisted to scale.bin).
+						// The band used to be 0.5x..2x, which is far too loose -- a 0.63x-0.71x
+						// reference sailed straight through it at Holmes on 2026-08-26 and inflated
+						// span ~5x on both lines. It is now the authority's +/-25%, exclusive.
+						// Out of band => leave SpanBias untouched (AutoSpanMonitor still flags the bad
+						// reference). Was `avg_ref > 0` alone, which was far too weak.
+						else if (avg_ref > 0 && known > 0 && AutoSpanCheckWeight(avg_ref, known))
+						{
+							double  spd  = 1000.0 * ((double) known / (double) avg_ref - 1.0);
+							__int64 span = (__int64)(spd + (spd >= 0 ? 0.5 : -0.5));
+							pShm->scl_set.SpanBias[s]    = span;
+							pShm->AutoSpanSpanBaseline[s] = span;   // clamp anchor for Part 2
+							pShm->AutoSpanAlarm[s]        = 0;
+							RtPrintf("Auto-Span: scale %d ref WeighShackle %d avg=%lld known=%lld -> SpanBias %lld (passes accepted=%d rejected=%d required=%d ref_setting=%d enable=%d)\n", s, pShm->WeighShackle[s], (long long)avg_ref, (long long)known, (long long)span, autospan_ref_cnt[s], autospan_ref_rej[s], want, pShm->AutoSpanRefShackle, pShm->AutoSpanEnable);
+							fsave_grp_tbl[shm_tbl[SCL_SET-1].group].changed = true;
+							fsave_grp_tbl[shm_tbl[SCL_SET-1].group].loaded  = true;
+							shm_updates[32-1] = true;
+
+							// Bias-too-high warning, mirroring RTSS AutoSpan.pas (~line 251, Jim W.
+							// 12/14/2004): "the generated AutoSpan bias value ... appears to be
+							// relatively high (greater than 1% of your currently-selected test
+							// weight ...). You should consider re-running this AutoSpan." SpanBias is
+							// in parts-per-thousand, so 1% == 10 ppt. RTSS warned and carried on; so
+							// do we -- this does NOT block the calibration.
+							if (span > 10 || span < -10)
+							{
+								sprintf(app_err_buf, "Auto-Span scale %d: the generated AutoSpan bias value of %.3f appears to be relatively high (greater than 1%% of the known weight). You should consider re-running this AutoSpan.\n",
+								        s + 1, (double) span / 1000.0);
+								GenError(warning, app_err_buf);
+							}
+						}
+						else
+						{
+							// Unreachable in practice now that every pass is gated, but keep the
+							// diagnostic: span stays untouched exactly as before, no state change.
+							RtPrintf("Auto-Span: scale %d ref WeighShackle %d avg=%lld known=%lld OUT OF BAND (+/-25%%) -> SpanBias UNCHANGED (%lld)\n", s, pShm->WeighShackle[s], (long long)avg_ref, (long long)known, (long long)pShm->scl_set.SpanBias[s]);
+						}
+					}
+					else
 					TARE_SHACKLE(s, pShm) /= pShm->AutoTareStep;
 					if (pShm->WeighShackle[0] == end_shackle)
 					{
@@ -6409,6 +8389,92 @@ void overhead::AutoTare ( int s )
                                  (int)TARE_SHACKLE(s, pShm));
             strcat((char*) &trc_buf[MAINBUFID], (char*) &tmp_trc_buf[MAINBUFID] );
         //}
+    }
+}
+
+//--------------------------------------------------------
+//  AutoSpanMonitor  (Auto Calculate Span Part 2)
+//
+//  Called once per revolution when the reference shackle (trolley 1 ==
+//  shackleno 2, welded to a permanent known weight) is weighed in ModeRun.
+//  final_ref is the fully processed weight: (raw - AutoBias - tare) * (1 +
+//  SpanBias/1000); the reference shackle has tare 0, and AutoBias has already
+//  removed load-cell ZERO/offset drift -- so any residual vs the known weight
+//  is GENUINE GAIN error. We trim SpanBias slowly toward it, never chasing
+//  offset drift (the safety crux, see docs/AUTO_SPANIBRATION.md).
+//
+//  Guards: zero must be active; reference must be present; outliers rejected;
+//  deadband; slow integral; hard clamp vs the AutoTare baseline with
+//  alarm-and-HOLD beyond it (weight shifted/fell, cell dying -> do not chase).
+//--------------------------------------------------------
+
+// REDESIGN 2026-07-02: span is set ONLY at Calibrate Shackle Tares (Part 1).
+// This monitor NEVER trims span -- it records the reference reading every
+// crossing and raises a DRIFT ALARM when the reading strays past the operator
+// threshold (AutoSpanClampPpt, default 20 ppt = 2%). No deadband/integral/clamp.
+#define AUTOSPAN_MISSING_PCT    50     // below 50% of known => weight gone -> alarm
+
+void overhead::AutoSpanMonitor(int s, __int64 final_ref)
+{
+    __int64 known = pShm->AutoSpanKnownWeight;
+    if (known <= 0) return;                              // not configured yet
+
+    int     drift_ppt = pShm->AutoSpanClampPpt > 0 ? pShm->AutoSpanClampPpt : 20;  // threshold, default 2%
+    __int64 err     = final_ref - known;                 // signed residual (offset already gone)
+    __int64 abs_err = err < 0 ? -err : err;
+    __int64 err_ppt = (err * 1000) / known;              // residual in parts-per-thousand
+    int     flag = 0;    // 0 ok / 2 zero-off / 3 weight-missing / 5 drift-over-threshold
+
+    // Sanity gates first, then the drift check. Span is NEVER touched here.
+    // Not zeroed yet (e.g. right after a restart): the reference check is
+    // meaningless, and nagging "zero bias off" every revolution before the line
+    // has ever zeroed is just noise. Only monitor the known weight AFTER the
+    // scale has zeroed; then a missing/drifted reference is a real alarm.
+    // (Del 2026-07-15 — flag 2 "zero bias off" removed.)
+    if (!pShm->WeighZero[s])
+    {
+        pShm->AutoSpanAlarm[s] = 0;                       // clear any prior alarm; do NOT raise one
+        return;
+    }
+    if (final_ref < (known * AUTOSPAN_MISSING_PCT) / 100)
+        flag = 3;                                        // zeroed but known reference weight not seen
+    else if (abs_err * 1000 > known * (__int64) drift_ppt)   // |err|/known > threshold
+        flag = 5;                                        // zeroed but reference drifted past threshold
+
+    // Alarm state + host warning on a NEW alarm (rides ERROR_MSG channel; host pops the red box,
+    // once per revolution while still out -- the reference crosses the scale only once/rev).
+    int prev_alarm = pShm->AutoSpanAlarm[s];
+    pShm->AutoSpanAlarm[s] = flag;                         // 0/2/3/5
+    if (flag != 0 && flag != prev_alarm)
+    {
+        const char* why = flag == 5 ? "reference weight drifted past threshold -- recalibrate" :
+                          flag == 2 ? "zero bias off" : "reference weight missing";
+        sprintf(app_err_buf, "Auto-Span scale %d: %s (ref %ld vs known %ld)\n",
+                s + 1, why, (long) final_ref, (long) known);
+        GenError(warning, app_err_buf);
+    }
+
+    // Emit one reading record per crossing (auto_span_log feed). Flat __int64[9] so
+    // there is no 32/64-bit struct-packing ambiguity; the host parses by fixed offset.
+    __int64 rec[9];
+    rec[0] = this_lineid;
+    rec[1] = s;                                          // scale 0/1
+    rec[2] = final_ref;                                  // measured (internal counts)
+    rec[3] = known;                                      // known weight (internal counts)
+    rec[4] = err_ppt;                                    // residual ppt
+    rec[5] = pShm->scl_set.SpanBias[s];                  // span (unchanged) for context
+    rec[6] = pShm->AutoBias[s];                          // zero bias (context)
+    rec[7] = 0;                                          // used-in-cal: 0 (this is a monitoring read)
+    rec[8] = flag;
+    if (HOST_OK)
+        SendHostMsg(AUTO_SPAN_REC, 0, (BYTE*) rec, sizeof(rec));
+
+    if( (!trc[MAINBUFID].buffer_full) && (TraceMask & _AUTOZ_) )
+    {
+        sprintf((char*) &tmp_trc_buf[MAINBUFID],
+            "AutoSpan\tscl\t%d\tref\t%ld\tknown\t%ld\terr_ppt\t%ld\tthresh_ppt\t%d\tflag\t%d\n",
+            s, (long) final_ref, (long) known, (long) err_ppt, drift_ppt, flag);
+        strcat((char*) &trc_buf[MAINBUFID], (char*) &tmp_trc_buf[MAINBUFID]);
     }
 }
 
@@ -7484,6 +9550,17 @@ int overhead::SendHostMsg( int cmd, int var, BYTE *data, int len)
 
                 //RtPrintf("\nWeight read1 %d read2 %d samples %d\n",
                 //          *rd1,*rd2, ((len/4) - 2) );
+
+            }
+            break;
+
+        case AUTO_SPAN_REC:        // Auto-Span: flat __int64[9] reading record, generic payload copy
+        case SYNC_CAPTURE_INFO:   // Sensor Scope: same generic payload copy as LC capture
+
+            {
+                for (i = 0; i < len; i++ )
+                    pappMsg->gen.data[i] = data[i];
+                pappMsg->gen.hdr.len = len;
 /*
                 // the loop is just debug (NEEDS UPDATING, now has 4 read indexes
                 for (i = 0; i < ((len/4) - 2); i++ )
@@ -7862,6 +9939,18 @@ bool overhead::AssignDrop(int scale, int drop, TShackleStatus* pShk )
     int  drop_plus1 = drop + 1;
 //    bool bch_stat   = false;	RED - Removed because not referenced
 
+//----- Auto-Span: the reference shackle carries a permanent known weight, not a
+//      bird. This is the single chokepoint for ALL drop assignment (local AND
+//      intersystems via the drop manager, plus gib/grade drops), so guarding
+//      here guarantees the reference is never assigned to a drop, counted as a
+//      bird (AddBird), batched, or dropped downstream. Omitted only when the
+//      feature is on; default behavior is byte-identical when off.
+    {
+        int acRefShk = pShm->AutoSpanRefShackle > 0 ? pShm->AutoSpanRefShackle : AUTOSPAN_REF_SHACKLE;
+        if (pShm->AutoSpanEnable && pShm->WeighShackle[scale] == acRefShk)
+            return false;
+    }
+
 //----- Short cuts
 
     pSch     = &pShm->Schedule[drop];
@@ -8200,9 +10289,27 @@ void overhead::FindDrops(int Scale, int StartAt, int Shackle)
 							trickle_short_cnt[drp_chk] = 0;
 							break;
 						case bpm_trickle:
-							if (target_trickle_count[drp_chk] == 0)
-								pShm->sys_stat.DropStatus[drp_chk].Suspended = true;
-							trickle_active = true;
+							//----- Trickle only has meaning under the rate modes (4-7).
+							//      target_trickle_count[] is written ONLY by TrickleCounts(),
+							//      which itself runs only for those modes, so under any other
+							//      mode the count stays 0 for the life of the process and the
+							//      test below would be true on every pass -- re-suspending the
+							//      drop forever, with no path that ever clears it. Bypass the
+							//      whole trickle path instead, so a stale Trickle flag left on
+							//      a weight/grade/batch drop cannot stop it taking birds.
+							switch (pShm->Schedule[drp_chk].DistMode)
+							{
+								case mode_4_rate:
+								case mode_5_batch_rate:
+								case mode_6_batch_alt_rate:
+								case mode_7_batch_alt_rate:
+									if (target_trickle_count[drp_chk] == 0)
+										pShm->sys_stat.DropStatus[drp_chk].Suspended = true;
+									trickle_active = true;
+									break;
+								default:
+								   break;
+							}
 							break;
 						default:
 						   break;
@@ -8348,12 +10455,16 @@ int overhead::CheckRange(int drop, int scale, TShackleStatus* pShk)
 		//	CHECK_GRADE
 		//----- See if the grade assigned to the shackle matches one in the schedule
 
-		if (pShm->sys_set.ResetGrading.ResetScale1Grade > 0)
-			grade = pShm->sys_set.GradeArea[pShk->GradeIndex[scale]].grade;
-		else\
-			grade = pShm->sys_set.GradeArea[pShk->GradeIndex[0]].grade;
-//DRW Added for resetting grade on empty shackles only
-		if (pShm->sys_set.ResetGrading.ResetS1Empty > 0)
+		// Dual-scale: when scale-1's grade is reset for scale 2 (all shackles via
+		// ResetScale1Grade, or empty-only via ResetS1Empty), test THIS SCALE's grade
+		// (GradeIndex[scale]) — for a scale-2 drop that is the reset grade already
+		// sitting in GradeIndex[1]. The original two separate if/else blocks let the
+		// ResetS1Empty branch clobber the ResetScale1Grade result back to
+		// GradeIndex[0], so scale-2 drops saw the scale-1 grade and rejected every
+		// bird (→ unassigned → GibDrop). Use one combined condition that matches the
+		// reset-firing logic in MissedBirdCheck (OR of both options). Single-scale is
+		// unaffected: scale==0 → GradeIndex[scale]==GradeIndex[0].
+		if ((pShm->sys_set.ResetGrading.ResetScale1Grade > 0) || (pShm->sys_set.ResetGrading.ResetS1Empty > 0))
 			grade = pShm->sys_set.GradeArea[pShk->GradeIndex[scale]].grade;
 		else
 			grade = pShm->sys_set.GradeArea[pShk->GradeIndex[0]].grade;
@@ -8646,6 +10757,9 @@ void overhead::GradeProcess(int GradeSyncIndex)
     {
         if ((grade_bit[i] != NULL) && (pShm->sys_set.GradeArea[grade_index[i]].GradeSyncUsed == GradeSyncIndex))
         {
+            // Scale offset removed (2026-07-02): grade is anchored to the GRADE
+            // sensor (grade_shackle), not the scale. The scale-sensor-to-deck
+            // offset only belongs in drop / missed-bird fire calcs.
             shackle = RingSub(pShm->grade_shackle[GradeSyncIndex],
                               pShm->sys_set.GradeArea[grade_index[i]].offset,
                               pShm->sys_set.Shackles);
@@ -8691,6 +10805,8 @@ void overhead::GradeProcess(int GradeSyncIndex)
 	{
 		if (pShm->sys_set.GradeArea[grade_index[MAXGRADES - 1]].GradeSyncUsed == GradeSyncIndex)
 		{
+			// Scale offset removed (2026-07-02): grade is anchored to the GRADE
+			// sensor, not the scale. The historical -2 is the grade's own and stays.
 			shackle = RingSub(pShm->grade_shackle[GradeSyncIndex],
 				pShm->sys_set.GradeArea[grade_index[MAXGRADES - 1]].offset - 2,
 				pShm->sys_set.Shackles);
@@ -9495,6 +11611,12 @@ void overhead::AddDropRecord(int shackle)
     struct tm *ptime;
 //	char    tmpGrade;
 
+    // SandCat: dead-zone / Auto-Span reference trolleys are not birds — never emit a host
+    // record for them (else the welded known weight surfaces as a phantom "unassigned" bird).
+    // Tagged at weigh time; see docs/DEAD_ZONE_AND_REFERENCE_TROLLEY.md.
+    if (pshk->OmitFromDrop)
+        return;
+
     // bail out if BOTH scales recorded less-than-min bird-weight
     if ( (pshk->weight[0] < pShm->sys_set.MinBird) &&
          (pshk->weight[1] < pShm->sys_set.MinBird) )
@@ -9635,8 +11757,26 @@ void overhead::GenError(int sev, char* txt)
         default:             api_sev = 0; break; // Info
     }
 
-    send_error.sev      = api_sev;
-    send_error.err_addr = txt;
+    // 15.7.16: queue a COPY of the message. It used to be ONE slot pointing at the caller's buffer:
+    // a second GenError before GpSendThread's next pass (<= 50 ms) overwrote the first, and the
+    // shared app_err_buf could be rewritten before it was sent. Lock-free, so no caller ever waits
+    // (the 5 ms scan included, every thread is SCHED_FIFO): an atomic ticket picks the slot, the
+    // slot's seq is cleared, the text copied, the seq published. A full ring overwrites its oldest
+    // entry; SendError notices the gap and reports it.
+    if (txt == NULL) txt = (char*) "";
+    unsigned long long t = __atomic_fetch_add(&errq_head, 1ULL, __ATOMIC_ACQ_REL);
+    ErrQEntry &e = errq[t % ERRQ_LEN];
+    __atomic_store_n(&e.seq, 0ULL, __ATOMIC_RELAXED);         // being written
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    size_t len = strnlen(txt, MAXERRMBUFSIZE);
+    e.sev = api_sev;
+    e.len = (int) len;
+    if (len < MAXERRMBUFSIZE) memcpy(e.txt, txt, len + 1);
+    else                      e.txt[0] = 0;                    // too long: SendError logs it, as before
+    __atomic_store_n(&e.seq, t + 1, __ATOMIC_RELEASE);        // published
+
+    send_error.sev      = api_sev;                             // kept: the latest message
+    send_error.err_addr = e.txt;
     send_error.send     = true;
 
     if (sev == critical)
@@ -9652,32 +11792,91 @@ void overhead::GenError(int sev, char* txt)
 //  SendError
 //--------------------------------------------------------
 
+// 15.7.16: drains the GenError queue IN ORDER - every message, each with the same HOST_OK gate,
+// mutex and SendHostMsg(ERROR_MSG, sev, text) as before. Single consumer (GpSendThread). A message
+// the host or the mutex cannot take now stays queued for the next pass. An entry overwritten by a
+// full ring (or while being copied) is counted, and once the survivors are delivered one
+// "N controller messages dropped (queue full)" is sent. A text of MAXERRMBUFSIZE or more is not
+// sent, with the same log line as before.
 void overhead::SendError()
 {
     // Guard: skip if pShm is invalid (HOST_OK dereferences pShm)
     if (!isPShmValid()) return;
 
-    int len = strlen(send_error.err_addr);
-
-    if (len >= MAXERRMBUFSIZE)
+    bool stalled = false;
+    for (;;)
     {
-        RtPrintf("Error file %s, line %d\n", _FILE_, __LINE__);
-        return;
+        unsigned long long head = __atomic_load_n(&errq_head, __ATOMIC_ACQUIRE);
+        if (errq_tail == head) break;                                  // empty
+        if (head - errq_tail > ERRQ_LEN)                               // lapped: the oldest were overwritten
+        {
+            errq_dropped += (unsigned int) (head - ERRQ_LEN - errq_tail);
+            errq_tail     = head - ERRQ_LEN;
+        }
+        ErrQEntry &e = errq[errq_tail % ERRQ_LEN];
+        unsigned long long s1 = __atomic_load_n(&e.seq, __ATOMIC_ACQUIRE);
+        if (s1 != errq_tail + 1)
+        {
+            if (s1 > errq_tail + 1) { errq_dropped++; errq_tail++; continue; }   // overwritten by a newer one
+            break;                                                     // still being written: next pass
+        }
+        int  sev = e.sev, len = e.len;
+        char buf[MAXERRMBUFSIZE];
+        if (len < MAXERRMBUFSIZE) memcpy(buf, e.txt, len + 1);
+        else                      buf[0] = 0;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&e.seq, __ATOMIC_RELAXED) != s1) { errq_dropped++; errq_tail++; continue; }   // overwritten while copied
+
+        if (len >= MAXERRMBUFSIZE)
+        {
+            RtPrintf("Error file %s, line %d\n", _FILE_, __LINE__);  // too long: not sent, as before
+            errq_tail++;
+            continue;
+        }
+        if (!SendErrorMsg(sev, buf)) { stalled = true; break; }        // keep it for the next pass
+        errq_tail++;
     }
+
+    if (errq_dropped && !stalled)
+    {
+        char buf[80];
+        sprintf(buf, "%u controller messages dropped (queue full)\n", errq_dropped);
+        RtPrintf("GenError: %s", buf);
+        if (SendErrorMsg(1 /* API Warning */, buf))
+            errq_dropped = 0;
+    }
+
+    if (!ErrQueuePending())
+    {
+        send_error.sev      = 0;
+        send_error.err_addr = NULL;
+        send_error.send     = false;
+    }
+}
+
+// 15.7.16: one message to the host - the body SendError always had. false = not sent (host not
+// connected, or the send mutex timed out), so the caller keeps the message.
+bool overhead::SendErrorMsg(int sev, char* txt)
+{
+    if (!(HOST_OK))
+        return false;
     // Request Mutex for send
     if(RtWaitForSingleObject(trc[GPBUFID].mutex, WAIT100MS) != WAIT_OBJECT_0)
-        RtPrintf("Wait failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
-    else
     {
-        if HOST_OK
-            SendHostMsg( ERROR_MSG, send_error.sev, (BYTE*) send_error.err_addr, strlen(send_error.err_addr));
-
-        if(!RtReleaseMutex(trc[GPBUFID].mutex))
-            RtPrintf("Release failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
+        RtPrintf("Wait failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
+        return false;
     }
+    SendHostMsg( ERROR_MSG, sev, (BYTE*) txt, strlen(txt));
 
-    send_error.sev      = 0;
-    send_error.err_addr = NULL;
+    if(!RtReleaseMutex(trc[GPBUFID].mutex))
+        RtPrintf("Release failed. GetLastError = %u file %s, line %d\n", GetLastError(), _FILE_, __LINE__);
+    return true;
+}
+
+// 15.7.16: a queued message, or an overflow summary, waits to be sent (consumer side only)
+bool overhead::ErrQueuePending()
+{
+    return (errq_tail != __atomic_load_n(&errq_head, __ATOMIC_ACQUIRE)) || (errq_dropped != 0);
 }
 
 //--------------------------------------------------------
@@ -10075,7 +12274,8 @@ void overhead::ProcessSyncs()
          pSyncStat = &pShm->SyncStatus[i];
 
 		//GLC for Carolina Turkeys, check that the zero sensor is triggered before the sync
-		 if (app->pShm->sys_set.MiscFeatures.RequireZeroBeforeSync)
+		//Single-sensor mode has no separate zero sensor, so this gate is bypassed.
+		 if (app->pShm->sys_set.MiscFeatures.RequireZeroBeforeSync && pShm->ZeroFlagMode != 1)
 		 {
 			 if (BITSET(sync_zero[byte], i)) //GLC added 3/8/05
 			 {
@@ -10108,34 +12308,95 @@ void overhead::ProcessSyncs()
 
 				//----- Zero flag detected -----
 
+                 // 15.7.14: single-sensor duplicate-pass guard (armed at the end of this edge,
+                 // see ss_ovr_pass[i] there). Standard mode (ZeroFlagMode==0) never sets these.
+                 bool ssTab     = false;   // this edge is an accepted single-sensor zero TAB
+                 bool ssTabDup  = false;   // ...whose pass would repeat the one already run at Shackles+1
+                 bool ssPassRan = false;   // this edge ran the drop / missed-bird pass
+
+ 				 // Zero-flag decision. Standard mode (ZeroFlagMode==0) reads the
+				 // dedicated odd zero bit, byte-for-byte unchanged. Single-sensor mode
+				 // (ZeroFlagMode==1) ignores the zero bit and derives zero from the
+				 // double-pulse timing on this even count bit (self-calibrating).
+                 bool zero_detected = (pShm->ZeroFlagMode == 1)
+                     ? SingleSensorIsZeroTab(ss_last_trolley_tick[i], ss_trolley_interval[i], ss_trolley_stall[i], ss_tab_run[i], ss_trolley_shrink[i],
+                                             ss_rule[i])
+                     : BITSET(sync_zero[byte], i);
+#if SS_CROSSCHECK
+                 if ((pShm->ZeroFlagMode == 1) && !zero_detected)
+                     SingleSensorXCGapEdge(i);      // 15.7.16: steadiness of this sync (trolley gap)
+#endif
+
  				 // Only zero the sync if the grade syncs have already zeroed. This is to prevent misgrading
 				 // in the time period between a scale sync zero and grade sync zero (if the zero flag passes
 				 // the scale before it passes the grade sync).
-                 if (BITSET(sync_zero[byte], i) && (grade_zeroed[0] & grade_zeroed[1])) //RCB test
+                 if (zero_detected && (grade_zeroed[0] & grade_zeroed[1])) //RCB test
                  {
+                     // Sensor Scope: mark a zero/tab on this sync for the scope overlay
+                     syncCapEventAccum = 0x40 | (pShm->ZeroFlagMode == 1 ? 0x80 : 0) | (i & 0x07);
 
+					 bool ssMisplaced = false;	// 15.7.15: exact-count check failed on this zero
+					 // 15.7.16: the same exact-count test, kept for the cross-sync check (a clean zero)
+					 bool ssExact = (pShm->ZeroFlagMode == 1) && pSyncStat->zeroed &&
+					                (pSyncStat->shackleno == pShm->sys_set.Shackles + 1) && (trolly_counters[i] == 0);
 					 // GLC 2/14/05
 					 // If this sync has already zeroed before, show late or early zero flag if applicable
 					if ((pSyncStat->shackleno < true_shackle_count[i]) &&
 						(true_shackle_count[i] > pShm->sys_set.Shackles) &&
 						pSyncStat->zeroed)
                     {
+                        if (SingleSensorAlarmOk(ss_alarm_cnt[i], ss_rule[i]))   // 15.7.15: owner's rule (single-sensor)
+                        {
                         sprintf(app_err_buf,"Late Zero Flag Detected. %s late count %ld\n",
 							sync_desc[i], (long) (true_shackle_count[i] - pShm->sys_set.Shackles));
                         GenError(warning, app_err_buf);
+                        }
 
                     }
                     else if ((pSyncStat->shackleno < pShm->sys_set.Shackles) && pSyncStat->zeroed)
                     {
+                        if (SingleSensorAlarmOk(ss_alarm_cnt[i], ss_rule[i]))   // 15.7.15
+                        {
                         sprintf(app_err_buf,"Early Zero Flag Detected. %s shkl %d expected shkl %d\n",
 							sync_desc[i], pSyncStat->shackleno, pShm->sys_set.Shackles);
                         GenError(warning, app_err_buf);
+                        }
+                    }
+                    // 15.7.15 EXACT-COUNT CHECK (single-sensor only). The flag trolley's body pulse
+                    // counts the sync to exactly Shackles+1 with the skip parity at 0 (02bf814: the
+                    // overshoot ProcessSyncs tolerates), so that is what an accepted tab must find.
+                    // Anything else that Late / Early cannot see - e.g. SkipTrollies 1, a missed tab
+                    // then a false zero one trolley later (Shackles+1 with trolly_counters 1) - would
+                    // run the whole revolution half a shackle off in silence. Counting is unchanged:
+                    // the sync zeroes below exactly as before; this only raises the alarm, under the
+                    // same once-per-revolution-per-sync rule. Not before the first zero (Initial).
+                    else if ((pShm->ZeroFlagMode == 1) && pSyncStat->zeroed &&
+                             !((pSyncStat->shackleno == pShm->sys_set.Shackles + 1) && (trolly_counters[i] == 0)))
+                    {
+                        ssMisplaced = true;
+                        if (SingleSensorAlarmOk(ss_alarm_cnt[i], ss_rule[i]))
+                        {
+                        sprintf(app_err_buf,"Zero Flag position mismatch. %s count %d trolley %d expected %d/0\n",
+							sync_desc[i], pSyncStat->shackleno, trolly_counters[i], pShm->sys_set.Shackles + 1);
+                        GenError(warning, app_err_buf);
+                        ss_zero_lost[i] = true;
+                        }
+                    }
+                    // 15.7.15 (single-sensor, informational): the once-per-revolution rule usually
+                    // swallows the "Late" that follows a "NOT Detected", so announce the recovery
+                    // once - on the first zero that is not itself misplaced.
+                    if ((pShm->ZeroFlagMode == 1) && pSyncStat->zeroed && ss_zero_lost[i] && !ssMisplaced)
+                    {
+                        sprintf(app_err_buf,"Zero Flag re-acquired. %s\n", sync_desc[i]);
+                        GenError(informational, app_err_buf);
+                        ss_zero_lost[i] = false;
                     }
 
 					//GLC added 2/15/05
 					// Show informational message the first time the sync is zeroed
 					if (!pSyncStat->zeroed)
 					{
+						ss_zero_lost[i] = false;	// 15.7.15: "Initial" already says it
 						sprintf(app_err_buf,"Initial Zero Flag Detected. %s\n", sync_desc[i]);
 						GenError(informational, app_err_buf);
 					}
@@ -10162,6 +12423,31 @@ void overhead::ProcessSyncs()
                         sprintf((char*) &tmp_trc_buf[MAINBUFID],"Zero\t%d\tOK\n", i);
                         strcat((char*) &trc_buf[MAINBUFID],(char*) &tmp_trc_buf[MAINBUFID] );
                     }
+
+                    // 15.7.14: single-sensor DOUBLE PULSE. The flag trolley's BODY pulse came
+                    // first, could not yet be known as the zero, and was counted as Shackles+1
+                    // (the overshoot tolerated below) - and it already ran this sync's per-shackle
+                    // pass. This TAB pulse realigns the counter to 1, but RingSub(1, x) ==
+                    // RingSub(Shackles+1, x) for every offset, so re-running the pass would process
+                    // the very same shackles a second time ~0.4 trolley later: a second drop kick,
+                    // a second missed-bird check and DROP_RECORD (shackle 1172 on the rig), a second
+                    // last-bird / pre-label step. The tab only realigns: the counter reset above and
+                    // the weigh relabel below (WeighShackle -> 1, the auto-zero shackle) are unchanged.
+                    if (pShm->ZeroFlagMode == 1)
+                    {
+                        ssTab    = true;
+                        ssTabDup = ss_ovr_pass[i];
+#if SS_CROSSCHECK
+                        SingleSensorXCZero(i, ssExact, NumSyncs);   // 15.7.16: anchor + learn offsets
+#endif
+
+                        if ( ssTabDup && (!trc[MAINBUFID].buffer_full) && (TraceMask & _ZEROS_ ) )
+                        {
+                            sprintf((char*) &tmp_trc_buf[MAINBUFID],"Zero\t%d\tSS tab\tdup pass skipped\tShk\t%d\n",
+                                    i, pShm->sys_set.Shackles + 1);
+                            strcat((char*) &trc_buf[MAINBUFID],(char*) &tmp_trc_buf[MAINBUFID] );
+                        }
+                    }
                  }
 
 //----- No Zero flag detected
@@ -10179,6 +12465,7 @@ void overhead::ProcessSyncs()
 						   //RtPrintf("**ProcessSync: trolly_counters[i] > pShm->sys_set.SkipTrollies\n");
 							pSyncStat->shackleno++;
 		                    true_shackle_count[i]++; //GLC added 2/14/05
+							SingleSensorAlarmTick(ss_alarm_cnt[i]);   // 15.7.15
 							pShm->sys_stat.dbg_sync[SYNC_ON][i]++;
 							pShm->sys_stat.dbg_sync[ZERO_ON][i]++;
                            trolly_counters[i] = 0;
@@ -10195,6 +12482,7 @@ void overhead::ProcessSyncs()
 						*/
 						pSyncStat->shackleno++;
 		                true_shackle_count[i]++; //GLC added 2/14/05
+						SingleSensorAlarmTick(ss_alarm_cnt[i]);   // 15.7.15
 						pShm->sys_stat.dbg_sync[SYNC_ON][i]++;
 						pShm->sys_stat.dbg_sync[ZERO_ON][i]++;
 					}
@@ -10210,21 +12498,65 @@ void overhead::ProcessSyncs()
 //----- Too many shackles, flag error
 
                 // GLC Only report late zeroes on syncs if grade sync has already zeroed or grading is disabled
-				if ((pSyncStat->shackleno > pShm->sys_set.Shackles) && grade_zeroed[0] && grade_zeroed[1])
+                // Single-sensor: the marked trolley's body pulse counts (shackleno -> Shackles+1)
+                // BEFORE its tab pulse resets it, so tolerate one overshoot; the tab does the zero.
+                int shackleLimit = pShm->sys_set.Shackles + (pShm->ZeroFlagMode == 1 ? 1 : 0);
+				if ((pSyncStat->shackleno > shackleLimit) && grade_zeroed[0] && grade_zeroed[1])
                 {
+                     // Single-sensor: at most one zero-flag alarm per revolution of THIS
+                     // sync's count (15.7.15 owner's rule; was a GLOBAL 30 s throttle).
+                     if (SingleSensorAlarmOk(ss_alarm_cnt[i], ss_rule[i]))
                      {
                         sprintf(app_err_buf,"Zero Flag NOT Detected. %s shackle %d expected %d\n",
 							sync_desc[i], pSyncStat->shackleno, pShm->sys_set.Shackles); //GLC added 2/14/05
                         GenError(warning, app_err_buf);
+                        if (pShm->ZeroFlagMode == 1) ss_zero_lost[i] = true;   // 15.7.15: announce the recovery
                      }
 					//RtPrintf("**ProcessSync: Trolly counter reset to 0\n");
                     trolly_counters[i]   = 0;
                     pSyncStat->shackleno = 1;
+#if SS_CROSSCHECK
+                    if (pShm->ZeroFlagMode == 1)
+                        SingleSensorXCOverrun(i);   // 15.7.16: the reset is a guess, not the flag
+#endif
                 }
+
+//----- 15.7.16: cross-sync count check (single-sensor, counted trolley edges only)
+
+                // A count that has slipped a whole trolley against the other count syncs is moved
+                // back here, BEFORE this edge's scale / drop pass (SingleSensorXCApply). The count
+                // it lands on already ran its drop / missed-bird pass at the previous counted edge
+                // (one trolley early, as every pass did while the count was ahead), so that pass is
+                // not repeated (xcSuppress). The scale: with SkipTrollies >= 1 the weighment started
+                // under that count one trolley ago is still averaging, so the scale re-labels and
+                // re-weighs the shackle really on it (capture / average re-armed, previousShackle = -1)
+                // and that weighment simply replaces the early one. With SkipTrollies 0 the early
+                // weighment (a whole shackle ago) has completed and been assigned, so the scale pass
+                // is skipped too (xcSuppressScale): no slot is weighed and assigned twice. Either way
+                // the shackle-to-shackle timing restarts. Standard mode: never set.
+                bool xcSuppress      = false;
+                bool xcSuppressScale = false;
+#if SS_CROSSCHECK
+                if ((pShm->ZeroFlagMode == 1) && !ssTab)
+                {
+                    int xcShift = SingleSensorXCCheck(i, NumSyncs);
+                    if (xcShift && SingleSensorXCApply(i, xcShift, NumSyncs))
+                    {
+                        xcSuppress      = true;
+                        xcSuppressScale = (pShm->sys_set.SkipTrollies <= 0);
+                        if (i == SCALE1SYNCBIT) app->cur_shk2shk_ticks = 0;
+                        if (!xcSuppressScale)
+                        {
+                            if (i == SCALE1SYNCBIT) app->previousShackle1 = -1;
+                            if (i == SCALE2SYNCBIT) app->previousShackle2 = -1;
+                        }
+                    }
+                }
+#endif
 
 //----- Reset status at scale 1 and trigger weighing
 
-                if ( SYNC_OK && (i == SCALE1SYNCBIT))
+                if ( SYNC_OK && (i == SCALE1SYNCBIT) && !xcSuppressScale)   // 15.7.16 (see above)
                 {
                     // clear drop & weight at scale 1
                     pShm->ShackleStatus[pSyncStat->shackleno].drop[0]   = 0;
@@ -10257,7 +12589,7 @@ void overhead::ProcessSyncs()
                 }
 
                 // trigger weighing for scale 2
-                if ( SYNC_OK && dual_scale && (i == SCALE2SYNCBIT) )
+                if ( SYNC_OK && dual_scale && (i == SCALE2SYNCBIT) && !xcSuppressScale )   // 15.7.16
                 {
                     pShm->ShackleStatus[pSyncStat->shackleno].drop[1]   = 0;
 					pShm->ShackleStatus[pSyncStat->shackleno].weight[1] = 0;
@@ -10278,7 +12610,9 @@ void overhead::ProcessSyncs()
                 // recalculate shackle to shackle ticks on every other shackle
                 if ( i == SCALE1SYNCBIT )
                 {
-                    isys_shksec_sec_cnt++; // not part of avg/capt
+                    // 15.7.14: a single-sensor tab is not a trolley (its body pulse was counted).
+                    if (!ssTab)
+                        isys_shksec_sec_cnt++; // not part of avg/capt
 
                     // The offsets can vary from install to install. Skip all of these
                     // to be out of the way of any automatic resets which may occur.
@@ -10309,12 +12643,27 @@ void overhead::ProcessSyncs()
                 // capture scale 1
                 if (( i == SCALE1SYNCBIT) && (app->previousShackle1 != app->pSyncStat->shackleno))
                 {
+                    // Single-sensor zero fires TWO count edges on the zero trolley: the
+                    // trolley-block (increments the shackle + arms here) then ~1/3-cycle
+                    // later the tab-block that resets the shackle to 1. That second (reset)
+                    // pass must NOT re-arm the capture or restart the weight average, or the
+                    // waveform jumps by the tab gap every revolution. Two-sensor zeroing is a
+                    // single edge, so it runs normally (this gate is single-sensor only).
+                    bool ssZeroReset1 = (pShm->ZeroFlagMode == 1) &&
+                                        (app->pSyncStat->shackleno < app->previousShackle1);
                     app->previousShackle1 = app->pSyncStat->shackleno;
-					if ( (capt_wt.scale == 1) &&
+                    if (!ssZeroReset1)
+                    {
+                    if ( (capt_wt.scale == 1) &&
                          (capt_wt.mode  == prod_capt) )
                     {
                         capt_wt.capture = true;
                         capture_period  = app->shk2shk_ticks - 3;
+                        // Re-phase the capture throttles to THIS shackle so the lead-in
+                        // and plateau sample counts are deterministic every frame (stops
+                        // the waveform sliding back and forth vs the fixed measurement lines).
+                        cap_slowdown      = CAPTURE_SPEED;
+                        capt_avg_slowdown = CAPTURE_SPEED;
                     }
 
                     // Clear wt average info and set trigger counter.
@@ -10322,6 +12671,7 @@ void overhead::ProcessSyncs()
                     // average finishes before the next shackle.
                     memset(&w_avg[i], 0, sizeof(t_wt_avg));
                     w_avg[i].avg_trigger_cntr = app->shk2shk_ticks - 3;
+                    }
 
                     //RtPrintf("shkl %d prevShackle %d\n",
                     //          app->pSyncStat->shackleno, app->previousShackle1);
@@ -10334,12 +12684,23 @@ void overhead::ProcessSyncs()
                 if ((( i == SCALE2SYNCBIT) && (app->previousShackle2 != app->pSyncStat->shackleno)) &&
                       dual_scale )
                 {
+                    // See scale-1 note: in single-sensor mode the zero trolley's tab-block
+                    // reset must not re-arm the capture / restart the average.
+                    bool ssZeroReset2 = (pShm->ZeroFlagMode == 1) &&
+                                        (app->pSyncStat->shackleno < app->previousShackle2);
                     app->previousShackle2 = app->pSyncStat->shackleno;
-					if ( (capt_wt.scale == 2) &&
+                    if (!ssZeroReset2)
+                    {
+                    if ( (capt_wt.scale == 2) &&
                           (capt_wt.mode  == prod_capt) )
                     {
                         capt_wt.capture = true;
                         capture_period  = app->shk2shk_ticks - 3;
+                        // Re-phase the capture throttles to THIS shackle so the lead-in
+                        // and plateau sample counts are deterministic every frame (stops
+                        // the waveform sliding back and forth vs the fixed measurement lines).
+                        cap_slowdown      = CAPTURE_SPEED;
+                        capt_avg_slowdown = CAPTURE_SPEED;
                     }
 
                     // Clear wt average info and set trigger counter.
@@ -10347,6 +12708,7 @@ void overhead::ProcessSyncs()
                     // average finishes before the next shackle.
                     memset(&w_avg[i], 0, sizeof(t_wt_avg));
                     w_avg[i].avg_trigger_cntr = app->shk2shk_ticks - 3;
+                    }
 
                     //RtPrintf("cap_prd %d shkl %d\n",
                     //          w_avg[i].avg_trigger_cntr,
@@ -10362,8 +12724,12 @@ void overhead::ProcessSyncs()
                     (dual_scale               ||
                     (!dual_scale              &&
                     (i != SCALE2SYNCBIT)))    &&
-                    (pShm->OpMode == ModeRun) )
+                    (pShm->OpMode == ModeRun) &&
+                    !ssTabDup &&              // 15.7.14: tab repeating the body pulse's pass
+                    !xcSuppress )             // 15.7.16: count moved back onto an already-run pass
                 {
+                    ssPassRan = true;         // 15.7.14: arms ss_ovr_pass[i] at the end of the edge
+
                     //If this sync supports drops, see if the shackle has a drop assigned
 
                     if ((pSyncSet->first > 0) && (pSyncSet->last > 0))
@@ -10372,7 +12738,7 @@ void overhead::ProcessSyncs()
                         {
                             // Get the Drop location based on this shackle
                             shk = RingSub(pSyncStat->shackleno,
-                                          pShm->sys_set.DropSettings[j-1].Offset,
+                                          pShm->sys_set.DropSettings[j-1].Offset + pShm->ScaleSyncOffset,
                                           pShm->sys_set.Shackles);
 
 //----- Test fire drop
@@ -10503,7 +12869,7 @@ void overhead::ProcessSyncs()
                     {
                         if ( i == pShm->sys_set.MBSync[k] + 1)
                         {
-                           shk = RingSub(pSyncStat->shackleno, pShm->sys_set.MBOffset[k], pShm->sys_set.Shackles);
+                           shk = RingSub(pSyncStat->shackleno, pShm->sys_set.MBOffset[k] + pShm->ScaleSyncOffset, pShm->sys_set.Shackles);
                            temp = ~RtReadPortUchar(PCM_3724_1_PORT_C0);
 						   //show GradeIndex before next call jdc
 //RtPrintf("GradeIndex = %d; shackle = %d\n",pShm->ShackleStatus[pSyncStat->shackleno].GradeIndex[0], pSyncStat->shackleno);
@@ -10524,6 +12890,21 @@ void overhead::ProcessSyncs()
                         } // if (pShm->sys_set.MBSync == i)
                     } // for loop
                 } // if (dual_scale... i != SCALE2SYNCBIT)
+
+                // 15.7.14: single-sensor duplicate-pass guard for the tab. ARMED when this edge
+                // ran the pass with the counter at the tolerated Shackles+1 overshoot (= the flag
+                // trolley's body pulse). DISARMED by a pass at any other count, or as soon as the
+                // counter leaves Shackles+1. An edge that neither counts nor runs the pass (a
+                // SkipTrollies trolley) leaves it as it is: the counter - and so the shackles a
+                // pass maps to - has not moved. So a tab skips its pass only when that pass would
+                // repeat shackles already processed at Shackles+1. A missed / rejected / out-of-
+                // window tab, an early tab, the first zero after start-up and standard mode leave
+                // it clear and run exactly as before. The counter itself is never touched here.
+                if (ssPassRan)
+                    ss_ovr_pass[i] = (pShm->ZeroFlagMode == 1) &&
+                                     (pSyncStat->shackleno == pShm->sys_set.Shackles + 1);
+                else if (pSyncStat->shackleno != pShm->sys_set.Shackles + 1)
+                    ss_ovr_pass[i] = false;
            }  // if sync_debounce[i] = 0
          } // if sync_in
          else if (!BITSET(sync_in[byte], i))
@@ -10597,12 +12978,8 @@ void __stdcall overhead::DebugThread(PVOID unused)
             app->pShm->sys_stat.dbg_switch[i] = app->switch_in[i];
         }
 
-        // Test Fire Outputs
-        if (app->pShm->dbg_set.dbg_output)
-        {
-            app->SetOutput(app->pShm->dbg_set.dbg_output,true);
-            app->pShm->dbg_set.dbg_output = 0;
-        }
+        // Test Fire Outputs are handled in the main scan loop (port-I/O privilege
+        // is per-thread on Linux; the DebugThread's outb would be lost).
 
         // Stop debugging if someone left it on.
 #if 0
@@ -11234,7 +13611,7 @@ shm_info tbl[ALL_SHM_IDS] = {
 	78,			_TSyncStatus,			sizeof(app->pShm->SyncStatus),					MAXSYNCS,		(void*) &app->pShm->SyncStatus,					"SyncStatus",			NO_GROUP,
 	SHKSTAT,	_TShackleStatus,		sizeof(app->pShm->ShackleStatus),				MAXPENDANT,		(void*) &app->pShm->ShackleStatus,				"ShackleStatus",		NO_GROUP,
 	SCLWGHZ,	_DBOOL,					sizeof(app->pShm->WeighZero),					MAXSCALES,		(void*) &app->pShm->WeighZero,					"WeighZero",			NO_GROUP,
-	81,			_uint,					sizeof(app->pShm->spare_int),					1,				(void*) &app->pShm->spare_int,					"spare_int",			NO_GROUP,
+	81,			_uint,					sizeof(app->pShm->ZeroFlagMode),				1,				(void*) &app->pShm->ZeroFlagMode,				"ZeroFlagMode",			NO_GROUP,
 	82,			_uint,					sizeof(app->pShm->WeighShackle),				MAXSCALES,		(void*) &app->pShm->WeighShackle,				"WeighShackle",			NO_GROUP,
 	GRD_SHKL,	_uint,					sizeof(app->pShm->grade_shackle),				MAXGRADESYNCS,	(void*) &app->pShm->grade_shackle,				"grade_shackle",		NO_GROUP,
 	SYS_SET,	_uint,					sizeof(app->pShm->sys_set),						1,				(void*) &app->pShm->sys_set,					"System Settings",		SYS_IN_GROUP,
@@ -11246,7 +13623,26 @@ shm_info tbl[ALL_SHM_IDS] = {
 	90,			___int64,				sizeof(app->pShm->AutoBias),					MAXSCALES,		(void*) &app->pShm->AutoBias,					"AutoBias",				NO_GROUP,
 	MBX_STAT,	_mbx_state,				sizeof(app->pShm->mbx_status),					MBX_STATUSES,	(void*) &app->pShm->mbx_status,					"Mailbox Status",		NO_GROUP,
 	APPVER,		_char,					sizeof(app->pShm->app_ver),						MAXVERINFO,		(void*) &app->pShm->app_ver,					"App Version",			NO_GROUP,
-	COMVER,		_char,					sizeof(app->pShm->comm_ver),					MAXVERINFO,		(void*) &app->pShm->comm_ver,					"Comm Version",			NO_GROUP
+	COMVER,		_char,					sizeof(app->pShm->comm_ver),					MAXVERINFO,		(void*) &app->pShm->comm_ver,					"Comm Version",			NO_GROUP,
+	// --- Power-loss auto-shutdown (host-pushed; ids 94/95 sit in the spare ALL_SHM_IDS slots, > MAXIDS so not saved/iterated) ---
+	94,			_int,					sizeof(app->pShm->AutoShutdownEnabled),			1,				(void*) &app->pShm->AutoShutdownEnabled,		"AutoShutdownEnabled",	NO_GROUP,
+	95,			_int,					sizeof(app->pShm->ShutdownDelaySecs),			1,				(void*) &app->pShm->ShutdownDelaySecs,			"ShutdownDelaySecs",	NO_GROUP,
+	// --- Single-sensor zero-flag mode (host-pushed). The natural shmID 81 (the
+	// ZeroFlagMode field's own slot) sits inside the read-only ZERO_CTR..GRD_SHKL
+	// status range, so host SHM_WRITEs to 81 are rejected by ProcessMbxMsg. Deliver
+	// over id 96 instead — a spare ALL_SHM_IDS slot (> MAXIDS, like 94/95) that
+	// passes the VALID_IDS gate — aliased to the same &ZeroFlagMode field. ---
+	96,			_int,					sizeof(app->pShm->ZeroFlagMode),				1,				(void*) &app->pShm->ZeroFlagMode,				"ZeroFlagMode(wr)",		NO_GROUP,
+	// --- Single-sensor zero-flag tab window (host-pushed ms; spare ALL_SHM_IDS slots) ---
+	97,			_int,					sizeof(app->pShm->ZeroTabWindowMinMs),			1,				(void*) &app->pShm->ZeroTabWindowMinMs,			"ZeroTabWindowMinMs",	NO_GROUP,
+	98,			_int,					sizeof(app->pShm->ZeroTabWindowMaxMs),			1,				(void*) &app->pShm->ZeroTabWindowMaxMs,			"ZeroTabWindowMaxMs",	NO_GROUP,
+	// --- Scale sync offset (host-pushed signed int; spare slot 99, > MAXIDS so not saved) ---
+	99,			_int,					sizeof(app->pShm->ScaleSyncOffset),				1,				(void*) &app->pShm->ScaleSyncOffset,			"ScaleSyncOffset",		NO_GROUP,
+	// --- Auto Calculate Span (host-pushed; spare slots 100/101/102, > MAXIDS so not saved) ---
+	AUTOSPAN_ENABLE,		_int,			sizeof(app->pShm->AutoSpanEnable),				1,				(void*) &app->pShm->AutoSpanEnable,				"AutoSpanEnable",		NO_GROUP,
+	AUTOSPAN_KNOWN_WT,	___int64,		sizeof(app->pShm->AutoSpanKnownWeight),			1,				(void*) &app->pShm->AutoSpanKnownWeight,			"AutoSpanKnownWeight",	NO_GROUP,
+	AUTOSPAN_CLAMP,		_int,			sizeof(app->pShm->AutoSpanClampPpt),				1,				(void*) &app->pShm->AutoSpanClampPpt,			"AutoSpanClampPpt",		NO_GROUP,
+	AUTOSPAN_REFSHK_ID,	_int,			sizeof(app->pShm->AutoSpanRefShackle),			1,				(void*) &app->pShm->AutoSpanRefShackle,			"AutoSpanRefShackle",	NO_GROUP
 };
 
 fsave_grp grp_tbl[MAX_GROUPS] = {

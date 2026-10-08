@@ -160,6 +160,20 @@ enum {
 	MASTER_STARTED,				//Master line is running again, retake mastership
 	LAST_BIRD_CLEARED,			//	Sent between lines when they share an InterSystem drop and the last bird for a batch arrives at the drop
 	REMOTE_BATCH_RESET,			//	Sent between lines when they share an InterSystem drop and the remote batch reset button is pressed on one of them
+    // --- Sensor Scope (SandCat/Linux only, host arch-gated). Appended at the END so existing
+    //     IDs do not shift; EPM-19's rtx_source ipc.h is never edited and never sees these. ---
+    SET_SYNC_CAPTURE,			//	332 host->ctrl: start/stop raw-input pulse capture {mode,triggerSync,pre,post}
+    SYNC_CAPTURE_INFO,			//	333 ctrl->host: window of per-scan input bytes + detector event flags
+    // --- Auto Calculate Span (SandCat/Linux only, host arch-gated). ctrl->host reading record
+    //     emitted once per reference-shackle crossing. Flat __int64[9] payload (no struct
+    //     packing ambiguity): line, scale, measured, known, span_error_ppt, span_bias,
+    //     zero_bias, adjusted, flag. ---
+    AUTO_SPAN_REC,				//	334 ctrl->host: one reference reading (auto_span_log feed)
+    // --- Manual Load Cell Re-init (SandCat/Linux only, host arch-gated). host->ctrl: re-run the
+    //     HBM init_adc (IDN? handshake + reconfig + resume streaming) to recover a frozen/power-lost
+    //     load cell WITHOUT a controller restart or losing zero. Payload int32 scale (1-based, 0=all).
+    //     Rejected by the controller unless the line is stopped (OpMode != ModeRun). ---
+    LC_REINIT,					//	335 host->ctrl: re-initialize HBM load cell ADC comms
     LAST_APP_MSG
 };
 

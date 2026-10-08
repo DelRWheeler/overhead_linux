@@ -86,6 +86,26 @@ static int AcceptTcpClient(SOCKET listenSock)
         return ERROR_OCCURED;
     }
 
+    // ---------------------------------------------------------------------
+    // Per-peer dedup: a given peer (the host, or an InterSystems controller)
+    // uses exactly ONE connection to this port. If this same peer IP already
+    // owns a slot, that slot is a stale ghost from a prior session the peer
+    // never closed cleanly (hard reboot / power loss = no FIN). Reap it now so
+    // a reconnecting peer always reclaims its own slot instead of consuming a
+    // new one. This is what makes Max Clients impossible to reach by reconnect.
+    // ---------------------------------------------------------------------
+    for (int j = 0; j < TCP_MAX_CLIENTS; j++)
+    {
+        if (g_clients[j].connected &&
+            g_clients[j].clientAddr.sin_addr.s_addr == clientAddr.sin_addr.s_addr)
+        {
+            RtPrintf("TCP: peer %s reconnected; reaping stale slot %d\n",
+                     inet_ntoa(clientAddr.sin_addr), j);
+            DisconnectTcpClient(j);
+            g_numClients--;
+        }
+    }
+
     // Find an empty slot
     for (idx = 0; idx < TCP_MAX_CLIENTS; idx++)
     {
@@ -95,9 +115,15 @@ static int AcceptTcpClient(SOCKET listenSock)
 
     if (idx >= TCP_MAX_CLIENTS)
     {
-        RtPrintf("Warning: Max clients reached, rejecting connection\n");
-        close(clientSock);
-        return ERROR_OCCURED;
+        // All slots are held by DISTINCT live peers (should not happen with the
+        // dedup above for a real deployment: host + up to 3 IS peers + loopback).
+        // Never refuse a legitimate new connection because of older ones: evict
+        // the oldest (slot 0) so the new peer always gets in.
+        RtPrintf("Warning: all %d client slots in use by distinct peers; evicting slot 0\n",
+                 TCP_MAX_CLIENTS);
+        DisconnectTcpClient(0);
+        g_numClients--;
+        idx = 0;
     }
 
     // Set socket options
@@ -106,6 +132,15 @@ static int AcceptTcpClient(SOCKET listenSock)
 
     optVal = TCP_KEEPALIVE_ENABLE;
     setsockopt(clientSock, SOL_SOCKET, SO_KEEPALIVE, (char*)&optVal, sizeof(optVal));
+
+    // Aggressive keepalive timing so even a ghost from a different/unknown peer
+    // IP is detected and torn down in ~25s instead of the ~2h Linux default.
+    optVal = TCP_KEEPIDLE_SEC;
+    setsockopt(clientSock, IPPROTO_TCP, TCP_KEEPIDLE, (char*)&optVal, sizeof(optVal));
+    optVal = TCP_KEEPINTVL_SEC;
+    setsockopt(clientSock, IPPROTO_TCP, TCP_KEEPINTVL, (char*)&optVal, sizeof(optVal));
+    optVal = TCP_KEEPCNT;
+    setsockopt(clientSock, IPPROTO_TCP, TCP_KEEPCNT, (char*)&optVal, sizeof(optVal));
 
     // Set non-blocking mode
     int flags = fcntl(clientSock, F_GETFL, 0);

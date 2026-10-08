@@ -15,3 +15,11 @@ __pycache__/
 # Compiled binaries (keep source, not binaries)
 linux_port/interface/interface
 linux_port/overhead/overhead
+linux_port/tools/iotest
+
+# Local build trees and hand-made backup copies (2026-10-07: keep source, not binaries)
+linux_port/build-x86/
+linux_port/build_interface/
+linux_port/overhead/build-arm64/
+*.bak.*
+*.bak

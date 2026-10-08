@@ -27,6 +27,7 @@ extern HANDLE        hAppTimer;
 extern HANDLE        hDebug;
 extern HANDLE        hGpSend;
 extern HANDLE        hGpTimer;
+extern HANDLE        hFstTimer;
 extern HANDLE        hShutdown;
 extern HANDLE        hAppMbx;
 extern HANDLE        hAppRx;
@@ -50,6 +51,21 @@ extern UINT             TraceMask;
 extern trcbuf           trc_buf       [MAXTRCBUFFERS];     // each thread must have a trace buffer
 extern tmptrcbuf        tmp_trc_buf   [MAXTRCBUFFERS];     // for parts to be catinated
 extern trace_ctrl       trc           [MAXTRCBUFFERS];
+
+//--------------------------------------------------------
+// 15.7.13 - universal outputs-disabled interlock
+//
+// Set (once, never cleared) on EVERY shutdown / clear-outputs path. While it is
+// set, overhead::SetOutput() returns immediately, so nothing - not the 5 ms
+// production scan, not the batch-station lamps that Gp_Timer_Main re-asserts
+// every 500 ms, not a test fire in mid-hold - can re-energize an output behind
+// the final ClearOutputs(). Config-independent: one predictable branch that
+// applies to every line count, every drop count, and every board variant.
+//
+// volatile sig_atomic_t because it is written from signal-handler context
+// (ShutdownHandler) and read from the timer threads.
+//--------------------------------------------------------
+extern volatile sig_atomic_t g_outputs_disabled;
 
 //--------------------------------------------------------
 // pShm sentinel diagnostics (set in Main.cpp after init)
